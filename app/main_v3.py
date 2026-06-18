@@ -94,6 +94,63 @@ def language(language_slug: str, limit: int = 50):
     }
 
 
+# ---------------- HOME ----------------
+
+@app.get("/api/v3/home")
+def home():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(f"""
+            SELECT tmdb_id, title, slug, poster_url, release_year, rating
+            FROM {TABLE}
+            ORDER BY popularity_rank ASC
+            LIMIT 24
+        """)
+        popular = cur.fetchall()
+
+        cur.execute(f"""
+            SELECT tmdb_id, title, slug, poster_url, release_year, rating
+            FROM {TABLE}
+            WHERE release_year IS NOT NULL
+            ORDER BY release_year DESC, popularity_rank ASC
+            LIMIT 24
+        """)
+        latest = cur.fetchall()
+
+        cur.execute(f"""
+            SELECT tmdb_id, title, slug, poster_url, release_year, rating
+            FROM {TABLE}
+            WHERE rating IS NOT NULL
+            ORDER BY rating DESC
+            LIMIT 24
+        """)
+        top_rated = cur.fetchall()
+
+    finally:
+        conn.close()
+
+    return {
+        "sections": [
+            {
+                "title": "Popular Movies",
+                "items": popular
+            },
+            {
+                "title": "Latest Movies",
+                "items": latest
+            },
+            {
+                "title": "Top Rated",
+                "items": top_rated
+            }
+        ],
+        "popular": popular,
+        "latest": latest,
+        "top_rated": top_rated
+    }
+
 # ---------------- SEARCH ----------------
 
 @app.get("/api/v3/search")
