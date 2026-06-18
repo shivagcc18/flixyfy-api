@@ -1,6 +1,7 @@
 import json
 import os
 from typing import Optional
+from urllib.parse import quote_plus
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -36,6 +37,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+PROVIDER_HOME = {
+    "netflix": "https://www.netflix.com/in/",
+    "zee5": "https://www.zee5.com/",
+    "jiohotstar": "https://www.hotstar.com/in/",
+    "hotstar": "https://www.hotstar.com/in/",
+    "prime_video": "https://www.primevideo.com/",
+    "amazon_prime_video": "https://www.primevideo.com/",
+    "sonyliv": "https://www.sonyliv.com/",
+    "sun_nxt": "https://www.sunnxt.com/",
+    "aha": "https://www.aha.video/",
+    "vi_movies_and_tv": "https://www.myvi.in/vi-movies-and-tv",
+    "mx_player": "https://www.mxplayer.in/",
+    "youtube": "https://www.youtube.com/",
+    "eros_now": "https://erosnow.com/",
+    "hoichoi": "https://www.hoichoi.tv/",
+    "etv_win": "https://www.etvwin.com/",
+}
+
+PROVIDER_SEARCH = {
+    "netflix": "https://www.netflix.com/search?q={q}",
+    "zee5": "https://www.zee5.com/search?q={q}",
+    "jiohotstar": "https://www.hotstar.com/in/search?q={q}",
+    "hotstar": "https://www.hotstar.com/in/search?q={q}",
+    "prime_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "amazon_prime_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "sonyliv": "https://www.sonyliv.com/search?q={q}",
+    "sun_nxt": "https://www.sunnxt.com/search?q={q}",
+    "aha": "https://www.aha.video/search?q={q}",
+    "vi_movies_and_tv": "https://www.myvi.in/vi-movies-and-tv/search?q={q}",
+    "mx_player": "https://www.mxplayer.in/search/{q}",
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "eros_now": "https://erosnow.com/search?q={q}",
+    "hoichoi": "https://www.hoichoi.tv/search?q={q}",
+    "etv_win": "https://www.etvwin.com/search?q={q}",
+}
+
 
 def get_conn():
     if not DATABASE_URL:
@@ -67,6 +104,74 @@ def fix_image_url(value):
     if value.startswith("/"):
         return f"https://image.tmdb.org/t/p/w500{value}"
     return value
+
+
+def normalize_provider_key(value):
+    return (value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def is_bad_ott_link(url):
+    if not url:
+        return True
+    u = str(url).lower()
+    return "themoviedb.org" in u or "/watch?locale=" in u
+
+
+def provider_final_url(provider_key, title, deep_link=None):
+    key = normalize_provider_key(provider_key)
+    q = quote_plus(title or "")
+
+    if deep_link and not is_bad_ott_link(deep_link):
+        return deep_link, "deep_link"
+
+    if key in PROVIDER_SEARCH:
+        return PROVIDER_SEARCH[key].format(q=q), "provider_search"
+
+    if key in PROVIDER_HOME:
+        return PROVIDER_HOME[key], "provider_homepage"
+
+    return f"https://www.google.com/search?q={q}", "google_search"
+
+
+def normalize_ott_links(ott_items, title):
+    fixed = []
+
+    for item in ott_items or []:
+        if not isinstance(item, dict):
+            continue
+
+        provider_key = (
+            item.get("provider_key")
+            or item.get("key")
+            or item.get("provider")
+            or item.get("provider_name")
+        )
+
+        key = normalize_provider_key(provider_key)
+        deep_link = item.get("deep_link")
+
+        fallback_search_url = (
+            PROVIDER_SEARCH[key].format(q=quote_plus(title or ""))
+            if key in PROVIDER_SEARCH
+            else None
+        )
+
+        homepage_url = PROVIDER_HOME.get(key)
+
+        final_url, final_url_source = provider_final_url(
+            provider_key=key,
+            title=title,
+            deep_link=deep_link,
+        )
+
+        item["homepage_url"] = homepage_url
+        item["fallback_search_url"] = fallback_search_url
+        item["final_url"] = final_url
+        item["final_url_source"] = final_url_source
+
+        fixed.append(item)
+
+    return fixed
 
 
 def movie_card(row):
@@ -103,12 +208,12 @@ def movie_card(row):
 
 def movie_detail(row):
     data = movie_card(row)
+    ott_all = normalize_ott_links(parse_json(row.get("ott_all"), []), row.get("title"))
 
     data.update({
         "overview": row.get("overview"),
         "runtime": row.get("runtime"),
         "genres": parse_json(row.get("genres"), []),
-
         "imdb_id": row.get("imdb_id"),
         "imdb_rating": row.get("imdb_rating"),
         "imdb_votes": row.get("imdb_votes"),
@@ -121,8 +226,7 @@ def movie_detail(row):
         "certification": row.get("certification"),
         "trailer_url": row.get("trailer_url"),
         "production_companies": row.get("production_companies"),
-
-        "ott_all": parse_json(row.get("ott_all"), []),
+        "ott_all": ott_all,
         "search_rank": row.get("search_rank"),
         "created_at": str(row.get("created_at")) if row.get("created_at") else None,
         "updated_at": str(row.get("updated_at")) if row.get("updated_at") else None,
@@ -165,10 +269,7 @@ def build_filters(
         params.append(provider.strip())
         params.append(f"%{provider.strip()}%")
 
-    if not where:
-        return "", params
-
-    return "WHERE " + " AND ".join(where), params
+    return ("WHERE " + " AND ".join(where)) if where else "", params
 
 
 @app.get("/")
@@ -186,23 +287,15 @@ def root():
 def health():
     conn = get_conn()
     cur = conn.cursor()
-
     try:
         cur.execute(f"SELECT COUNT(*) AS total FROM {TABLE}")
         total = cur.fetchone()["total"]
-
         cur.execute(f"SELECT COUNT(*) AS ott FROM {TABLE} WHERE has_ott = 1")
         ott = cur.fetchone()["ott"]
     finally:
         conn.close()
 
-    return {
-        "status": "ok",
-        "table": TABLE,
-        "movies": total,
-        "ott": ott,
-        "ott_coverage": ott,
-    }
+    return {"status": "ok", "table": TABLE, "movies": total, "ott": ott, "ott_coverage": ott}
 
 
 @app.get("/api/v3/movies")
@@ -232,7 +325,6 @@ def movies(
 
     conn = get_conn()
     cur = conn.cursor()
-
     try:
         cur.execute(f"SELECT COUNT(*) AS total FROM {TABLE} {where_sql}", params)
         total = cur.fetchone()["total"]
@@ -264,17 +356,8 @@ def movies(
 def get_movie(slug: str):
     conn = get_conn()
     cur = conn.cursor()
-
     try:
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            WHERE slug = %s
-            LIMIT 1
-            """,
-            (slug,),
-        )
+        cur.execute(f"SELECT * FROM {TABLE} WHERE slug = %s LIMIT 1", (slug,))
         row = cur.fetchone()
     finally:
         conn.close()
@@ -314,7 +397,6 @@ def search(
 
     conn = get_conn()
     cur = conn.cursor()
-
     try:
         cur.execute(f"SELECT COUNT(*) AS total FROM {TABLE} {where_sql}", params)
         total = cur.fetchone()["total"]
@@ -360,7 +442,6 @@ def search(
 def languages():
     conn = get_conn()
     cur = conn.cursor()
-
     try:
         cur.execute(
             f"""
@@ -418,7 +499,6 @@ def language_page(
 def ott_providers():
     conn = get_conn()
     cur = conn.cursor()
-
     try:
         cur.execute(
             f"""
@@ -453,73 +533,24 @@ def ott_providers():
 def home():
     conn = get_conn()
     cur = conn.cursor()
-
     try:
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            WHERE has_ott = 1
-            ORDER BY popularity_rank ASC NULLS LAST
-            LIMIT 24
-            """
-        )
+        cur.execute(f"SELECT * FROM {TABLE} WHERE has_ott = 1 ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
         trending = cur.fetchall()
 
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            ORDER BY release_year DESC NULLS LAST, popularity_rank ASC NULLS LAST
-            LIMIT 24
-            """
-        )
+        cur.execute(f"SELECT * FROM {TABLE} ORDER BY release_year DESC NULLS LAST, popularity_rank ASC NULLS LAST LIMIT 24")
         latest = cur.fetchall()
 
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            WHERE is_free = 1
-            ORDER BY popularity_rank ASC NULLS LAST
-            LIMIT 24
-            """
-        )
+        cur.execute(f"SELECT * FROM {TABLE} WHERE is_free = 1 ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
         free = cur.fetchall()
 
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            WHERE language_slug = 'hindi'
-            ORDER BY popularity_rank ASC NULLS LAST
-            LIMIT 24
-            """
-        )
+        cur.execute(f"SELECT * FROM {TABLE} WHERE language_slug = 'hindi' ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
         hindi = cur.fetchall()
 
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            WHERE language_slug = 'telugu'
-            ORDER BY popularity_rank ASC NULLS LAST
-            LIMIT 24
-            """
-        )
+        cur.execute(f"SELECT * FROM {TABLE} WHERE language_slug = 'telugu' ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
         telugu = cur.fetchall()
 
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            WHERE language_slug = 'tamil'
-            ORDER BY popularity_rank ASC NULLS LAST
-            LIMIT 24
-            """
-        )
+        cur.execute(f"SELECT * FROM {TABLE} WHERE language_slug = 'tamil' ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
         tamil = cur.fetchall()
-
     finally:
         conn.close()
 
@@ -545,7 +576,6 @@ def home():
 def stats():
     conn = get_conn()
     cur = conn.cursor()
-
     try:
         cur.execute(f"SELECT COUNT(*) AS total FROM {TABLE}")
         total = cur.fetchone()["total"]
@@ -559,24 +589,11 @@ def stats():
         cur.execute(f"SELECT COUNT(*) AS sub FROM {TABLE} WHERE has_subscription_ott = 1")
         sub = cur.fetchone()["sub"]
 
-        cur.execute(
-            f"""
-            SELECT COUNT(*) AS poster
-            FROM {TABLE}
-            WHERE poster_url IS NOT NULL AND poster_url != ''
-            """
-        )
+        cur.execute(f"SELECT COUNT(*) AS poster FROM {TABLE} WHERE poster_url IS NOT NULL AND poster_url != ''")
         poster = cur.fetchone()["poster"]
 
-        cur.execute(
-            f"""
-            SELECT COUNT(*) AS overview
-            FROM {TABLE}
-            WHERE overview IS NOT NULL AND overview != ''
-            """
-        )
+        cur.execute(f"SELECT COUNT(*) AS overview FROM {TABLE} WHERE overview IS NOT NULL AND overview != ''")
         overview = cur.fetchone()["overview"]
-
     finally:
         conn.close()
 
