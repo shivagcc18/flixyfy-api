@@ -23,6 +23,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://flixyfy-web.vercel.app",
+        "https://flixyfy.com",
+        "https://www.flixyfy.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
