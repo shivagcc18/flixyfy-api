@@ -269,6 +269,34 @@ def load_youtube_links(tmdb_id):
 
     try:
         cur.execute("""
+            WITH ranked AS (
+                SELECT
+                    video_id,
+                    video_url,
+                    youtube_title,
+                    clean_title,
+                    youtube_language,
+                    original_language,
+                    duration_seconds,
+                    view_count,
+                    release_year,
+                    match_score,
+                    match_source,
+                    variant_type,
+                    is_official,
+                    is_active,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY youtube_language
+                        ORDER BY
+                            view_count DESC NULLS LAST,
+                            duration_seconds DESC NULLS LAST,
+                            video_id ASC
+                    ) AS rn
+                FROM youtube_variants_v2
+                WHERE tmdb_id = %s
+                  AND is_active = 1
+                  AND variant_type = 'FULL_MOVIE'
+            )
             SELECT
                 video_id,
                 video_url,
@@ -284,11 +312,10 @@ def load_youtube_links(tmdb_id):
                 variant_type,
                 is_official,
                 is_active
-            FROM youtube_variants_v2
-            WHERE tmdb_id = %s
-              AND is_active = 1
-              AND variant_type = 'FULL_MOVIE'
+            FROM ranked
+            WHERE rn = 1
             ORDER BY view_count DESC NULLS LAST
+            LIMIT 5
         """, (tmdb_id,))
 
         rows = cur.fetchall()
@@ -314,7 +341,6 @@ def load_youtube_links(tmdb_id):
         ]
     finally:
         conn.close()
-
 
 def movie_detail(row):
     data = movie_card(row)
