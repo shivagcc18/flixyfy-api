@@ -205,10 +205,124 @@ def movie_card(row):
         "is_free": as_bool(row.get("is_free")),
     }
 
+def load_ott_links(tmdb_id):
+    if not tmdb_id:
+        return []
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                provider_key,
+                provider_display_name,
+                provider_category,
+                provider_type,
+                region,
+                provider_deep_link,
+                provider_search_url,
+                provider_homepage_url,
+                tmdb_watch_url,
+                final_url,
+                final_url_source,
+                button_label,
+                priority
+            FROM ott_availability_provider_links_v2
+            WHERE tmdb_id = %s
+            ORDER BY priority NULLS LAST, provider_display_name
+        """, (tmdb_id,))
+
+        rows = cur.fetchall()
+
+        return [
+            {
+                "provider_key": r.get("provider_key"),
+                "provider_display_name": r.get("provider_display_name"),
+                "provider_category": r.get("provider_category"),
+                "provider_type": r.get("provider_type"),
+                "region": r.get("region"),
+                "deep_link": r.get("provider_deep_link"),
+                "provider_deep_link": r.get("provider_deep_link"),
+                "fallback_search_url": r.get("provider_search_url"),
+                "provider_search_url": r.get("provider_search_url"),
+                "homepage_url": r.get("provider_homepage_url"),
+                "provider_homepage_url": r.get("provider_homepage_url"),
+                "tmdb_watch_url": r.get("tmdb_watch_url"),
+                "final_url": r.get("final_url"),
+                "final_url_source": r.get("final_url_source"),
+                "button_label": r.get("button_label") or r.get("provider_display_name"),
+                "priority": r.get("priority"),
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def load_youtube_links(tmdb_id):
+    if not tmdb_id:
+        return []
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                video_id,
+                video_url,
+                youtube_title,
+                clean_title,
+                youtube_language,
+                original_language,
+                duration_seconds,
+                view_count,
+                release_year,
+                match_score,
+                match_source,
+                variant_type,
+                is_official,
+                is_active
+            FROM youtube_variants_v2
+            WHERE tmdb_id = %s
+              AND is_active = 1
+              AND variant_type = 'FULL_MOVIE'
+            ORDER BY view_count DESC NULLS LAST
+        """, (tmdb_id,))
+
+        rows = cur.fetchall()
+
+        return [
+            {
+                "video_id": r.get("video_id"),
+                "video_url": r.get("video_url"),
+                "youtube_title": r.get("youtube_title"),
+                "clean_title": r.get("clean_title"),
+                "youtube_language": r.get("youtube_language"),
+                "original_language": r.get("original_language"),
+                "duration_seconds": r.get("duration_seconds"),
+                "view_count": r.get("view_count"),
+                "release_year": r.get("release_year"),
+                "match_score": r.get("match_score"),
+                "match_source": r.get("match_source"),
+                "variant_type": r.get("variant_type"),
+                "is_official": as_bool(r.get("is_official")),
+                "is_active": as_bool(r.get("is_active")),
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
 
 def movie_detail(row):
     data = movie_card(row)
-    ott_all = normalize_ott_links(parse_json(row.get("ott_all"), []), row.get("title"))
+
+    tmdb_id = row.get("tmdb_id")
+
+    ott_all = load_ott_links(tmdb_id)
+    youtube_variants = load_youtube_links(tmdb_id)
 
     data.update({
         "overview": row.get("overview"),
@@ -227,6 +341,9 @@ def movie_detail(row):
         "trailer_url": row.get("trailer_url"),
         "production_companies": row.get("production_companies"),
         "ott_all": ott_all,
+        "youtube_variants": youtube_variants,
+        "youtube_full_movies": youtube_variants,
+        "youtube_count": len(youtube_variants),
         "search_rank": row.get("search_rank"),
         "created_at": str(row.get("created_at")) if row.get("created_at") else None,
         "updated_at": str(row.get("updated_at")) if row.get("updated_at") else None,
@@ -370,30 +487,39 @@ def get_movie(slug: str):
 
 @app.get("/api/v3/search")
 def search(
-    q: str = Query(..., min_length=1),
+    q: str = Query("", min_length=0),
     page: int = Query(1, ge=1),
     limit: int = Query(24, ge=1, le=100),
     language: Optional[str] = None,
+    year: Optional[int] = None,
     has_ott: Optional[int] = None,
 ):
     offset = (page - 1) * limit
     query = q.strip()
 
-    where = [
-        "(LOWER(title) LIKE LOWER(%s) "
-        "OR LOWER(COALESCE(original_title, '')) LIKE LOWER(%s))"
-    ]
-    params = [f"%{query}%", f"%{query}%"]
+    where = []
+    params = []
+
+    if query:
+        where.append(
+            "(LOWER(title) LIKE LOWER(%s) "
+            "OR LOWER(COALESCE(original_title, '')) LIKE LOWER(%s))"
+        )
+        params.extend([f"%{query}%", f"%{query}%"])
 
     if language:
         where.append("language_slug = %s")
         params.append(language.strip().lower())
 
+    if year:
+        where.append("release_year = %s")
+        params.append(year)
+
     if has_ott is not None:
         where.append("has_ott = %s")
         params.append(1 if has_ott else 0)
 
-    where_sql = "WHERE " + " AND ".join(where)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
 
     conn = get_conn()
     cur = conn.cursor()
@@ -401,12 +527,8 @@ def search(
         cur.execute(f"SELECT COUNT(*) AS total FROM {TABLE} {where_sql}", params)
         total = cur.fetchone()["total"]
 
-        cur.execute(
-            f"""
-            SELECT *
-            FROM {TABLE}
-            {where_sql}
-            ORDER BY
+        if query:
+            order_sql = """
                 CASE
                     WHEN LOWER(title) = LOWER(%s) THEN 1
                     WHEN LOWER(title) LIKE LOWER(%s) THEN 2
@@ -414,13 +536,26 @@ def search(
                     WHEN LOWER(COALESCE(original_title, '')) LIKE LOWER(%s) THEN 4
                     ELSE 5
                 END,
+            """
+            order_params = [query, f"{query}%", query, f"{query}%"]
+        else:
+            order_sql = ""
+            order_params = []
+
+        cur.execute(
+            f"""
+            SELECT *
+            FROM {TABLE}
+            {where_sql}
+            ORDER BY
+                {order_sql}
                 has_ott DESC NULLS LAST,
                 release_year DESC NULLS LAST,
                 search_rank DESC NULLS LAST,
                 popularity_rank ASC NULLS LAST
             LIMIT %s OFFSET %s
             """,
-            params + [query, f"{query}%", query, f"{query}%", limit, offset],
+            params + order_params + [limit, offset],
         )
         rows = cur.fetchall()
     finally:
@@ -436,8 +571,6 @@ def search(
         "pages": (total + limit - 1) // limit,
         "items": [movie_card(r) for r in rows],
     }
-
-
 @app.get("/api/v3/languages")
 def languages():
     conn = get_conn()
