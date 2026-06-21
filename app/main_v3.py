@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-TABLE = os.getenv("SERVING_TABLE", "media_serving_v7_final")
+TABLE = os.getenv("SERVING_TABLE", "media_serving_v8_expanded")
 
 app = FastAPI(
     title="Flixyfy API V3",
@@ -110,70 +110,6 @@ def normalize_provider_key(value):
     return (value or "").strip().lower().replace(" ", "_").replace("-", "_")
 
 
-def is_bad_ott_link(url):
-    if not url:
-        return True
-    u = str(url).lower()
-    return "themoviedb.org" in u or "/watch?locale=" in u
-
-
-def provider_final_url(provider_key, title, deep_link=None):
-    key = normalize_provider_key(provider_key)
-    q = quote_plus(title or "")
-
-    if deep_link and not is_bad_ott_link(deep_link):
-        return deep_link, "deep_link"
-
-    if key in PROVIDER_SEARCH:
-        return PROVIDER_SEARCH[key].format(q=q), "provider_search"
-
-    if key in PROVIDER_HOME:
-        return PROVIDER_HOME[key], "provider_homepage"
-
-    return f"https://www.google.com/search?q={q}", "google_search"
-
-
-def normalize_ott_links(ott_items, title):
-    fixed = []
-
-    for item in ott_items or []:
-        if not isinstance(item, dict):
-            continue
-
-        provider_key = (
-            item.get("provider_key")
-            or item.get("key")
-            or item.get("provider")
-            or item.get("provider_name")
-        )
-
-        key = normalize_provider_key(provider_key)
-        deep_link = item.get("deep_link")
-
-        fallback_search_url = (
-            PROVIDER_SEARCH[key].format(q=quote_plus(title or ""))
-            if key in PROVIDER_SEARCH
-            else None
-        )
-
-        homepage_url = PROVIDER_HOME.get(key)
-
-        final_url, final_url_source = provider_final_url(
-            provider_key=key,
-            title=title,
-            deep_link=deep_link,
-        )
-
-        item["homepage_url"] = homepage_url
-        item["fallback_search_url"] = fallback_search_url
-        item["final_url"] = final_url
-        item["final_url_source"] = final_url_source
-
-        fixed.append(item)
-
-    return fixed
-
-
 def movie_card(row):
     slug = row.get("slug")
 
@@ -193,7 +129,6 @@ def movie_card(row):
         "vote_count": row.get("vote_count"),
         "popularity": row.get("popularity"),
         "quality_score": row.get("quality_score"),
-        "popularity_rank": row.get("popularity_rank"),
         "ott_primary": row.get("ott_primary"),
         "ott_primary_key": row.get("ott_primary_key"),
         "ott_count": row.get("ott_count"),
@@ -205,6 +140,7 @@ def movie_card(row):
         "is_free": as_bool(row.get("is_free")),
     }
 
+
 def load_ott_links(tmdb_id):
     if not tmdb_id:
         return []
@@ -213,7 +149,8 @@ def load_ott_links(tmdb_id):
     cur = conn.cursor()
 
     try:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
                 provider_key,
                 provider_display_name,
@@ -231,7 +168,9 @@ def load_ott_links(tmdb_id):
             FROM ott_availability_provider_links_v2
             WHERE tmdb_id = %s
             ORDER BY priority NULLS LAST, provider_display_name
-        """, (tmdb_id,))
+            """,
+            (tmdb_id,),
+        )
 
         rows = cur.fetchall()
 
@@ -268,7 +207,8 @@ def load_youtube_links(tmdb_id):
     cur = conn.cursor()
 
     try:
-        cur.execute("""
+        cur.execute(
+            """
             WITH ranked AS (
                 SELECT
                     video_id,
@@ -297,26 +237,14 @@ def load_youtube_links(tmdb_id):
                   AND is_active = 1
                   AND variant_type = 'FULL_MOVIE'
             )
-            SELECT
-                video_id,
-                video_url,
-                youtube_title,
-                clean_title,
-                youtube_language,
-                original_language,
-                duration_seconds,
-                view_count,
-                release_year,
-                match_score,
-                match_source,
-                variant_type,
-                is_official,
-                is_active
+            SELECT *
             FROM ranked
             WHERE rn = 1
             ORDER BY view_count DESC NULLS LAST
             LIMIT 5
-        """, (tmdb_id,))
+            """,
+            (tmdb_id,),
+        )
 
         rows = cur.fetchall()
 
@@ -342,38 +270,38 @@ def load_youtube_links(tmdb_id):
     finally:
         conn.close()
 
+
 def movie_detail(row):
     data = movie_card(row)
-
     tmdb_id = row.get("tmdb_id")
 
-    ott_all = load_ott_links(tmdb_id)
     youtube_variants = load_youtube_links(tmdb_id)
 
-    data.update({
-        "overview": row.get("overview"),
-        "runtime": row.get("runtime"),
-        "genres": parse_json(row.get("genres"), []),
-        "imdb_id": row.get("imdb_id"),
-        "imdb_rating": row.get("imdb_rating"),
-        "imdb_votes": row.get("imdb_votes"),
-        "omdb_runtime": row.get("omdb_runtime"),
-        "omdb_genre": row.get("omdb_genre"),
-        "director": row.get("director"),
-        "writers": row.get("writers"),
-        "actors": row.get("actors"),
-        "awards": row.get("awards"),
-        "certification": row.get("certification"),
-        "trailer_url": row.get("trailer_url"),
-        "production_companies": row.get("production_companies"),
-        "ott_all": ott_all,
-        "youtube_variants": youtube_variants,
-        "youtube_full_movies": youtube_variants,
-        "youtube_count": len(youtube_variants),
-        "search_rank": row.get("search_rank"),
-        "created_at": str(row.get("created_at")) if row.get("created_at") else None,
-        "updated_at": str(row.get("updated_at")) if row.get("updated_at") else None,
-    })
+    data.update(
+        {
+            "overview": row.get("overview"),
+            "runtime": row.get("runtime"),
+            "genres": parse_json(row.get("genres"), []),
+            "imdb_id": row.get("imdb_id"),
+            "imdb_rating": row.get("imdb_rating"),
+            "imdb_votes": row.get("imdb_votes"),
+            "omdb_runtime": row.get("omdb_runtime"),
+            "omdb_genre": row.get("omdb_genre"),
+            "director": row.get("director"),
+            "writers": row.get("writers"),
+            "actors": row.get("actors"),
+            "awards": row.get("awards"),
+            "certification": row.get("certification"),
+            "trailer_url": row.get("trailer_url"),
+            "production_companies": row.get("production_companies"),
+            "ott_all": load_ott_links(tmdb_id),
+            "youtube_variants": youtube_variants,
+            "youtube_full_movies": youtube_variants,
+            "youtube_count": len(youtube_variants),
+            "created_at": str(row.get("created_at")) if row.get("created_at") else None,
+            "updated_at": str(row.get("updated_at")) if row.get("updated_at") else None,
+        }
+    )
 
     return data
 
@@ -405,11 +333,7 @@ def build_filters(
         params.append(1 if is_free else 0)
 
     if provider:
-        where.append(
-            "(LOWER(COALESCE(ott_primary, '')) = LOWER(%s) "
-            "OR LOWER(COALESCE(ott_all::text, '')) LIKE LOWER(%s))"
-        )
-        params.append(provider.strip())
+        where.append("LOWER(COALESCE(ott_primary_key, ott_primary, '')) LIKE LOWER(%s)")
         params.append(f"%{provider.strip()}%")
 
     return ("WHERE " + " AND ".join(where)) if where else "", params
@@ -438,7 +362,13 @@ def health():
     finally:
         conn.close()
 
-    return {"status": "ok", "table": TABLE, "movies": total, "ott": ott, "ott_coverage": ott}
+    return {
+        "status": "ok",
+        "table": TABLE,
+        "movies": total,
+        "ott": ott,
+        "ott_coverage": ott,
+    }
 
 
 @app.get("/api/v3/movies")
@@ -450,17 +380,31 @@ def movies(
     has_ott: Optional[int] = None,
     is_free: Optional[int] = None,
     provider: Optional[str] = None,
+    availability: Optional[str] = None,
     sort: str = Query("popular"),
 ):
     offset = (page - 1) * limit
-    where_sql, params = build_filters(language, year, has_ott, is_free, provider)
+
+    where_sql, params = build_filters(
+        language=language,
+        year=year,
+        has_ott=has_ott,
+        is_free=is_free,
+        provider=provider,
+    )
+
+    if availability == "ott":
+        where_sql = f"{where_sql} AND has_ott = 1" if where_sql else "WHERE has_ott = 1"
+
+    elif availability == "youtube":
+        where_sql = f"{where_sql} AND is_free = 1" if where_sql else "WHERE is_free = 1"
 
     allowed_sorts = {
-        "popular": "popularity_rank ASC NULLS LAST",
-        "latest": "release_year DESC NULLS LAST, popularity_rank ASC NULLS LAST",
-        "rating": "rating DESC NULLS LAST, vote_count DESC NULLS LAST",
-        "ott": "has_ott DESC NULLS LAST, popularity_rank ASC NULLS LAST",
-        "search": "search_rank DESC NULLS LAST",
+        "popular": "COALESCE(rating, 0) DESC NULLS LAST, release_year DESC NULLS LAST, title ASC",
+        "latest": "release_year DESC NULLS LAST, title ASC",
+        "rating": "COALESCE(rating, 0) DESC NULLS LAST, title ASC",
+        "ott": "has_ott DESC NULLS LAST, COALESCE(rating, 0) DESC NULLS LAST, title ASC",
+        "search": "COALESCE(rating, 0) DESC NULLS LAST, title ASC",
         "title": "title ASC",
     }
 
@@ -577,8 +521,8 @@ def search(
                 {order_sql}
                 has_ott DESC NULLS LAST,
                 release_year DESC NULLS LAST,
-                search_rank DESC NULLS LAST,
-                popularity_rank ASC NULLS LAST
+                COALESCE(rating, 0) DESC NULLS LAST,
+                title ASC
             LIMIT %s OFFSET %s
             """,
             params + order_params + [limit, offset],
@@ -597,6 +541,8 @@ def search(
         "pages": (total + limit - 1) // limit,
         "items": [movie_card(r) for r in rows],
     }
+
+
 @app.get("/api/v3/languages")
 def languages():
     conn = get_conn()
@@ -640,6 +586,8 @@ def language_page(
     limit: int = Query(24, ge=1, le=100),
     sort: str = Query("popular"),
     year: Optional[int] = None,
+    availability: Optional[str] = None,
+    provider: Optional[str] = None,
     has_ott: Optional[int] = None,
 ):
     return movies(
@@ -649,7 +597,8 @@ def language_page(
         year=year,
         has_ott=has_ott,
         is_free=None,
-        provider=None,
+        provider=provider,
+        availability=availability,
         sort=sort,
     )
 
@@ -693,22 +642,82 @@ def home():
     conn = get_conn()
     cur = conn.cursor()
     try:
-        cur.execute(f"SELECT * FROM {TABLE} WHERE has_ott = 1 ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
+        cur.execute(
+            f"""
+            SELECT *
+            FROM {TABLE}
+            WHERE poster_url IS NOT NULL
+              AND poster_url != ''
+              AND COALESCE(vote_count, 0) >= 20
+              AND has_ott = 1
+            ORDER BY COALESCE(rating, 0) DESC NULLS LAST, release_year DESC NULLS LAST, title ASC
+            LIMIT 24
+            """
+        )
         trending = cur.fetchall()
 
-        cur.execute(f"SELECT * FROM {TABLE} ORDER BY release_year DESC NULLS LAST, popularity_rank ASC NULLS LAST LIMIT 24")
+        cur.execute(
+            f"""
+            SELECT *
+            FROM {TABLE}
+            WHERE poster_url IS NOT NULL
+              AND poster_url != ''
+            ORDER BY release_year DESC NULLS LAST, title ASC
+            LIMIT 24
+            """
+        )
         latest = cur.fetchall()
 
-        cur.execute(f"SELECT * FROM {TABLE} WHERE is_free = 1 ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
+        cur.execute(
+            f"""
+            SELECT *
+            FROM {TABLE}
+            WHERE poster_url IS NOT NULL
+              AND poster_url != ''
+              AND is_free = 1
+            ORDER BY COALESCE(rating, 0) DESC NULLS LAST, release_year DESC NULLS LAST, title ASC
+            LIMIT 24
+            """
+        )
         free = cur.fetchall()
 
-        cur.execute(f"SELECT * FROM {TABLE} WHERE language_slug = 'hindi' ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
+        cur.execute(
+            f"""
+            SELECT *
+            FROM {TABLE}
+            WHERE language_slug = 'hindi'
+              AND poster_url IS NOT NULL
+              AND poster_url != ''
+            ORDER BY COALESCE(rating, 0) DESC NULLS LAST, release_year DESC NULLS LAST, title ASC
+            LIMIT 24
+            """
+        )
         hindi = cur.fetchall()
 
-        cur.execute(f"SELECT * FROM {TABLE} WHERE language_slug = 'telugu' ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
+        cur.execute(
+            f"""
+            SELECT *
+            FROM {TABLE}
+            WHERE language_slug = 'telugu'
+              AND poster_url IS NOT NULL
+              AND poster_url != ''
+            ORDER BY COALESCE(rating, 0) DESC NULLS LAST, release_year DESC NULLS LAST, title ASC
+            LIMIT 24
+            """
+        )
         telugu = cur.fetchall()
 
-        cur.execute(f"SELECT * FROM {TABLE} WHERE language_slug = 'tamil' ORDER BY popularity_rank ASC NULLS LAST LIMIT 24")
+        cur.execute(
+            f"""
+            SELECT *
+            FROM {TABLE}
+            WHERE language_slug = 'tamil'
+              AND poster_url IS NOT NULL
+              AND poster_url != ''
+            ORDER BY COALESCE(rating, 0) DESC NULLS LAST, release_year DESC NULLS LAST, title ASC
+            LIMIT 24
+            """
+        )
         tamil = cur.fetchall()
     finally:
         conn.close()
@@ -721,7 +730,7 @@ def home():
         "telugu": [movie_card(r) for r in telugu],
         "tamil": [movie_card(r) for r in tamil],
         "sections": [
-            {"title": "Trending Now", "items": [movie_card(r) for r in trending]},
+            {"title": "Popular Movies", "items": [movie_card(r) for r in trending]},
             {"title": "Latest Movies", "items": [movie_card(r) for r in latest]},
             {"title": "Free to Watch", "items": [movie_card(r) for r in free]},
             {"title": "Hindi Movies", "items": [movie_card(r) for r in hindi]},
