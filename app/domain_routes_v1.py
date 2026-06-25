@@ -446,7 +446,7 @@ def row_by_slug(table_name: str, slug: str):
         conn.close()
 
 
-def availability_rows(domain: str, movie_id=None, slug=None, title=None):
+def availability_rows(domain: str, movie_id=None, tmdb_id=None, imdb_id=None, slug=None, title=None):
     table_name = HOLLYWOOD_AVAILABILITY_TABLE if domain == "hollywood" else HISTORICAL_AVAILABILITY_TABLE
 
     if not table_exists(table_name):
@@ -456,21 +456,42 @@ def availability_rows(domain: str, movie_id=None, slug=None, title=None):
     where = []
     params = []
 
-    if movie_id is not None and "id" in cols:
-        where.append("CAST(id AS TEXT) = CAST(%s AS TEXT)")
-        params.append(str(movie_id))
+    # Hollywood availability table has its own row id. Do NOT join Hollywood by id.
+    # Use tmdb_id / imdb_id / slug / title so Avatar does not pull another movie with the same local row id.
+    if domain == "hollywood":
+        if tmdb_id is not None and "tmdb_id" in cols:
+            where.append("CAST(tmdb_id AS TEXT) = CAST(%s AS TEXT)")
+            params.append(str(tmdb_id))
 
-    if movie_id is not None and "movie_id" in cols:
-        where.append("CAST(movie_id AS TEXT) = CAST(%s AS TEXT)")
-        params.append(str(movie_id))
+        if imdb_id and "imdb_id" in cols:
+            where.append("CAST(imdb_id AS TEXT) = CAST(%s AS TEXT)")
+            params.append(str(imdb_id))
 
-    if slug and "slug" in cols:
-        where.append("slug = %s")
-        params.append(slug)
+        if slug and "slug" in cols:
+            where.append("slug = %s")
+            params.append(slug)
 
-    if title and "title" in cols:
-        where.append("LOWER(title) = LOWER(%s)")
-        params.append(title)
+        if title and "title" in cols:
+            where.append("LOWER(title) = LOWER(%s)")
+            params.append(title)
+
+    else:
+        # Historical has stable local ids and some rows only have historical id/slug/title.
+        if movie_id is not None and "id" in cols:
+            where.append("CAST(id AS TEXT) = CAST(%s AS TEXT)")
+            params.append(str(movie_id))
+
+        if movie_id is not None and "movie_id" in cols:
+            where.append("CAST(movie_id AS TEXT) = CAST(%s AS TEXT)")
+            params.append(str(movie_id))
+
+        if slug and "slug" in cols:
+            where.append("slug = %s")
+            params.append(slug)
+
+        if title and "title" in cols:
+            where.append("LOWER(title) = LOWER(%s)")
+            params.append(title)
 
     if not where:
         return []
@@ -497,17 +518,58 @@ def availability_rows(domain: str, movie_id=None, slug=None, title=None):
 
 
 def normalize_availability(rows: List[Dict[str, Any]], domain: str):
-    out = []
+    expanded = []
 
     for row in rows:
+        item = dict(row)
+
+        provider_links_json = item.get("provider_links_json")
+
+        if provider_links_json:
+            try:
+                links = json.loads(provider_links_json)
+
+                if isinstance(links, list):
+                    for link in links:
+                        if not isinstance(link, dict):
+                            continue
+
+                        merged = dict(link)
+
+                        merged.update(
+                            {
+                                "movie_id": item.get("id") or item.get("movie_id"),
+                                "tmdb_id": item.get("tmdb_id"),
+                                "imdb_id": item.get("imdb_id"),
+                                "title": item.get("title"),
+                                "slug": item.get("slug"),
+                                "movie_url": item.get("movie_url"),
+                                "release_year": item.get("release_year"),
+                                "availability_status": item.get("availability_status"),
+                                "source_layer": item.get("source_layer"),
+                            }
+                        )
+
+                        expanded.append(merged)
+
+                    continue
+            except Exception:
+                pass
+
+        expanded.append(item)
+
+    out = []
+    seen = set()
+
+    for row in expanded:
         item = dict(row)
 
         provider = first(
             item,
             [
-                "provider",
-                "provider_name",
                 "provider_display_name",
+                "provider_name",
+                "provider",
                 "ott_primary",
                 "primary_provider",
                 "top_provider",
@@ -516,7 +578,11 @@ def normalize_availability(rows: List[Dict[str, Any]], domain: str):
 
         provider_key = first(item, ["provider_key", "ott_primary_key"]) or normalize_provider_key(provider)
 
+        provider_type = first(item, ["provider_type", "type", "category"])
+        region = first(item, ["region", "country", "locale"])
+
         youtube_url = first(item, ["youtube_url", "video_url", "youtube_video_url"])
+
         youtube_title = first(item, ["youtube_title", "video_title"])
 
         final_url = first(
@@ -543,12 +609,32 @@ def normalize_availability(rows: List[Dict[str, Any]], domain: str):
         if not final_url and provider_key:
             final_url = PROVIDER_HOME.get(provider_key)
 
+        button_label = (
+            item.get("button_label")
+            or (f"Watch on {provider}" if provider else None)
+            or ("Watch on YouTube" if youtube_url else "Watch")
+        )
+
+        dedupe_key = (
+            str(provider_key or "").lower(),
+            str(provider_type or "").lower(),
+            str(region or "").upper(),
+            str(final_url or "").lower(),
+        )
+
+        if dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+
         item.update(
             {
                 "domain": domain,
                 "provider_key": provider_key,
                 "provider_display_name": provider,
-                "button_label": item.get("button_label") or provider or ("Watch on YouTube" if youtube_url else "Watch"),
+                "provider_type": provider_type,
+                "region": region,
+                "button_label": button_label,
                 "final_url": final_url,
                 "youtube_url": youtube_url,
                 "youtube_title": youtube_title,
@@ -556,6 +642,25 @@ def normalize_availability(rows: List[Dict[str, Any]], domain: str):
         )
 
         out.append(item)
+
+    def sort_key(item):
+        region_score = 0 if str(item.get("region") or "").upper() == "IN" else 1
+        type_order = {
+            "subscription": 1,
+            "free": 2,
+            "free_with_ads": 3,
+            "rent": 4,
+            "buy": 5,
+        }.get(str(item.get("provider_type") or "").lower(), 9)
+
+        try:
+            priority = int(item.get("display_priority") or item.get("priority") or 999)
+        except Exception:
+            priority = 999
+
+        return (region_score, type_order, priority, str(item.get("provider_display_name") or ""))
+
+    out.sort(key=sort_key)
 
     return out
 
@@ -566,6 +671,8 @@ def domain_detail(row: Dict[str, Any], domain: str):
     raw_availability = availability_rows(
         domain=domain,
         movie_id=first(row, ["id", "movie_id"]),
+        tmdb_id=row.get("tmdb_id"),
+        imdb_id=row.get("imdb_id"),
         slug=row.get("slug"),
         title=row.get("title"),
     )
