@@ -963,3 +963,4 @@ def domain_movie(slug: str):
         return domain_detail(row, "historical")
 
     raise HTTPException(status_code=404, detail="Domain movie not found")
+
