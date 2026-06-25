@@ -688,11 +688,19 @@ def domain_detail(row: Dict[str, Any], domain: str):
         status = str(item.get("availability_status") or "").lower()
         provider_key = str(item.get("provider_key") or "").lower()
 
-        if youtube_url and (
-            "youtube" in provider_key
-            or "youtube" in str(youtube_url).lower()
-            or status == "youtube_available"
-        ):
+        # Only historical YouTube matches are real free full-movie links.
+        # Hollywood TMDB YouTube providers are rent/buy availability, not free full movies.
+        is_real_youtube_full_movie = (
+            domain == "historical"
+            and youtube_url
+            and (
+                status == "youtube_available"
+                or first(item, ["youtube_video_id", "video_id"])
+                or first(item, ["youtube_match_type", "match_type"])
+            )
+        )
+
+        if is_real_youtube_full_movie:
             youtube_full_movies.append(
                 {
                     "video_id": first(item, ["youtube_video_id", "video_id"]),
