@@ -273,11 +273,19 @@ def where_sql(
 
     if search_query:
         title_clauses = []
+        normalized_query = "".join(ch.lower() for ch in search_query if ch.isalnum())
 
         for col in ["title", "original_title", "wiki_title"]:
             if col in cols:
-                title_clauses.append(f"LOWER(CAST({qident(col)} AS TEXT)) LIKE LOWER(%s)")
+                title_clauses.append(
+                    "("
+                    f"LOWER(CAST({qident(col)} AS TEXT)) LIKE LOWER(%s) "
+                    "OR "
+                    f"regexp_replace(LOWER(CAST({qident(col)} AS TEXT)), '[^a-z0-9]+', '', 'g') LIKE %s"
+                    ")"
+                )
                 params.append(f"%{search_query}%")
+                params.append(f"%{normalized_query}%")
 
         if title_clauses:
             where.append("(" + " OR ".join(title_clauses) + ")")
