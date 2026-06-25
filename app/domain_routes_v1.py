@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 from functools import lru_cache
 from typing import Optional, Dict, Any, List, Tuple
@@ -247,7 +247,7 @@ def order_sql(table_name: str, sort: str):
             score_col = candidate
             break
 
-    score_expr = numeric_expr(score_col) if score_col else "0"
+    score_expr = numeric_expr(score_col) if score_col else "(0)::DOUBLE PRECISION"
 
     if sort == "latest":
         return f"{year_expr}, {title_expr}"
