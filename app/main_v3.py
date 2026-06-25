@@ -775,3 +775,6 @@ def stats():
         "poster_coverage_percent": round((poster / total) * 100, 2) if total else 0,
         "overview_coverage_percent": round((overview / total) * 100, 2) if total else 0,
     }
+from app.domain_routes_v1 import router as domain_router
+app.include_router(domain_router)
+
