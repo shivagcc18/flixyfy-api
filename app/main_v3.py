@@ -199,14 +199,111 @@ def load_ott_links(tmdb_id):
         conn.close()
 
 
-def load_youtube_links(tmdb_id):
+def load_youtube_links(tmdb_id=None, slug=None, domain="modern"):
+    """
+    Production-safe YouTube links from public.youtube_full_movie_links_v2.
+
+    No dependency on table_exists_cached/table_exists.
+    Safe behavior:
+    - Try brand-safe YouTube table first.
+    - If unavailable, fall back to legacy youtube_variants_v2.
+    - If both unavailable, return [] instead of breaking movie detail.
+    """
+    if slug:
+        if domain == "modern":
+            domains = ["current_v8", "current_v7"]
+        elif domain == "historical":
+            domains = ["historical"]
+        else:
+            domains = []
+
+        if domains:
+            conn = None
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT
+                        domain,
+                        movie_id,
+                        movie_slug,
+                        title,
+                        youtube_video_id,
+                        youtube_url,
+                        youtube_title,
+                        youtube_channel,
+                        duration_seconds,
+                        view_count,
+                        match_score,
+                        match_type,
+                        trusted_brand,
+                        source,
+                        promotion_batch
+                    FROM public.youtube_full_movie_links_v2
+                    WHERE status = 'active'
+                      AND movie_slug = %s
+                      AND domain = ANY(%s)
+                    ORDER BY
+                        CASE
+                            WHEN domain = 'current_v8' THEN 1
+                            WHEN domain = 'current_v7' THEN 2
+                            WHEN domain = 'historical' THEN 1
+                            ELSE 9
+                        END,
+                        match_score DESC NULLS LAST,
+                        view_count DESC NULLS LAST,
+                        youtube_video_id ASC
+                    LIMIT 1
+                    """,
+                    (slug, domains),
+                )
+                rows = cur.fetchall()
+                return [
+                    {
+                        "domain": r.get("domain"),
+                        "movie_id": r.get("movie_id"),
+                        "movie_slug": r.get("movie_slug"),
+                        "video_id": r.get("youtube_video_id"),
+                        "youtube_video_id": r.get("youtube_video_id"),
+                        "video_url": r.get("youtube_url"),
+                        "youtube_url": r.get("youtube_url"),
+                        "youtube_title": r.get("youtube_title"),
+                        "youtube_channel": r.get("youtube_channel"),
+                        "duration_seconds": r.get("duration_seconds"),
+                        "view_count": r.get("view_count"),
+                        "match_score": r.get("match_score"),
+                        "match_type": r.get("match_type"),
+                        "trusted_brand": as_bool(r.get("trusted_brand")),
+                        "source": r.get("source") or "youtube_full_movie_links_v2",
+                        "promotion_batch": r.get("promotion_batch"),
+                        "variant_type": "FULL_MOVIE",
+                        "is_official": True,
+                        "is_active": True,
+                    }
+                    for r in rows
+                ]
+            except Exception:
+                if conn:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                # Fall through to legacy lookup. Movie detail must not 500.
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
     if not tmdb_id:
         return []
 
-    conn = get_conn()
-    cur = conn.cursor()
-
+    conn = None
     try:
+        conn = get_conn()
+        cur = conn.cursor()
         cur.execute(
             """
             WITH ranked AS (
@@ -227,31 +324,26 @@ def load_youtube_links(tmdb_id):
                     is_active,
                     ROW_NUMBER() OVER (
                         PARTITION BY youtube_language
-                        ORDER BY
-                            view_count DESC NULLS LAST,
-                            duration_seconds DESC NULLS LAST,
-                            video_id ASC
+                        ORDER BY view_count DESC NULLS LAST, duration_seconds DESC NULLS LAST, video_id ASC
                     ) AS rn
                 FROM youtube_variants_v2
                 WHERE tmdb_id = %s
                   AND is_active = 1
                   AND variant_type = 'FULL_MOVIE'
             )
-            SELECT *
-            FROM ranked
+            SELECT * FROM ranked
             WHERE rn = 1
             ORDER BY view_count DESC NULLS LAST
             LIMIT 5
             """,
             (tmdb_id,),
         )
-
         rows = cur.fetchall()
-
         return [
             {
                 "video_id": r.get("video_id"),
                 "video_url": r.get("video_url"),
+                "youtube_url": r.get("video_url"),
                 "youtube_title": r.get("youtube_title"),
                 "clean_title": r.get("clean_title"),
                 "youtube_language": r.get("youtube_language"),
@@ -267,15 +359,25 @@ def load_youtube_links(tmdb_id):
             }
             for r in rows
         ]
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return []
     finally:
-        conn.close()
-
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def movie_detail(row):
     data = movie_card(row)
     tmdb_id = row.get("tmdb_id")
 
-    youtube_variants = load_youtube_links(tmdb_id)
+    youtube_variants = load_youtube_links(tmdb_id=tmdb_id, slug=row.get("slug"), domain="modern")
 
     data.update(
         {
