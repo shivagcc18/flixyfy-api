@@ -6,3 +6,9 @@ __pycache__/
 *.sqlite3
 *.csv
 *.log
+# Local generated backups and reports
+.env.local
+backups/
+reports/
+app/main_v3_BACKUP_*.py
+app/main_v3_24june.py
