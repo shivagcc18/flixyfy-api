@@ -199,337 +199,14 @@ def load_ott_links(tmdb_id):
         conn.close()
 
 
-
-def safe_int(value):
-    try:
-        if value is None or value == "":
-            return None
-        return int(value)
-    except Exception:
-        return None
-
-
-def safe_float(value):
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
-def quote_ident(name):
-    return '"' + str(name).replace('"', '""') + '"'
-
-
-def table_exists(table_name):
-    conn = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name = %s
-            LIMIT 1
-            """,
-            (table_name,),
-        )
-        return cur.fetchone() is not None
-    except Exception:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        return False
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def table_columns(table_name):
-    conn = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name = %s
-            """,
-            (table_name,),
-        )
-        return {r["column_name"] for r in cur.fetchall()}
-    except Exception:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        return set()
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def normalize_detail_row(row, domain, source_table, slug_value):
-    if not row:
-        return None
-
-    row = dict(row)
-    row["_flixyfy_domain"] = domain
-    row["_flixyfy_source_table"] = source_table
-
-    if not row.get("slug"):
-        row["slug"] = slug_value
-
-    if not row.get("movie_url") and row.get("slug"):
-        row["movie_url"] = f"/movie/{row.get('slug')}"
-
-    if row.get("release_year") is None:
-        row["release_year"] = row.get("year") or row.get("movie_year")
-
-    if row.get("primary_language") is None:
-        row["primary_language"] = row.get("language") or row.get("language_name")
-
-    if row.get("language_slug") is None:
-        lang = row.get("primary_language") or row.get("language")
-        row["language_slug"] = str(lang).strip().lower().replace(" ", "-") if lang else None
-
-    if row.get("rating") is None:
-        row["rating"] = row.get("vote_average") or row.get("imdb_rating")
-
-    if row.get("poster_url") is None:
-        row["poster_url"] = row.get("poster") or row.get("poster_path")
-
-    if row.get("backdrop_url") is None:
-        row["backdrop_url"] = row.get("backdrop") or row.get("backdrop_path")
-
-    return row
-
-
-def resolve_movie_by_slug(slug, preferred_domain=None):
-    """
-    Unified resolver for MovieDetail.
-    Searches current, historical, and Hollywood serving tables.
-    """
-    slug = (slug or "").strip()
-    if not slug:
-        return None
-
-    candidates = []
-
-    # Prefer configured serving table first for normal current catalog.
-    if TABLE:
-        candidates.append(("current", TABLE))
-
-    candidates.extend(
-        [
-            ("current", "media_serving_v8_expanded"),
-            ("current_v8", "media_serving_v8_expanded"),
-            ("current_v7", "media_serving_v7_final"),
-            ("historical", "historical_detail_serving_v1"),
-            ("historical", "historical_serving_v1"),
-            ("hollywood", "hollywood_detail_serving_v3"),
-            ("hollywood", "hollywood_serving_v3"),
-        ]
-    )
-
-    seen = set()
-    ordered = []
-
-    for domain, table in candidates:
-        key = (domain, table)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if preferred_domain and domain != preferred_domain:
-            continue
-
-        ordered.append((domain, table))
-
-    if preferred_domain:
-        # If preferred lookup fails, fall back to all domains.
-        for domain, table in candidates:
-            key = (domain, table)
-            if key not in seen:
-                ordered.append((domain, table))
-                seen.add(key)
+def load_youtube_links(tmdb_id):
+    if not tmdb_id:
+        return []
 
     conn = get_conn()
     cur = conn.cursor()
 
     try:
-        for domain, table in ordered:
-            if not table_exists(table):
-                continue
-
-            cols = table_columns(table)
-            slug_col = None
-            for c in ["slug", "movie_slug", "media_slug", "canonical_slug"]:
-                if c in cols:
-                    slug_col = c
-                    break
-
-            if not slug_col:
-                continue
-
-            cur.execute(
-                f"""
-                SELECT *
-                FROM {quote_ident(table)}
-                WHERE {quote_ident(slug_col)} = %s
-                LIMIT 1
-                """,
-                (slug,),
-            )
-
-            row = cur.fetchone()
-            if row:
-                return normalize_detail_row(row, domain, table, slug)
-
-        return None
-
-    finally:
-        conn.close()
-
-
-def load_youtube_links(tmdb_id=None, slug=None, domain=None, title=None, year=None):
-    """
-    Production-safe YouTube links.
-
-    Primary:
-    - public.youtube_full_movie_links_v2 by movie_slug.
-    - No narrow domain filter. New sync contains current/historical and legacy unknown-domain rows.
-
-    Fallback:
-    - youtube_variants_v2 by tmdb_id.
-    """
-    slug = (slug or "").strip()
-
-    if slug:
-        conn = None
-        try:
-            conn = get_conn()
-            cur = conn.cursor()
-
-            cur.execute(
-                """
-                SELECT
-                    domain,
-                    normalized_domain,
-                    movie_id,
-                    movie_slug,
-                    movie_key,
-                    title,
-                    year,
-                    youtube_video_id,
-                    youtube_url,
-                    youtube_title,
-                    COALESCE(youtube_channel, channel_name) AS youtube_channel,
-                    duration_seconds,
-                    view_count,
-                    match_score,
-                    match_type,
-                    source,
-                    source_generation,
-                    source_table,
-                    source_run_id,
-                    source_local_stage_id,
-                    quality_score,
-                    audio_language,
-                    is_dubbed,
-                    status
-                FROM public.youtube_full_movie_links_v2
-                WHERE COALESCE(status, 'active') = 'active'
-                  AND movie_slug = %s
-                ORDER BY
-                    CASE
-                        WHEN normalized_domain = %s THEN 1
-                        WHEN domain = %s THEN 2
-                        WHEN normalized_domain = 'current' THEN 3
-                        WHEN domain IN ('current', 'current_v8', 'current_v7') THEN 4
-                        WHEN normalized_domain = 'historical' THEN 5
-                        WHEN domain = 'historical' THEN 6
-                        WHEN domain IS NULL OR domain = '' OR domain = 'unknown' THEN 7
-                        ELSE 9
-                    END,
-                    COALESCE(quality_score, final_score, match_score, 0) DESC NULLS LAST,
-                    view_count DESC NULLS LAST,
-                    youtube_video_id ASC
-                LIMIT 5
-                """,
-                (slug, domain, domain),
-            )
-
-            rows = cur.fetchall()
-
-            if rows:
-                return [
-                    {
-                        "domain": r.get("domain"),
-                        "normalized_domain": r.get("normalized_domain"),
-                        "movie_id": r.get("movie_id"),
-                        "movie_slug": r.get("movie_slug"),
-                        "movie_key": r.get("movie_key"),
-                        "video_id": r.get("youtube_video_id"),
-                        "youtube_video_id": r.get("youtube_video_id"),
-                        "video_url": r.get("youtube_url"),
-                        "youtube_url": r.get("youtube_url"),
-                        "youtube_title": r.get("youtube_title"),
-                        "youtube_channel": r.get("youtube_channel"),
-                        "duration_seconds": r.get("duration_seconds"),
-                        "view_count": r.get("view_count"),
-                        "match_score": r.get("match_score"),
-                        "match_type": r.get("match_type"),
-                        "quality_score": r.get("quality_score"),
-                        "audio_language": r.get("audio_language"),
-                        "is_dubbed": as_bool(r.get("is_dubbed")),
-                        "trusted_brand": True,
-                        "source": r.get("source") or r.get("source_table") or "youtube_full_movie_links_v2",
-                        "source_generation": r.get("source_generation"),
-                        "source_run_id": r.get("source_run_id"),
-                        "variant_type": "FULL_MOVIE",
-                        "provider_name": "YouTube",
-                        "provider_type": "free",
-                        "is_official": True,
-                        "is_active": True,
-                    }
-                    for r in rows
-                ]
-
-        except Exception:
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-    if not tmdb_id:
-        return []
-
-    conn = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
         cur.execute(
             """
             WITH ranked AS (
@@ -550,26 +227,31 @@ def load_youtube_links(tmdb_id=None, slug=None, domain=None, title=None, year=No
                     is_active,
                     ROW_NUMBER() OVER (
                         PARTITION BY youtube_language
-                        ORDER BY view_count DESC NULLS LAST, duration_seconds DESC NULLS LAST, video_id ASC
+                        ORDER BY
+                            view_count DESC NULLS LAST,
+                            duration_seconds DESC NULLS LAST,
+                            video_id ASC
                     ) AS rn
                 FROM youtube_variants_v2
                 WHERE tmdb_id = %s
                   AND is_active = 1
                   AND variant_type = 'FULL_MOVIE'
             )
-            SELECT * FROM ranked
+            SELECT *
+            FROM ranked
             WHERE rn = 1
             ORDER BY view_count DESC NULLS LAST
             LIMIT 5
             """,
             (tmdb_id,),
         )
+
         rows = cur.fetchall()
+
         return [
             {
                 "video_id": r.get("video_id"),
                 "video_url": r.get("video_url"),
-                "youtube_url": r.get("video_url"),
                 "youtube_title": r.get("youtube_title"),
                 "clean_title": r.get("clean_title"),
                 "youtube_language": r.get("youtube_language"),
@@ -585,41 +267,19 @@ def load_youtube_links(tmdb_id=None, slug=None, domain=None, title=None, year=No
             }
             for r in rows
         ]
-    except Exception:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        return []
     finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
+        conn.close()
 
 
 def movie_detail(row):
     data = movie_card(row)
     tmdb_id = row.get("tmdb_id")
-    slug = row.get("slug")
-    domain = row.get("_flixyfy_domain") or row.get("normalized_domain") or row.get("domain") or "current"
 
-    youtube_variants = load_youtube_links(
-        tmdb_id=tmdb_id,
-        slug=slug,
-        domain=domain,
-        title=row.get("title"),
-        year=row.get("release_year") or row.get("year"),
-    )
+    youtube_variants = load_youtube_links(tmdb_id)
 
     data.update(
         {
-            "domain": domain,
-            "source_table": row.get("_flixyfy_source_table"),
-            "overview": row.get("overview") or row.get("plot") or row.get("description"),
+            "overview": row.get("overview"),
             "runtime": row.get("runtime"),
             "genres": parse_json(row.get("genres"), []),
             "imdb_id": row.get("imdb_id"),
@@ -629,7 +289,7 @@ def movie_detail(row):
             "omdb_genre": row.get("omdb_genre"),
             "director": row.get("director"),
             "writers": row.get("writers"),
-            "actors": row.get("actors") or row.get("cast"),
+            "actors": row.get("actors"),
             "awards": row.get("awards"),
             "certification": row.get("certification"),
             "trailer_url": row.get("trailer_url"),
@@ -779,51 +439,20 @@ def movies(
     }
 
 
-
 @app.get("/api/v3/movie/{slug}")
 def get_movie(slug: str):
-    row = resolve_movie_by_slug(slug)
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT * FROM {TABLE} WHERE slug = %s LIMIT 1", (slug,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
 
     if not row:
         raise HTTPException(status_code=404, detail="Movie not found")
 
     return movie_detail(row)
-
-
-@app.get("/api/v3/movies/{slug}")
-def get_movie_plural_alias(slug: str):
-    return get_movie(slug)
-
-
-@app.get("/api/v3/historical/movie/{slug}")
-def get_historical_movie(slug: str):
-    row = resolve_movie_by_slug(slug, preferred_domain="historical")
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Historical movie not found")
-
-    return movie_detail(row)
-
-
-@app.get("/api/v3/historical/movies/{slug}")
-def get_historical_movie_plural_alias(slug: str):
-    return get_historical_movie(slug)
-
-
-@app.get("/api/v3/hollywood/movie/{slug}")
-def get_hollywood_movie(slug: str):
-    row = resolve_movie_by_slug(slug, preferred_domain="hollywood")
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Hollywood movie not found")
-
-    return movie_detail(row)
-
-
-@app.get("/api/v3/hollywood/movies/{slug}")
-def get_hollywood_movie_plural_alias(slug: str):
-    return get_hollywood_movie(slug)
-
 
 
 @app.get("/api/v3/search")

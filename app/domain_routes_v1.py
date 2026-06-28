@@ -16,11 +16,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 MODERN_TABLE = os.getenv("SERVING_TABLE", "media_serving_v8_expanded")
 
-HOLLYWOOD_TABLE = os.getenv("HOLLYWOOD_SERVING_TABLE", "hollywood_serving_v1")
-HOLLYWOOD_CARD_TABLE = os.getenv("HOLLYWOOD_CARD_TABLE", "hollywood_card_serving_v1")
-HOLLYWOOD_DETAIL_TABLE = os.getenv("HOLLYWOOD_DETAIL_TABLE", "hollywood_detail_serving_v1")
-HOLLYWOOD_SEARCH_TABLE = os.getenv("HOLLYWOOD_SEARCH_TABLE", "hollywood_search_serving_v1")
-HOLLYWOOD_AVAILABILITY_TABLE = os.getenv("HOLLYWOOD_AVAILABILITY_TABLE", "hollywood_availability_v2")
+HOLLYWOOD_TABLE = os.getenv("HOLLYWOOD_SERVING_TABLE", "hollywood_serving_v3")
+HOLLYWOOD_CARD_TABLE = os.getenv("HOLLYWOOD_CARD_TABLE", "hollywood_card_serving_v3")
+HOLLYWOOD_DETAIL_TABLE = os.getenv("HOLLYWOOD_DETAIL_TABLE", "hollywood_detail_serving_v3")
+HOLLYWOOD_SEARCH_TABLE = os.getenv("HOLLYWOOD_SEARCH_TABLE", "hollywood_search_serving_v3")
+HOLLYWOOD_AVAILABILITY_TABLE = os.getenv("HOLLYWOOD_AVAILABILITY_TABLE", "hollywood_availability_v3")
 
 HISTORICAL_TABLE = os.getenv("HISTORICAL_SERVING_TABLE", "historical_serving_v1")
 HISTORICAL_CARD_TABLE = os.getenv("HISTORICAL_CARD_TABLE", "historical_card_serving_v1")
