@@ -374,6 +374,8 @@ def fetch_rows(
     language: Optional[str] = None,
     year: Optional[int] = None,
     sort: str = "popular",
+    provider: Optional[str] = None,
+    availability: Optional[str] = None,
 ):
     if not table_exists(table_name):
         raise HTTPException(status_code=500, detail=f"Missing table: {table_name}")
@@ -386,6 +388,42 @@ def fetch_rows(
         language=language,
         year=year,
     )
+
+    def add_where(condition: str):
+        nonlocal where
+        where = f"{where} AND {condition}" if where else f"WHERE {condition}"
+
+    provider_text = str(provider or "").strip().lower()
+    availability_text = str(availability or "").strip().lower()
+
+    if domain == "hollywood" and table_exists(HOLLYWOOD_AVAILABILITY_TABLE):
+        if availability_text == "ott":
+            add_where(
+                "tmdb_id IN ("
+                f"SELECT tmdb_id FROM public.{qident(HOLLYWOOD_AVAILABILITY_TABLE)} "
+                "WHERE COALESCE(has_confirmed_ott, 0) = 1 OR COALESCE(provider_count, 0) > 0"
+                ")"
+            )
+
+        if availability_text == "free":
+            add_where(
+                "tmdb_id IN ("
+                f"SELECT tmdb_id FROM public.{qident(HOLLYWOOD_AVAILABILITY_TABLE)} "
+                "WHERE LOWER(COALESCE(provider_links_json, '')) LIKE %s"
+                ")"
+            )
+            params.append("%youtube%")
+
+        if provider_text:
+            provider_like = provider_text.replace("_", " ")
+            add_where(
+                "tmdb_id IN ("
+                f"SELECT tmdb_id FROM public.{qident(HOLLYWOOD_AVAILABILITY_TABLE)} "
+                "WHERE LOWER(COALESCE(provider_links_json, '')) LIKE %s "
+                "OR LOWER(COALESCE(provider_links_json, '')) LIKE %s"
+                ")"
+            )
+            params.extend([f"%{provider_text}%", f"%{provider_like}%"])
 
     order = order_sql(table_name, sort)
 
@@ -913,6 +951,9 @@ def hollywood_movies(
     limit: int = Query(24, ge=1, le=100),
     q: str = Query("", min_length=0),
     year: Optional[int] = None,
+    provider: Optional[str] = None,
+    availability: Optional[str] = None,
+    has_ott: Optional[str] = None,
     sort: str = Query("popular"),
 ):
     table_name = HOLLYWOOD_CARD_TABLE if table_exists(HOLLYWOOD_CARD_TABLE) else HOLLYWOOD_TABLE
@@ -926,6 +967,8 @@ def hollywood_movies(
         language=None,
         year=year,
         sort=sort,
+        provider=provider,
+        availability=availability or ("ott" if str(has_ott or "").lower() in ("1", "true", "yes") else None),
     )
 
 
