@@ -1286,9 +1286,35 @@ def _fhp_list_card(row):
 
 
 def _fhp_detail(row):
-    data = _fhp_card(row)
+    data = _fhp_list_card(row)
     slug = data.get("slug")
-    links = _fhp_verified_links(slug)
+    youtube_url = _fhp_pick(row, "youtube_url")
+    links = []
+    if _fhp_is_youtube_url(youtube_url):
+        links.append(
+            {
+                "domain": "historical",
+                "slug": slug,
+                "title": _fhp_pick(row, "title", "youtube_title"),
+                "provider": "YouTube",
+                "provider_key": "youtube",
+                "provider_display_name": "YouTube",
+                "provider_type": "free",
+                "button_label": "Watch on YouTube",
+                "final_url": youtube_url,
+                "url": youtube_url,
+                "youtube_url": youtube_url,
+                "youtube_title": _fhp_pick(row, "youtube_title", "title"),
+                "youtube_video_id": _fhp_pick(row, "youtube_video_id", "video_id"),
+                "youtube_language": _fhp_pick(row, "youtube_language", "language"),
+                "active": True,
+                "is_free": True,
+                "has_youtube": True,
+                "has_ott": True,
+                "ott_primary": "YouTube",
+                "ott_primary_key": "youtube",
+            }
+        )
     primary = links[0] if links else None
 
     data.update(
@@ -1336,13 +1362,6 @@ def _fhp_detail(row):
 
 def _fhp_fetch_historical_row(slug):
     for table in ("historical_detail_serving_v1", "historical_serving_v1", "historical_card_serving_v1"):
-        if not _fhp_table_exists(table):
-            continue
-
-        cols = set(_fhp_columns(table))
-        if "slug" not in cols:
-            continue
-
         rows = _fhp_rows('SELECT * FROM "' + table + '" WHERE slug=%s LIMIT 1', [slug])
         if rows:
             return rows[0]
