@@ -1306,6 +1306,197 @@ def _fhp_fetch_historical_row(slug):
     return None
 
 
+def _fhp_parse_json_list(value):
+    if value is None or value == "":
+        return []
+
+    if isinstance(value, list):
+        return value
+
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _fhp_combo_payload(row):
+    person_a = _fhp_pick(row, "person_a")
+    person_b = _fhp_pick(row, "person_b")
+
+    return {
+        "combo_key": _fhp_pick(row, "combo_key"),
+        "combo_type": _fhp_pick(row, "combo_type"),
+        "person_a": person_a,
+        "person_a_slug": _fhp_pick(row, "person_a_slug"),
+        "person_b": person_b,
+        "person_b_slug": _fhp_pick(row, "person_b_slug"),
+        "title": f"{person_a} + {person_b} Movies" if person_a and person_b else _fhp_pick(row, "seo_title"),
+        "movie_count": _fhp_int(_fhp_pick(row, "movie_count"), 0),
+        "youtube_movie_count": _fhp_int(_fhp_pick(row, "youtube_movie_count"), 0),
+        "languages": _fhp_parse_json_list(_fhp_pick(row, "languages_json")),
+        "years": _fhp_parse_json_list(_fhp_pick(row, "years_json")),
+        "seo_url": _fhp_pick(row, "seo_url"),
+        "seo_title": _fhp_pick(row, "seo_title"),
+        "meta_description": _fhp_pick(row, "meta_description"),
+        "indexable": _fhp_bool(_fhp_pick(row, "indexable")),
+        "index_reason": _fhp_pick(row, "index_reason"),
+    }
+
+
+def _fhp_combo_movie_card(row):
+    slug = _fhp_pick(row, "slug", "movie_slug")
+    data = _fhp_card({**row, "slug": slug})
+    data["id"] = _fhp_pick(row, "movie_id", "id")
+    data["title"] = _fhp_pick(row, "title", "combo_title") or data.get("title")
+    data["release_year"] = _fhp_pick(row, "release_year", "combo_release_year", "year") or data.get("release_year")
+    data["year"] = data.get("release_year")
+    data["language_slug"] = _fhp_pick(row, "language_slug", "combo_language_slug", "language") or data.get("language_slug")
+    data["movie_url"] = _fhp_route_for(slug)
+
+    if _fhp_bool(_fhp_pick(row, "combo_has_youtube", "has_youtube")) and not data.get("has_ott"):
+        data["has_ott"] = True
+        data["has_free_ott"] = True
+        data["is_free"] = True
+        data["ott_primary"] = "YouTube"
+        data["ott_primary_key"] = "youtube"
+
+    return data
+
+
+@router.get("/api/v3/historical/combinations")
+def historical_combinations_patched_v1(
+    page: int = 1,
+    limit: int = 48,
+    q: str = None,
+    min_movies: int = 2,
+    youtube_only: bool = False,
+):
+    if not _fhp_table_exists("historical_combo_seo_preprod_v1"):
+        return {"domain": "historical", "page": page, "limit": limit, "total": 0, "pages": 0, "items": []}
+
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 48), 100))
+    offset = (page - 1) * limit
+
+    where = ["COALESCE(indexable, 0) = 1", "COALESCE(movie_count, 0) >= %s"]
+    params = [max(1, int(min_movies or 1))]
+
+    if q:
+        text = f"%{str(q).strip().lower()}%"
+        where.append("(LOWER(person_a) LIKE %s OR LOWER(person_b) LIKE %s OR LOWER(seo_title) LIKE %s)")
+        params.extend([text, text, text])
+
+    if youtube_only:
+        where.append("COALESCE(youtube_movie_count, 0) > 0")
+
+    where_sql = "WHERE " + " AND ".join(where)
+    count_rows = _fhp_rows(
+        f"SELECT COUNT(*) AS total FROM historical_combo_seo_preprod_v1 {where_sql}",
+        params,
+    )
+    total = _fhp_int(count_rows[0].get("total") if count_rows else 0, 0)
+
+    rows = _fhp_rows(
+        f"""
+        SELECT *
+        FROM historical_combo_seo_preprod_v1
+        {where_sql}
+        ORDER BY COALESCE(youtube_movie_count, 0) DESC, COALESCE(movie_count, 0) DESC, person_a ASC, person_b ASC
+        LIMIT %s OFFSET %s
+        """,
+        params + [limit, offset],
+    )
+
+    return {
+        "domain": "historical",
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "pages": (total + limit - 1) // limit if limit else 0,
+        "items": [_fhp_combo_payload(row) for row in rows],
+    }
+
+
+@router.get("/api/v3/historical/combination/{combo_slug}")
+def historical_combination_detail_patched_v1(combo_slug: str, page: int = 1, limit: int = 96):
+    if not _fhp_table_exists("historical_combo_seo_preprod_v1") or not _fhp_table_exists("historical_combo_movie_index_preprod_v1"):
+        raise HTTPException(status_code=404, detail="Historical combination data not found")
+
+    slug = str(combo_slug or "").strip().strip("/")
+    seo_url = f"/historical/combination/{slug}"
+    alt_seo_url = f"historical/combination/{slug}"
+
+    combo_rows = _fhp_rows(
+        """
+        SELECT *
+        FROM historical_combo_seo_preprod_v1
+        WHERE seo_url IN (%s, %s)
+           OR (person_a_slug || '-' || person_b_slug) = %s
+           OR (person_b_slug || '-' || person_a_slug) = %s
+        LIMIT 1
+        """,
+        [seo_url, alt_seo_url, slug, slug],
+    )
+
+    if not combo_rows:
+        raise HTTPException(status_code=404, detail="Historical combination not found")
+
+    combo = _fhp_combo_payload(combo_rows[0])
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 96), 200))
+    offset = (page - 1) * limit
+
+    count_rows = _fhp_rows(
+        "SELECT COUNT(*) AS total FROM historical_combo_movie_index_preprod_v1 WHERE combo_key=%s",
+        [combo["combo_key"]],
+    )
+    total = _fhp_int(count_rows[0].get("total") if count_rows else 0, 0)
+
+    serving_table = "historical_card_serving_v1" if _fhp_table_exists("historical_card_serving_v1") else None
+    if serving_table:
+        movie_rows = _fhp_rows(
+            f"""
+            SELECT h.*,
+                   cm.movie_id,
+                   cm.movie_slug,
+                   cm.title AS combo_title,
+                   cm.release_year AS combo_release_year,
+                   cm.language_slug AS combo_language_slug,
+                   cm.has_youtube AS combo_has_youtube
+            FROM historical_combo_movie_index_preprod_v1 cm
+            LEFT JOIN {serving_table} h ON h.slug = cm.movie_slug
+            WHERE cm.combo_key=%s
+            ORDER BY COALESCE(cm.has_youtube, 0) DESC, cm.release_year DESC NULLS LAST, cm.title ASC
+            LIMIT %s OFFSET %s
+            """,
+            [combo["combo_key"], limit, offset],
+        )
+    else:
+        movie_rows = _fhp_rows(
+            """
+            SELECT *
+            FROM historical_combo_movie_index_preprod_v1
+            WHERE combo_key=%s
+            ORDER BY COALESCE(has_youtube, 0) DESC, release_year DESC NULLS LAST, title ASC
+            LIMIT %s OFFSET %s
+            """,
+            [combo["combo_key"], limit, offset],
+        )
+
+    items = [_fhp_combo_movie_card(row) for row in movie_rows if _fhp_pick(row, "slug", "movie_slug")]
+
+    return {
+        "domain": "historical",
+        "combo": combo,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "pages": (total + limit - 1) // limit if limit else 0,
+        "items": items,
+    }
+
+
 @router.get("/api/v3/historical")
 def historical_movies_patched_v1(
     page: int = 1,
