@@ -12,3 +12,17 @@ backups/
 reports/
 app/main_v3_BACKUP_*.py
 app/main_v3_24june.py
+
+# Local one-off ops artifacts
+*.backup_*
+*.BACKUP_*
+*_BACKUP_*.py
+patch_*_v*.py
+inspect_*_v*.py
+create_*_v*.py
+drop_*_v*.py
+load_*_v*.py
+rebuild_*_v*.py
+add_*_indexes.py
+main.py
+railway.json
