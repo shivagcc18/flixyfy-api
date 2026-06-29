@@ -1241,6 +1241,50 @@ def _fhp_card(row):
     }
 
 
+def _fhp_list_card(row):
+    slug = _fhp_pick(row, "slug")
+    youtube_url = _fhp_pick(row, "youtube_url")
+    has_youtube = _fhp_is_youtube_url(youtube_url) or _fhp_bool(_fhp_pick(row, "has_youtube"))
+    has_ott = has_youtube or _fhp_bool(_fhp_pick(row, "has_ott"))
+
+    return {
+        "domain": "historical",
+        "source_domain": "historical",
+        "source_label": "Historical Indian",
+        "id": _fhp_pick(row, "id"),
+        "tmdb_id": _fhp_pick(row, "tmdb_id"),
+        "imdb_id": _fhp_pick(row, "imdb_id"),
+        "title": _fhp_pick(row, "title"),
+        "original_title": _fhp_pick(row, "original_title"),
+        "slug": slug,
+        "movie_url": _fhp_pick(row, "movie_url") or _fhp_route_for(slug),
+        "release_year": _fhp_pick(row, "release_year", "year"),
+        "year": _fhp_pick(row, "release_year", "year"),
+        "primary_language": _fhp_pick(row, "primary_language", "language_name"),
+        "language_name": _fhp_pick(row, "language_name", "primary_language"),
+        "language_slug": _fhp_pick(row, "language_slug", "language"),
+        "poster_url": _fhp_pick(row, "poster_url"),
+        "backdrop_url": _fhp_pick(row, "backdrop_url"),
+        "rating": _fhp_pick(row, "rating"),
+        "vote_count": _fhp_pick(row, "vote_count"),
+        "popularity": _fhp_pick(row, "popularity"),
+        "quality_score": _fhp_pick(row, "quality_score"),
+        "ott_primary": "YouTube" if has_youtube else _fhp_pick(row, "ott_primary"),
+        "ott_primary_key": "youtube" if has_youtube else (_fhp_pick(row, "ott_primary_key") or ""),
+        "ott_count": 1 if has_youtube else _fhp_pick(row, "ott_count"),
+        "has_ott": has_ott,
+        "has_free_ott": has_youtube or _fhp_bool(_fhp_pick(row, "has_free_ott")),
+        "has_subscription_ott": _fhp_bool(_fhp_pick(row, "has_subscription_ott")),
+        "has_rent_ott": _fhp_bool(_fhp_pick(row, "has_rent_ott")),
+        "has_buy_ott": _fhp_bool(_fhp_pick(row, "has_buy_ott")),
+        "is_free": has_youtube or _fhp_bool(_fhp_pick(row, "is_free")),
+        "youtube_url": youtube_url,
+        "youtube_title": _fhp_pick(row, "youtube_title"),
+        "youtube_video_id": _fhp_pick(row, "youtube_video_id"),
+        "youtube_count": 1 if has_youtube else 0,
+    }
+
+
 def _fhp_detail(row):
     data = _fhp_card(row)
     slug = data.get("slug")
@@ -1514,8 +1558,6 @@ def historical_movies_patched_v1(
     offset = (page - 1) * limit
 
     table = "historical_card_serving_v1"
-    if not _fhp_table_exists(table):
-        table = "historical_serving_v1"
 
     where = []
     params = []
@@ -1558,36 +1600,27 @@ def historical_movies_patched_v1(
 
     where_sql = "WHERE " + " AND ".join(where) if where else ""
 
+    order_sql = "ORDER BY"
+    if sort == "latest":
+        order_sql += " release_year DESC NULLS LAST, title ASC"
+    elif sort == "title":
+        order_sql += " title ASC"
+    elif sort == "rating":
+        order_sql += " rating DESC NULLS LAST, title ASC"
+    else:
+        order_sql += " release_year DESC NULLS LAST, title ASC"
+
     rows = _fhp_rows(
-        f'SELECT h.* FROM "{table}" h {join_sql} {where_sql}',
-        params,
+        f'SELECT h.* FROM "{table}" h {join_sql} {where_sql} {order_sql} LIMIT %s OFFSET %s',
+        params + [limit, offset],
     )
 
-    items = [_fhp_card(row) for row in rows if not _fhp_bad_person_row(row)]
+    items = [_fhp_list_card(row) for row in rows if not _fhp_bad_person_row(row)]
 
     if provider_text == "youtube" or availability_text in ("youtube", "true", "ott", "1"):
         items = [item for item in items if item.get("youtube_count", 0) > 0 or item.get("has_ott") is True]
-
-    def sort_key(item):
-        poster_rank = 0 if _fhp_has_real_poster(item) else 1
-        ott_rank = 0 if item.get("has_ott") else 1
-        year_value = _fhp_int(item.get("release_year"), 0)
-        title_value = str(item.get("title") or "")
-
-        if sort == "latest":
-            return (poster_rank, ott_rank, -year_value, title_value)
-        if sort == "title":
-            return (poster_rank, ott_rank, title_value)
-        if sort == "rating":
-            return (poster_rank, ott_rank, -float(item.get("rating") or 0), title_value)
-
-        return (poster_rank, ott_rank, -_fhp_int(item.get("youtube_count"), 0), -year_value, title_value)
-
-    items.sort(key=sort_key)
-
-    total = len(items)
-    paged = items[offset: offset + limit]
-    pages = (total + limit - 1) // limit if limit else 0
+    total = offset + len(items) + (1 if len(rows) == limit else 0)
+    pages = page + (1 if len(rows) == limit else 0)
 
     return {
         "domain": "historical",
@@ -1596,7 +1629,7 @@ def historical_movies_patched_v1(
         "limit": limit,
         "total": total,
         "pages": pages,
-        "items": paged,
+        "items": items,
     }
 
 
