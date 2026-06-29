@@ -432,13 +432,6 @@ def fetch_rows(
 
     try:
         cur.execute(
-            f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where}",
-            params,
-        )
-
-        total = cur.fetchone()["total"]
-
-        cur.execute(
             f"""
             SELECT *
             FROM public.{qident(table_name)}
@@ -446,12 +439,16 @@ def fetch_rows(
             ORDER BY {order}
             LIMIT %s OFFSET %s
             """,
-            params + [limit, offset],
+            params + [limit + 1, offset],
         )
 
         rows = cur.fetchall()
     finally:
         conn.close()
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    total = offset + len(rows) + (1 if has_more else 0)
 
     return {
         "domain": domain,
@@ -459,7 +456,7 @@ def fetch_rows(
         "page": page,
         "limit": limit,
         "total": total,
-        "pages": (total + limit - 1) // limit,
+        "pages": page + (1 if has_more else 0),
         "items": [domain_card(dict(r), domain) for r in rows],
     }
 
@@ -1781,7 +1778,7 @@ def historical_movies_patched_v1(
     provider_text = str(provider or "").strip().lower()
     availability_text = str(availability or has_ott or "").strip().lower()
 
-    youtube_only = provider_text in ("youtube", "youTube") or availability_text in ("youtube", "true", "ott", "1")
+    youtube_only = provider_text == "youtube" or availability_text in ("youtube", "free", "true", "ott", "1")
 
     join_sql = ""
     if youtube_only and _fhp_table_exists("historical_youtube_verified_links_v1"):
@@ -1817,7 +1814,7 @@ def historical_movies_patched_v1(
 
     items = [_fhp_list_card(row) for row in rows if not _fhp_bad_person_row(row)]
 
-    if provider_text == "youtube" or availability_text in ("youtube", "true", "ott", "1"):
+    if provider_text == "youtube" or availability_text in ("youtube", "free", "true", "ott", "1"):
         items = [item for item in items if item.get("youtube_count", 0) > 0 or item.get("has_ott") is True]
     total = offset + len(items) + (1 if len(rows) == limit else 0)
     pages = page + (1 if len(rows) == limit else 0)
