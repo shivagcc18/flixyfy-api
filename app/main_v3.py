@@ -145,6 +145,105 @@ def load_ott_links(tmdb_id):
     if not tmdb_id:
         return []
 
+    v2_rows = load_ott_links_v2(tmdb_id)
+
+    if v2_rows is not None:
+        return v2_rows
+
+    return load_ott_provider_links_fallback(tmdb_id)
+
+
+def load_ott_links_v2(tmdb_id):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT
+                provider_key,
+                provider_display_name,
+                provider_category,
+                provider_type,
+                region,
+                deep_link,
+                final_url,
+                final_url_source,
+                button_label,
+                source_layer,
+                source_method,
+                priority,
+                confidence
+            FROM ott_availability_normalized_v2
+            WHERE CAST(tmdb_id AS TEXT) = CAST(%s AS TEXT)
+            ORDER BY
+                CASE WHEN UPPER(COALESCE(region, '')) = 'IN' THEN 0 ELSE 1 END,
+                priority NULLS LAST,
+                CASE LOWER(COALESCE(provider_category, provider_type, ''))
+                    WHEN 'subscription' THEN 1
+                    WHEN 'flatrate' THEN 1
+                    WHEN 'free' THEN 2
+                    WHEN 'free_with_ads' THEN 3
+                    WHEN 'ads' THEN 3
+                    WHEN 'rent' THEN 4
+                    WHEN 'buy' THEN 5
+                    ELSE 9
+                END,
+                provider_display_name
+            """,
+            (tmdb_id,),
+        )
+
+        rows = cur.fetchall()
+
+        return [normalize_ott_v2_row(r) for r in rows]
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        conn.close()
+
+
+def normalize_ott_v2_row(row):
+    provider_name = row.get("provider_display_name")
+    provider_key = row.get("provider_key") or normalize_provider_key(provider_name)
+    provider_category = row.get("provider_category")
+    provider_type = row.get("provider_type") or provider_category
+    homepage_url = None
+
+    if provider_key:
+        homepage_url = PROVIDER_HOME.get(provider_key)
+
+    final_url = row.get("final_url") or row.get("deep_link") or homepage_url
+
+    return {
+        "provider_key": provider_key,
+        "provider_display_name": provider_name,
+        "provider_category": provider_category,
+        "provider_type": provider_type,
+        "category": provider_category,
+        "type": provider_type,
+        "region": row.get("region"),
+        "deep_link": row.get("deep_link"),
+        "provider_deep_link": row.get("deep_link"),
+        "fallback_search_url": None,
+        "provider_search_url": None,
+        "homepage_url": homepage_url,
+        "provider_homepage_url": homepage_url,
+        "final_url": final_url,
+        "final_url_source": row.get("final_url_source"),
+        "button_label": row.get("button_label") or (f"Watch on {provider_name}" if provider_name else "Watch"),
+        "source_layer": row.get("source_layer"),
+        "source_method": row.get("source_method"),
+        "priority": row.get("priority"),
+        "confidence": row.get("confidence"),
+    }
+
+
+def load_ott_provider_links_fallback(tmdb_id):
     conn = get_conn()
     cur = conn.cursor()
 
@@ -606,6 +705,7 @@ def movie_detail(row):
     tmdb_id = row.get("tmdb_id")
     slug = row.get("slug")
     domain = row.get("_flixyfy_domain") or row.get("normalized_domain") or row.get("domain") or "current"
+    ott_links = load_ott_links(tmdb_id)
 
     youtube_variants = load_youtube_links(
         tmdb_id=tmdb_id,
@@ -634,7 +734,9 @@ def movie_detail(row):
             "certification": row.get("certification"),
             "trailer_url": row.get("trailer_url"),
             "production_companies": row.get("production_companies"),
-            "ott_all": load_ott_links(tmdb_id),
+            "availability": ott_links,
+            "ott_all": ott_links,
+            "watch_providers": ott_links,
             "youtube_variants": youtube_variants,
             "youtube_full_movies": youtube_variants,
             "youtube_count": len(youtube_variants),
@@ -642,6 +744,29 @@ def movie_detail(row):
             "updated_at": str(row.get("updated_at")) if row.get("updated_at") else None,
         }
     )
+
+    if ott_links:
+        primary_ott = ott_links[0]
+        categories = {
+            str(link.get("provider_category") or link.get("provider_type") or "").strip().lower()
+            for link in ott_links
+        }
+
+        data["has_ott"] = True
+        data["ott_count"] = len(ott_links)
+        data["ott_primary"] = primary_ott.get("provider_display_name")
+        data["ott_primary_key"] = primary_ott.get("provider_key")
+        data["has_free_ott"] = bool(categories & {"free", "free_with_ads", "ads"})
+        data["has_subscription_ott"] = bool(categories & {"subscription", "flatrate"})
+        data["has_rent_ott"] = "rent" in categories
+        data["has_buy_ott"] = "buy" in categories
+
+        raw = data.get("raw")
+        if isinstance(raw, dict):
+            raw["has_ott"] = 1
+            raw["ott_count"] = len(ott_links)
+            raw["ott_primary"] = data["ott_primary"]
+            raw["ott_primary_key"] = data["ott_primary_key"]
 
     data = enrich_historical_youtube_detail_patch_v2(data, row)
     return data

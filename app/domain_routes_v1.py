@@ -15,6 +15,12 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 MODERN_TABLE = os.getenv("SERVING_TABLE", "media_serving_v8_expanded")
+MODERN_SEARCH_TABLE = os.getenv("MODERN_SEARCH_TABLE", "media_serving_v8_expanded")
+
+WEBSERIES_SEARCH_TABLE = os.getenv("WEBSERIES_SEARCH_TABLE", "webseries_search_serving_v1")
+WEBSERIES_CARD_TABLE = os.getenv("WEBSERIES_CARD_TABLE", "webseries_card_serving_v1")
+WEBSERIES_DETAIL_TABLE = os.getenv("WEBSERIES_DETAIL_TABLE", "webseries_detail_serving_v1")
+WEBSERIES_AVAILABILITY_TABLE = os.getenv("WEBSERIES_AVAILABILITY_TABLE", "webseries_availability_serving_v1")
 
 HOLLYWOOD_TABLE = os.getenv("HOLLYWOOD_SERVING_TABLE", "hollywood_serving_v3")
 HOLLYWOOD_CARD_TABLE = os.getenv("HOLLYWOOD_CARD_TABLE", "hollywood_card_serving_v3")
@@ -813,7 +819,9 @@ def modern_card(row: Dict[str, Any]):
 
 
 def search_modern(query: str, limit: int, language: Optional[str], year: Optional[int]):
-    if not table_exists(MODERN_TABLE):
+    table_name = MODERN_SEARCH_TABLE if table_exists(MODERN_SEARCH_TABLE) else MODERN_TABLE
+
+    if not table_exists(table_name):
         return 0, []
 
     where = []
@@ -841,25 +849,41 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
 
     try:
         cur.execute(
-            f"SELECT COUNT(*) AS total FROM public.{qident(MODERN_TABLE)} {where_clause}",
+            f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where_clause}",
             params,
         )
 
         total = cur.fetchone()["total"]
+        order_params = []
+
+        if query:
+            order_sql = """
+                CASE
+                    WHEN LOWER(title) = LOWER(%s) THEN 1
+                    WHEN LOWER(title) LIKE LOWER(%s) THEN 2
+                    WHEN LOWER(COALESCE(original_title, '')) = LOWER(%s) THEN 3
+                    WHEN LOWER(COALESCE(original_title, '')) LIKE LOWER(%s) THEN 4
+                    ELSE 5
+                END,
+            """
+            order_params = [query, f"{query}%", query, f"{query}%"]
+        else:
+            order_sql = ""
 
         cur.execute(
             f"""
             SELECT *
-            FROM public.{qident(MODERN_TABLE)}
+            FROM public.{qident(table_name)}
             {where_clause}
             ORDER BY
+                {order_sql}
                 has_ott DESC NULLS LAST,
                 release_year DESC NULLS LAST,
                 COALESCE(rating, 0) DESC NULLS LAST,
                 title ASC
             LIMIT %s
             """,
-            params + [limit],
+            params + order_params + [limit],
         )
 
         items = [modern_card(dict(r)) for r in cur.fetchall()]
@@ -909,6 +933,175 @@ def search_domain(table_name: str, domain: str, query: str, limit: int, language
         conn.close()
 
     return total, items
+
+
+def webseries_card(row: Dict[str, Any]):
+    providers = parse_json(row.get("provider_names"), [])
+    major_providers = parse_json(row.get("major_provider_names"), [])
+    provider_list = major_providers if major_providers else providers
+    primary_provider = provider_list[0] if provider_list else None
+
+    return {
+        "domain": "webseries",
+        "content_type": "webseries",
+        "source_label": "Webseries",
+        "tmdb_id": row.get("tmdb_id"),
+        "title": row.get("title"),
+        "slug": row.get("slug"),
+        "movie_url": f"/webseries/{row.get('slug')}" if row.get("slug") else None,
+        "release_year": row.get("first_air_year"),
+        "year": row.get("first_air_year"),
+        "primary_language": row.get("original_language"),
+        "language_slug": row.get("original_language"),
+        "poster_url": fix_image_url(row.get("poster_path")),
+        "rating": row.get("vote_average"),
+        "vote_count": row.get("vote_count"),
+        "popularity": row.get("popularity_score"),
+        "quality_score": row.get("popularity_score"),
+        "ott_primary": primary_provider,
+        "ott_count": row.get("availability_count"),
+        "has_ott": as_bool(row.get("has_major_provider")) or bool(primary_provider),
+        "raw": dict(row),
+    }
+
+
+def search_webseries(query: str, limit: int, scope: str, year: Optional[int]):
+    if not table_exists(WEBSERIES_SEARCH_TABLE):
+        return 0, []
+
+    where = []
+    params = []
+
+    if query:
+        where.append(
+            "(LOWER(s.title) LIKE LOWER(%s) "
+            "OR LOWER(COALESCE(s.normalized_title, '')) LIKE LOWER(%s) "
+            "OR LOWER(COALESCE(s.search_text, '')) LIKE LOWER(%s))"
+        )
+        params.extend([f"%{query}%", f"%{query}%", f"%{query}%"])
+
+    if scope == "indian":
+        where.append("LOWER(COALESCE(s.region, '')) = 'indian'")
+
+    if year:
+        where.append("s.first_air_year = %s")
+        params.append(year)
+
+    where_clause = "WHERE " + " AND ".join(where) if where else ""
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            f"SELECT COUNT(*) AS total FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s {where_clause}",
+            params,
+        )
+        total = cur.fetchone()["total"]
+
+        order_params = []
+        if query:
+            order_sql = """
+                CASE
+                    WHEN LOWER(s.title) = LOWER(%s) THEN 1
+                    WHEN LOWER(s.title) LIKE LOWER(%s) THEN 2
+                    WHEN LOWER(COALESCE(s.normalized_title, '')) = LOWER(%s) THEN 3
+                    WHEN LOWER(COALESCE(s.normalized_title, '')) LIKE LOWER(%s) THEN 4
+                    ELSE 5
+                END,
+            """
+            order_params = [query, f"{query}%", query, f"{query}%"]
+        else:
+            order_sql = ""
+
+        cur.execute(
+            f"""
+            SELECT s.*, c.poster_path, c.vote_average, c.major_provider_names, c.availability_count
+            FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s
+            LEFT JOIN public.{qident(WEBSERIES_CARD_TABLE)} c ON c.slug = s.slug
+            {where_clause}
+            ORDER BY
+                {order_sql}
+                COALESCE(s.has_major_provider, 0) DESC,
+                COALESCE(s.popularity_score, 0) DESC,
+                s.first_air_year DESC NULLS LAST,
+                s.title ASC
+            LIMIT %s
+            """,
+            params + order_params + [limit],
+        )
+        items = [webseries_card(dict(r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    return total, items
+
+
+def webseries_availability(tmdb_id):
+    if not tmdb_id or not table_exists(WEBSERIES_AVAILABILITY_TABLE):
+        return []
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            f"""
+            SELECT provider_name, normalized_provider_name, monetization_type, watch_region,
+                   display_priority, tmdb_watch_link, is_major_indian_provider
+            FROM public.{qident(WEBSERIES_AVAILABILITY_TABLE)}
+            WHERE tmdb_id = %s
+            ORDER BY display_priority NULLS LAST, provider_name
+            """,
+            [tmdb_id],
+        )
+        return [
+            {
+                "provider_display_name": r.get("provider_name"),
+                "provider_key": normalize_provider_key(r.get("normalized_provider_name") or r.get("provider_name")),
+                "provider_type": r.get("monetization_type"),
+                "region": r.get("watch_region"),
+                "final_url": r.get("tmdb_watch_link"),
+                "button_label": f"Watch on {r.get('provider_name')}" if r.get("provider_name") else "Watch",
+                "priority": r.get("display_priority"),
+                "is_major_provider": as_bool(r.get("is_major_indian_provider")),
+            }
+            for r in cur.fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+@router.get("/api/v3/webseries/{slug}")
+def webseries_detail(slug: str):
+    row = row_by_slug(WEBSERIES_DETAIL_TABLE, slug)
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Webseries not found")
+
+    data = webseries_card(row)
+    availability = webseries_availability(row.get("tmdb_id"))
+
+    data.update(
+        {
+            "overview": row.get("overview") or row.get("omdb_plot"),
+            "genres": parse_json(row.get("genres"), []),
+            "backdrop_url": fix_image_url(row.get("backdrop_path")),
+            "imdb_id": row.get("imdb_id"),
+            "imdb_rating": row.get("omdb_imdb_rating"),
+            "imdb_votes": row.get("omdb_imdb_votes"),
+            "awards": row.get("omdb_awards"),
+            "first_air_date": row.get("first_air_date"),
+            "number_of_seasons": row.get("number_of_seasons"),
+            "number_of_episodes": row.get("number_of_episodes"),
+            "series_status": row.get("series_status"),
+            "series_type": row.get("series_type"),
+            "availability": availability,
+            "ott_all": availability,
+            "watch_providers": availability,
+        }
+    )
+    return data
 
 
 @router.get("/api/v3/domain-health")
@@ -1892,6 +2085,7 @@ def global_search(
     language: Optional[str] = None,
     year: Optional[int] = None,
     domain: Optional[str] = Query(None),
+    content_type: Optional[str] = Query(None, alias="type"),
 ):
     query = q.strip()
     offset = (page - 1) * limit
@@ -1902,10 +2096,18 @@ def global_search(
     else:
         requested = {"modern", "hollywood", "historical"}
 
+    requested_type = str(content_type or "movies").strip().lower()
+    if requested_type not in {"movies", "webseries", "all"}:
+        requested_type = "movies"
+
+    search_movies = requested_type in {"movies", "all"}
+    search_series = requested_type in {"webseries", "all"}
+    scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
+
     total = 0
     items = []
 
-    if "modern" in requested or "indian" in requested:
+    if search_movies and ("modern" in requested or "indian" in requested):
         modern_total, modern_items = search_modern(
             query=query,
             limit=fetch_limit,
@@ -1915,7 +2117,7 @@ def global_search(
         total += modern_total
         items.extend(modern_items)
 
-    if "hollywood" in requested:
+    if search_movies and "hollywood" in requested:
         table_name = HOLLYWOOD_SEARCH_TABLE if table_exists(HOLLYWOOD_SEARCH_TABLE) else HOLLYWOOD_TABLE
         hollywood_total, hollywood_items = search_domain(
             table_name=table_name,
@@ -1928,7 +2130,7 @@ def global_search(
         total += hollywood_total
         items.extend(hollywood_items)
 
-    if "historical" in requested:
+    if search_movies and "historical" in requested:
         table_name = HISTORICAL_SEARCH_TABLE if table_exists(HISTORICAL_SEARCH_TABLE) else HISTORICAL_TABLE
         historical_total, historical_items = search_domain(
             table_name=table_name,
@@ -1940,6 +2142,16 @@ def global_search(
         )
         total += historical_total
         items.extend(historical_items)
+
+    if search_series:
+        webseries_total, webseries_items = search_webseries(
+            query=query,
+            limit=fetch_limit,
+            scope=scope,
+            year=year,
+        )
+        total += webseries_total
+        items.extend(webseries_items)
 
     query_lower = query.lower()
 
@@ -1959,6 +2171,7 @@ def global_search(
 
         domain_boost = {
             "modern": 300,
+            "webseries": 250,
             "hollywood": 200,
             "historical": 100,
         }.get(item.get("domain"), 0)
