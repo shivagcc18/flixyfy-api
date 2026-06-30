@@ -151,6 +151,14 @@ def first(row: Dict[str, Any], keys: List[str], default=None):
     return default
 
 
+def list_value(value):
+    if isinstance(value, list):
+        return value
+
+    parsed = parse_json(value, [])
+    return parsed if isinstance(parsed, list) else []
+
+
 def route_for(domain: str, slug: Optional[str]):
     if not slug:
         return None
@@ -789,6 +797,11 @@ def domain_detail(row: Dict[str, Any], domain: str):
 
 def modern_card(row: Dict[str, Any]):
     slug = row.get("slug")
+    providers = (
+        list_value(row.get("watch_providers"))
+        or list_value(row.get("ott_all"))
+        or list_value(row.get("availability"))
+    )
 
     return {
         "domain": "modern",
@@ -814,8 +827,120 @@ def modern_card(row: Dict[str, Any]):
         "ott_primary_key": row.get("ott_primary_key"),
         "ott_count": row.get("ott_count"),
         "has_ott": as_bool(row.get("has_ott")),
+        "has_free_ott": as_bool(row.get("has_free_ott")),
+        "has_subscription_ott": as_bool(row.get("has_subscription_ott")),
+        "has_rent_ott": as_bool(row.get("has_rent_ott")),
+        "has_buy_ott": as_bool(row.get("has_buy_ott")),
+        "availability": providers,
+        "ott_all": providers,
+        "watch_providers": providers,
         "is_free": as_bool(row.get("is_free")),
     }
+
+
+def modern_ott_v2_summaries(tmdb_ids: List[Any]) -> Dict[str, Dict[str, Any]]:
+    clean_ids = []
+    seen = set()
+
+    for value in tmdb_ids:
+        if value is None or str(value).strip() == "":
+            continue
+
+        key = str(value).strip()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        clean_ids.append(key)
+
+    if not clean_ids or not table_exists("ott_availability_normalized_v2"):
+        return {}
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT tmdb_id, provider_key, provider_display_name, provider_category, provider_type,
+                   region, final_url, deep_link, button_label, priority
+            FROM public.ott_availability_normalized_v2
+            WHERE CAST(tmdb_id AS TEXT) = ANY(%s)
+            ORDER BY
+                CASE WHEN UPPER(COALESCE(region, '')) = 'IN' THEN 0 ELSE 1 END,
+                priority NULLS LAST,
+                CASE LOWER(COALESCE(provider_category, provider_type, ''))
+                    WHEN 'subscription' THEN 1
+                    WHEN 'flatrate' THEN 1
+                    WHEN 'free' THEN 2
+                    WHEN 'free_with_ads' THEN 3
+                    WHEN 'ads' THEN 3
+                    WHEN 'rent' THEN 4
+                    WHEN 'buy' THEN 5
+                    ELSE 9
+                END,
+                provider_display_name
+            """,
+            [clean_ids],
+        )
+
+        summaries: Dict[str, Dict[str, Any]] = {}
+
+        for row in cur.fetchall():
+            key = str(row.get("tmdb_id"))
+            summary = summaries.setdefault(
+                key,
+                {
+                    "ott_count": 0,
+                    "ott_primary": None,
+                    "ott_primary_key": None,
+                    "has_ott": False,
+                    "has_free_ott": False,
+                    "has_subscription_ott": False,
+                    "has_rent_ott": False,
+                    "has_buy_ott": False,
+                    "watch_providers": [],
+                },
+            )
+
+            category = str(row.get("provider_category") or row.get("provider_type") or "").strip().lower()
+            provider_name = row.get("provider_display_name")
+            provider_key = row.get("provider_key") or normalize_provider_key(provider_name)
+            final_url = row.get("final_url") or row.get("deep_link")
+
+            summary["ott_count"] += 1
+            summary["has_ott"] = True
+
+            if not summary["ott_primary"]:
+                summary["ott_primary"] = provider_name
+                summary["ott_primary_key"] = provider_key
+
+            if category in {"free", "free_with_ads", "ads"}:
+                summary["has_free_ott"] = True
+            if category in {"subscription", "flatrate"}:
+                summary["has_subscription_ott"] = True
+            if category == "rent":
+                summary["has_rent_ott"] = True
+            if category == "buy":
+                summary["has_buy_ott"] = True
+
+            summary["watch_providers"].append(
+                {
+                    "provider_key": provider_key,
+                    "provider_display_name": provider_name,
+                    "provider_category": row.get("provider_category"),
+                    "provider_type": row.get("provider_type") or row.get("provider_category"),
+                    "region": row.get("region"),
+                    "final_url": final_url,
+                    "deep_link": row.get("deep_link"),
+                    "button_label": row.get("button_label") or (f"Watch on {provider_name}" if provider_name else "Watch"),
+                    "priority": row.get("priority"),
+                }
+            )
+
+        return summaries
+    finally:
+        conn.close()
 
 
 def search_modern(query: str, limit: int, language: Optional[str], year: Optional[int]):
@@ -886,7 +1011,18 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
             params + order_params + [limit],
         )
 
-        items = [modern_card(dict(r)) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        ott_summaries = modern_ott_v2_summaries([r.get("tmdb_id") for r in rows])
+        items = []
+
+        for row in rows:
+            summary = ott_summaries.get(str(row.get("tmdb_id")))
+            if summary:
+                row.update(summary)
+                row["ott_all"] = summary["watch_providers"]
+                row["availability"] = summary["watch_providers"]
+
+            items.append(modern_card(row))
     finally:
         conn.close()
 
@@ -1070,6 +1206,89 @@ def webseries_availability(tmdb_id):
         ]
     finally:
         conn.close()
+
+
+def person_search_card(row: Dict[str, Any], domain: str = "historical"):
+    person_slug = row.get("person_slug")
+    person_name = row.get("person_name")
+
+    return {
+        "domain": "person",
+        "content_type": "person",
+        "source_domain": domain,
+        "source_label": "People",
+        "title": person_name,
+        "person_name": person_name,
+        "person_slug": person_slug,
+        "slug": person_slug,
+        "movie_url": f"/historical/person/{person_slug}" if domain == "historical" and person_slug else None,
+        "primary_role": row.get("primary_role"),
+        "release_year": row.get("last_year"),
+        "year": row.get("last_year"),
+        "movie_count": row.get("movie_count"),
+        "youtube_movie_count": row.get("youtube_movie_count"),
+        "quality_score": row.get("movie_count") or 0,
+        "raw": dict(row),
+    }
+
+
+def search_people(query: str, limit: int, scope: str):
+    if not table_exists("historical_people_seo_preprod_v1"):
+        return 0, []
+
+    where = []
+    params = []
+
+    if query:
+        where.append("(LOWER(person_name) LIKE LOWER(%s) OR LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s))")
+        params.extend([f"%{query}%", f"%{query}%"])
+
+    where.append("COALESCE(indexable, 1) = 1")
+    where_clause = "WHERE " + " AND ".join(where)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            f"SELECT COUNT(*) AS total FROM public.historical_people_seo_preprod_v1 {where_clause}",
+            params,
+        )
+        total = cur.fetchone()["total"]
+
+        order_params = []
+        if query:
+            order_sql = """
+                CASE
+                    WHEN LOWER(person_name) = LOWER(%s) THEN 1
+                    WHEN LOWER(person_name) LIKE LOWER(%s) THEN 2
+                    WHEN LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s) THEN 3
+                    ELSE 4
+                END,
+            """
+            order_params = [query, f"{query}%", f"%{query}%"]
+        else:
+            order_sql = ""
+
+        cur.execute(
+            f"""
+            SELECT *
+            FROM public.historical_people_seo_preprod_v1
+            {where_clause}
+            ORDER BY
+                {order_sql}
+                COALESCE(youtube_movie_count, 0) DESC,
+                COALESCE(movie_count, 0) DESC,
+                person_name ASC
+            LIMIT %s
+            """,
+            params + order_params + [limit],
+        )
+        items = [person_search_card(dict(r), "historical") for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    return total, items
 
 
 @router.get("/api/v3/webseries/{slug}")
@@ -2097,11 +2316,12 @@ def global_search(
         requested = {"modern", "hollywood", "historical"}
 
     requested_type = str(content_type or "movies").strip().lower()
-    if requested_type not in {"movies", "webseries", "all"}:
+    if requested_type not in {"movies", "webseries", "people", "all"}:
         requested_type = "movies"
 
     search_movies = requested_type in {"movies", "all"}
     search_series = requested_type in {"webseries", "all"}
+    search_persons = requested_type in {"people", "all"}
     scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
 
     total = 0
@@ -2153,6 +2373,15 @@ def global_search(
         total += webseries_total
         items.extend(webseries_items)
 
+    if search_persons:
+        people_total, people_items = search_people(
+            query=query,
+            limit=fetch_limit,
+            scope=scope,
+        )
+        total += people_total
+        items.extend(people_items)
+
     query_lower = query.lower()
 
     def score(item):
@@ -2172,6 +2401,7 @@ def global_search(
         domain_boost = {
             "modern": 300,
             "webseries": 250,
+            "person": 240,
             "hollywood": 200,
             "historical": 100,
         }.get(item.get("domain"), 0)
