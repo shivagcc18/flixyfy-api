@@ -1,5 +1,6 @@
 ﻿import json
 import os
+import re
 from functools import lru_cache
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import quote_plus
@@ -298,8 +299,8 @@ def where_sql(
                     f"regexp_replace(LOWER(CAST({qident(col)} AS TEXT)), '[^a-z0-9]+', '', 'g') LIKE %s"
                     ")"
                 )
-                params.append(f"%{search_query}%")
-                params.append(f"%{normalized_query}%")
+                params.append(f"{search_query}%")
+                params.append(f"{normalized_query}%")
 
         if title_clauses:
             where.append("(" + " OR ".join(title_clauses) + ")")
@@ -957,7 +958,7 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
             "(LOWER(title) LIKE LOWER(%s) "
             "OR LOWER(COALESCE(original_title, '')) LIKE LOWER(%s))"
         )
-        params.extend([f"%{query}%", f"%{query}%"])
+        params.extend([f"{query}%", f"{query}%"])
 
     if language:
         where.append("language_slug = %s")
@@ -973,12 +974,13 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
     cur = conn.cursor()
 
     try:
-        cur.execute(
-            f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where_clause}",
-            params,
-        )
-
-        total = cur.fetchone()["total"]
+        total = None
+        if not query:
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where_clause}",
+                params,
+            )
+            total = cur.fetchone()["total"]
         order_params = []
 
         if query:
@@ -1002,8 +1004,9 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
             {where_clause}
             ORDER BY
                 {order_sql}
-                has_ott DESC NULLS LAST,
                 release_year DESC NULLS LAST,
+                has_ott DESC NULLS LAST,
+                (poster_url IS NOT NULL AND TRIM(CAST(poster_url AS TEXT)) <> '') DESC,
                 COALESCE(rating, 0) DESC NULLS LAST,
                 title ASC
             LIMIT %s
@@ -1012,7 +1015,7 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
         )
 
         rows = [dict(r) for r in cur.fetchall()]
-        ott_summaries = modern_ott_v2_summaries([r.get("tmdb_id") for r in rows])
+        ott_summaries = {} if query else modern_ott_v2_summaries([r.get("tmdb_id") for r in rows])
         items = []
 
         for row in rows:
@@ -1023,6 +1026,8 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
                 row["availability"] = summary["watch_providers"]
 
             items.append(modern_card(row))
+        if total is None:
+            total = len(items) + (1 if len(rows) == limit else 0)
     finally:
         conn.close()
 
@@ -1040,18 +1045,54 @@ def search_domain(table_name: str, domain: str, query: str, limit: int, language
         year=year,
     )
 
-    order = order_sql(table_name, "popular")
+    cols = table_columns(table_name)
+    order_params = []
+
+    if query:
+        title_col = "title" if "title" in cols else None
+        original_col = "original_title" if "original_title" in cols else None
+        match_parts = []
+
+        if title_col:
+            match_parts.extend(
+                [
+                    f"WHEN LOWER({qident(title_col)}) = LOWER(%s) THEN 1",
+                    f"WHEN LOWER({qident(title_col)}) LIKE LOWER(%s) THEN 2",
+                ]
+            )
+            order_params.extend([query, f"{query}%"])
+
+        if original_col:
+            match_parts.extend(
+                [
+                    f"WHEN LOWER(COALESCE({qident(original_col)}, '')) = LOWER(%s) THEN 3",
+                    f"WHEN LOWER(COALESCE({qident(original_col)}, '')) LIKE LOWER(%s) THEN 4",
+                ]
+            )
+            order_params.extend([query, f"{query}%"])
+
+        match_sql = "CASE " + " ".join(match_parts) + " ELSE 5 END," if match_parts else ""
+        year_sql = "release_year DESC NULLS LAST," if "release_year" in cols else ("year DESC NULLS LAST," if "year" in cols else "")
+        youtube_sql = "COALESCE(has_youtube, 0) DESC," if "has_youtube" in cols else ""
+        ott_sql = "COALESCE(has_ott, 0) DESC," if "has_ott" in cols else ""
+        poster_sql = "(poster_url IS NOT NULL AND TRIM(CAST(poster_url AS TEXT)) <> '') DESC," if "poster_url" in cols else ""
+        score_col = next((col for col in ["quality_score", "popularity", "rating", "vote_average"] if col in cols), None)
+        score_sql = f"COALESCE({qident(score_col)}, 0) DESC NULLS LAST," if score_col else ""
+        order = f"{match_sql} {year_sql} {youtube_sql} {ott_sql} {poster_sql} {score_sql} title ASC"
+    else:
+        order = order_sql(table_name, "popular")
 
     conn = get_conn()
     cur = conn.cursor()
 
     try:
-        cur.execute(
-            f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where}",
-            params,
-        )
-
-        total = cur.fetchone()["total"]
+        total = None
+        if not query:
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where}",
+                params,
+            )
+            total = cur.fetchone()["total"]
 
         cur.execute(
             f"""
@@ -1061,10 +1102,12 @@ def search_domain(table_name: str, domain: str, query: str, limit: int, language
             ORDER BY {order}
             LIMIT %s
             """,
-            params + [limit],
+            params + order_params + [limit],
         )
 
         items = [domain_card(dict(r), domain) for r in cur.fetchall()]
+        if total is None:
+            total = len(items) + (1 if len(items) == limit else 0)
     finally:
         conn.close()
 
@@ -1114,7 +1157,7 @@ def search_webseries(query: str, limit: int, scope: str, year: Optional[int]):
             "OR LOWER(COALESCE(s.normalized_title, '')) LIKE LOWER(%s) "
             "OR LOWER(COALESCE(s.search_text, '')) LIKE LOWER(%s))"
         )
-        params.extend([f"%{query}%", f"%{query}%", f"%{query}%"])
+        params.extend([f"{query}%", f"{query}%", f"{query}%"])
 
     if scope == "indian":
         where.append("LOWER(COALESCE(s.region, '')) = 'indian'")
@@ -1129,11 +1172,13 @@ def search_webseries(query: str, limit: int, scope: str, year: Optional[int]):
     cur = conn.cursor()
 
     try:
-        cur.execute(
-            f"SELECT COUNT(*) AS total FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s {where_clause}",
-            params,
-        )
-        total = cur.fetchone()["total"]
+        total = None
+        if not query:
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s {where_clause}",
+                params,
+            )
+            total = cur.fetchone()["total"]
 
         order_params = []
         if query:
@@ -1167,6 +1212,8 @@ def search_webseries(query: str, limit: int, scope: str, year: Optional[int]):
             params + order_params + [limit],
         )
         items = [webseries_card(dict(r)) for r in cur.fetchall()]
+        if total is None:
+            total = len(items) + (1 if len(items) == limit else 0)
     finally:
         conn.close()
 
@@ -1232,16 +1279,52 @@ def person_search_card(row: Dict[str, Any], domain: str = "historical"):
     }
 
 
+PERSON_SEARCH_STOPWORDS = {
+    "movie",
+    "movies",
+    "film",
+    "films",
+    "cinema",
+    "filmography",
+    "actor",
+    "actress",
+    "director",
+    "producer",
+    "music",
+}
+
+
+def normalize_people_query(query: str) -> str:
+    text = str(query or "").strip()
+    if not text:
+        return ""
+
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    meaningful = [token for token in tokens if token not in PERSON_SEARCH_STOPWORDS]
+    return " ".join(meaningful).strip() or text
+
+
 def search_people(query: str, limit: int, scope: str):
     if not table_exists("historical_people_seo_preprod_v1"):
         return 0, []
 
+    person_query = normalize_people_query(query)
+    compact_person_query = "".join(ch.lower() for ch in person_query if ch.isalnum())
     where = []
     params = []
 
-    if query:
-        where.append("(LOWER(person_name) LIKE LOWER(%s) OR LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s))")
-        params.extend([f"%{query}%", f"%{query}%"])
+    if person_query:
+        if len(compact_person_query) <= 3:
+            where.append(
+                "("
+                "LOWER(person_name) = LOWER(%s) "
+                "OR regexp_replace(LOWER(COALESCE(person_name, '')), '[^a-z0-9]+', '', 'g') = %s"
+                ")"
+            )
+            params.extend([person_query, compact_person_query])
+        else:
+            where.append("(LOWER(person_name) LIKE LOWER(%s) OR LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s))")
+            params.extend([f"%{person_query}%", f"%{person_query}%"])
 
     where.append("COALESCE(indexable, 1) = 1")
     where_clause = "WHERE " + " AND ".join(where)
@@ -1250,23 +1333,26 @@ def search_people(query: str, limit: int, scope: str):
     cur = conn.cursor()
 
     try:
-        cur.execute(
-            f"SELECT COUNT(*) AS total FROM public.historical_people_seo_preprod_v1 {where_clause}",
-            params,
-        )
-        total = cur.fetchone()["total"]
+        total = None
+        if not person_query:
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM public.historical_people_seo_preprod_v1 {where_clause}",
+                params,
+            )
+            total = cur.fetchone()["total"]
 
         order_params = []
-        if query:
+        if person_query:
             order_sql = """
                 CASE
                     WHEN LOWER(person_name) = LOWER(%s) THEN 1
-                    WHEN LOWER(person_name) LIKE LOWER(%s) THEN 2
-                    WHEN LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s) THEN 3
-                    ELSE 4
+                    WHEN regexp_replace(LOWER(COALESCE(person_name, '')), '[^a-z0-9]+', '', 'g') = %s THEN 2
+                    WHEN LOWER(person_name) LIKE LOWER(%s) THEN 3
+                    WHEN LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s) THEN 4
+                    ELSE 5
                 END,
             """
-            order_params = [query, f"{query}%", f"%{query}%"]
+            order_params = [person_query, compact_person_query, f"{person_query}%", f"%{person_query}%"]
         else:
             order_sql = ""
 
@@ -1285,10 +1371,315 @@ def search_people(query: str, limit: int, scope: str):
             params + order_params + [limit],
         )
         items = [person_search_card(dict(r), "historical") for r in cur.fetchall()]
+        if total is None:
+            total = len(items) + (1 if len(items) == limit else 0)
     finally:
         conn.close()
 
     return total, items
+
+
+def suggestion_item(row: Dict[str, Any], domain: str, content_type: str = "movie") -> Dict[str, Any]:
+    title = row.get("title") or row.get("person_name")
+    slug = row.get("slug") or row.get("person_slug")
+    year = row.get("release_year") or row.get("year") or row.get("first_air_year") or row.get("last_year")
+
+    if content_type == "person":
+        movie_url = f"/historical/person/{slug}" if slug else None
+        label = "People"
+    elif domain == "webseries":
+        movie_url = f"/webseries/{slug}" if slug else None
+        label = "Webseries"
+    else:
+        movie_url = route_for(domain, slug)
+        label = domain_label(domain)
+
+    return {
+        "title": title,
+        "slug": slug,
+        "domain": "person" if content_type == "person" else domain,
+        "source_domain": domain,
+        "content_type": content_type,
+        "source_label": label,
+        "movie_url": movie_url,
+        "release_year": year,
+        "year": year,
+        "primary_language": row.get("language_name") or row.get("primary_language") or row.get("language_slug") or row.get("language"),
+        "poster_url": fix_image_url(row.get("poster_url") or row.get("poster_path")),
+        "rank_score": row.get("rank_score") or row.get("quality_score") or row.get("popularity") or row.get("movie_count") or 0,
+    }
+
+
+def suggestion_rows(
+    table_name: str,
+    domain: str,
+    query: str,
+    limit: int,
+    language: Optional[str] = None,
+    cur=None,
+) -> List[Dict[str, Any]]:
+    if not table_exists(table_name):
+        return []
+
+    cols = table_columns(table_name)
+    title_col = "title" if "title" in cols else None
+    if not title_col:
+        return []
+
+    where = [f"{qident(title_col)} ILIKE %s"]
+    params: List[Any] = [f"{query}%"]
+
+    if "original_title" in cols:
+        where[0] = f"({where[0]} OR original_title ILIKE %s)"
+        params.append(f"{query}%")
+
+    if language:
+        lang = language.strip().lower()
+        if "language_slug" in cols:
+            where.append("LOWER(CAST(language_slug AS TEXT)) = LOWER(%s)")
+            params.append(lang)
+        elif "primary_language" in cols:
+            where.append("LOWER(CAST(primary_language AS TEXT)) = LOWER(%s)")
+            params.append(lang)
+        elif "language" in cols:
+            where.append("LOWER(CAST(language AS TEXT)) = LOWER(%s)")
+            params.append(lang)
+
+    score_col = next((col for col in ["rank_score", "search_rank", "quality_score", "popularity", "rating"] if col in cols), None)
+    year_col = "release_year" if "release_year" in cols else ("year" if "year" in cols else ("first_air_year" if "first_air_year" in cols else None))
+    score_sql = f"COALESCE({qident(score_col)}, 0) DESC NULLS LAST," if score_col else ""
+    year_sql = f"{qident(year_col)} DESC NULLS LAST," if year_col else ""
+    select_cols = [
+        col
+        for col in [
+            title_col,
+            "original_title",
+            "slug",
+            "release_year",
+            "year",
+            "first_air_year",
+            "language_slug",
+            "language_name",
+            "primary_language",
+            "language",
+            "poster_url",
+            "poster_path",
+            "rank_score",
+            "search_rank",
+            "quality_score",
+            "popularity",
+        ]
+        if col and col in cols
+    ]
+    select_sql = ", ".join(qident(col) for col in dict.fromkeys(select_cols))
+
+    own_conn = None
+    if cur is None:
+        own_conn = get_conn()
+        cur = own_conn.cursor()
+
+    try:
+        cur.execute(
+            f"""
+            SELECT {select_sql}
+            FROM public.{qident(table_name)}
+            WHERE {' AND '.join(where)}
+            ORDER BY {score_sql} {year_sql} {qident(title_col)} ASC
+            LIMIT %s
+            """,
+            params + [limit],
+        )
+        return [suggestion_item(dict(row), domain, "webseries" if domain == "webseries" else "movie") for row in cur.fetchall()]
+    finally:
+        if own_conn is not None:
+            own_conn.close()
+
+
+@lru_cache(maxsize=1)
+def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
+    if not table_exists("historical_people_seo_preprod_v1"):
+        return tuple()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT person_name, person_slug, primary_role, movie_count, youtube_movie_count, NULL AS last_year
+            FROM public.historical_people_seo_preprod_v1
+            WHERE COALESCE(indexable, 1) = 1
+            ORDER BY COALESCE(youtube_movie_count, 0) DESC, COALESCE(movie_count, 0) DESC, person_name ASC
+            LIMIT 5000
+            """
+        )
+        return tuple(
+            (
+                row.get("person_name"),
+                row.get("person_slug"),
+                row.get("primary_role"),
+                row.get("movie_count"),
+                row.get("youtube_movie_count"),
+                row.get("last_year"),
+            )
+            for row in cur.fetchall()
+        )
+    finally:
+        conn.close()
+
+
+def people_suggestion_rows(query: str, limit: int, cur=None) -> List[Dict[str, Any]]:
+    person_query = normalize_people_query(query)
+    compact_query = "".join(ch.lower() for ch in person_query if ch.isalnum())
+    if len(compact_query) < 2:
+        return []
+
+    cached = cached_people_suggestion_rows()
+    if cached:
+        matches = []
+        for name, slug, role, movie_count, youtube_count, last_year in cached:
+            name_text = str(name or "")
+            slug_text = str(slug or "")
+            compact_name = "".join(ch.lower() for ch in name_text if ch.isalnum())
+            compact_slug = "".join(ch.lower() for ch in slug_text if ch.isalnum())
+            if not (compact_name.startswith(compact_query) or compact_slug.startswith(compact_query)):
+                continue
+            exact = 1 if compact_name == compact_query else 0
+            matches.append(
+                (
+                    exact,
+                    int(youtube_count or 0),
+                    int(movie_count or 0),
+                    {
+                        "person_name": name,
+                        "person_slug": slug,
+                        "primary_role": role,
+                        "movie_count": movie_count,
+                        "youtube_movie_count": youtube_count,
+                        "last_year": last_year,
+                    },
+                )
+            )
+        matches.sort(key=lambda item: (item[0], item[1], item[2], str(item[3].get("person_name") or "")), reverse=True)
+        return [suggestion_item(row, "historical", "person") for *_score, row in matches[:limit]]
+
+    if not table_exists("historical_people_seo_preprod_v1"):
+        return []
+
+    own_conn = None
+    if cur is None:
+        own_conn = get_conn()
+        cur = own_conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.historical_people_seo_preprod_v1
+            WHERE COALESCE(indexable, 1) = 1
+              AND (person_name ILIKE %s OR person_slug ILIKE %s)
+            ORDER BY
+              CASE
+                WHEN LOWER(person_name) = LOWER(%s) THEN 1
+                WHEN person_name ILIKE %s THEN 2
+                ELSE 3
+              END,
+              COALESCE(youtube_movie_count, 0) DESC,
+              COALESCE(movie_count, 0) DESC,
+              person_name ASC
+            LIMIT %s
+            """,
+            [f"{person_query}%", f"{compact_query}%", person_query, f"{person_query}%", limit],
+        )
+        return [suggestion_item(dict(row), "historical", "person") for row in cur.fetchall()]
+    finally:
+        if own_conn is not None:
+            own_conn.close()
+
+
+@router.get("/api/v3/search-suggestions")
+def search_suggestions(
+    q: str = Query("", min_length=0),
+    limit: int = Query(8, ge=1, le=12),
+    domain: Optional[str] = Query(None),
+    content_type: Optional[str] = Query(None, alias="type"),
+    language: Optional[str] = None,
+):
+    query = q.strip()
+    if len(query) < 3:
+        return {"query": query, "items": []}
+
+    if domain:
+        requested = {d.strip().lower() for d in domain.split(",") if d.strip()}
+    else:
+        requested = {"modern", "hollywood", "historical", "webseries"}
+
+    requested_type = str(content_type or "all").strip().lower()
+    if requested_type not in {"movies", "webseries", "people", "all"}:
+        requested_type = "all"
+
+    items: List[Dict[str, Any]] = []
+    per_source_limit = max(limit, 6)
+    compact_query = "".join(ch.lower() for ch in query if ch.isalnum())
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        if requested_type in {"people", "all", "movies"} and 2 < len(compact_query) <= 4:
+            people_items = people_suggestion_rows(query, per_source_limit, cur)
+            strong_people = [
+                item
+                for item in people_items
+                if "".join(ch.lower() for ch in str(item.get("title") or "") if ch.isalnum()).startswith(compact_query)
+            ]
+            if strong_people:
+                return {"query": query, "items": strong_people[:limit]}
+
+        if requested_type in {"movies", "all"}:
+            if "modern" in requested or "indian" in requested:
+                items.extend(suggestion_rows(MODERN_SEARCH_TABLE if table_exists(MODERN_SEARCH_TABLE) else MODERN_TABLE, "modern", query, per_source_limit, language, cur))
+            if "historical" in requested:
+                items.extend(suggestion_rows(HISTORICAL_SEARCH_TABLE if table_exists(HISTORICAL_SEARCH_TABLE) else HISTORICAL_TABLE, "historical", query, per_source_limit, language, cur))
+            if "hollywood" in requested:
+                items.extend(suggestion_rows(HOLLYWOOD_SEARCH_TABLE if table_exists(HOLLYWOOD_SEARCH_TABLE) else HOLLYWOOD_TABLE, "hollywood", query, per_source_limit, None, cur))
+
+        if requested_type in {"webseries", "all"}:
+            items.extend(suggestion_rows(WEBSERIES_SEARCH_TABLE, "webseries", query, per_source_limit, None, cur))
+
+        if requested_type in {"people", "all", "movies"}:
+            items.extend(people_suggestion_rows(query, per_source_limit, cur))
+    finally:
+        conn.close()
+
+    seen = set()
+    deduped = []
+
+    def score(item: Dict[str, Any]) -> Tuple[int, int, str]:
+        title = str(item.get("title") or "")
+        compact_title = "".join(ch.lower() for ch in title if ch.isalnum())
+        exact = 0
+        if compact_title == compact_query:
+            exact = 3
+        elif compact_title.startswith(compact_query):
+            exact = 2
+        elif compact_query in compact_title:
+            exact = 1
+        try:
+            rank = int(float(item.get("rank_score") or 0))
+        except Exception:
+            rank = 0
+        return exact, rank, title.lower()
+
+    for item in sorted(items, key=score, reverse=True):
+        key = (item.get("domain"), item.get("slug"), item.get("title"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+
+    return {"query": query, "items": deduped}
 
 
 @router.get("/api/v3/webseries/{slug}")
@@ -2327,6 +2718,19 @@ def global_search(
     total = 0
     items = []
 
+    if requested_type == "movies" and query:
+        person_query = normalize_people_query(query)
+        if person_query and person_query.lower() != query.lower():
+            people_total, people_items = search_people(
+                query=query,
+                limit=fetch_limit,
+                scope=scope,
+            )
+            if people_items:
+                total += people_total
+                items.extend(people_items)
+                search_movies = False
+
     if search_movies and ("modern" in requested or "indian" in requested):
         modern_total, modern_items = search_modern(
             query=query,
@@ -2362,6 +2766,15 @@ def global_search(
         )
         total += historical_total
         items.extend(historical_items)
+
+    if requested_type == "movies" and query and total == 0:
+        people_total, people_items = search_people(
+            query=query,
+            limit=fetch_limit,
+            scope=scope,
+        )
+        total += people_total
+        items.extend(people_items)
 
     if search_series:
         webseries_total, webseries_items = search_webseries(
