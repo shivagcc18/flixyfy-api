@@ -437,7 +437,6 @@ def resolve_movie_by_slug(slug, preferred_domain=None):
         [
             ("current", "media_serving_v8_expanded"),
             ("current_v8", "media_serving_v8_expanded"),
-            ("current_v7", "media_serving_v7_final"),
             ("historical", "historical_detail_serving_v1"),
             ("historical", "historical_serving_v1"),
             ("hollywood", "hollywood_detail_serving_v3"),
@@ -471,7 +470,53 @@ def resolve_movie_by_slug(slug, preferred_domain=None):
     cur = conn.cursor()
 
     try:
+        checked_legacy_redirect = False
+
+        def resolve_legacy_current_redirect():
+            if preferred_domain and preferred_domain not in {"current", "current_v8"}:
+                return None
+            if not table_exists("media_legacy_slug_redirect_v1"):
+                return None
+
+            cur.execute(
+                """
+                SELECT new_slug
+                FROM media_legacy_slug_redirect_v1
+                WHERE old_slug = %s
+                LIMIT 1
+                """,
+                (slug,),
+            )
+            redirect = cur.fetchone()
+            new_slug = redirect.get("new_slug") if redirect else None
+            if not new_slug or not table_exists("media_serving_v8_expanded"):
+                return None
+
+            cur.execute(
+                """
+                SELECT *
+                FROM media_serving_v8_expanded
+                WHERE slug = %s
+                LIMIT 1
+                """,
+                (new_slug,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            data = normalize_detail_row(row, "current", "media_serving_v8_expanded", new_slug)
+            data["legacy_slug"] = slug
+            data["redirected_from_slug"] = slug
+            return data
+
         for domain, table in ordered:
+            if not checked_legacy_redirect and domain not in {"current", "current_v8"}:
+                checked_legacy_redirect = True
+                redirected = resolve_legacy_current_redirect()
+                if redirected:
+                    return redirected
+
             if not table_exists(table):
                 continue
 
@@ -498,6 +543,11 @@ def resolve_movie_by_slug(slug, preferred_domain=None):
             row = cur.fetchone()
             if row:
                 return normalize_detail_row(row, domain, table, slug)
+
+        if not checked_legacy_redirect:
+            redirected = resolve_legacy_current_redirect()
+            if redirected:
+                return redirected
 
         return None
 
