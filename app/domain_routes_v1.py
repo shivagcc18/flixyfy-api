@@ -1403,7 +1403,7 @@ def webseries_card(row: Dict[str, Any], domain: str = "webseries", source_label:
     }
 
 
-def webseries_catalog_filters(programs: bool = False):
+def webseries_catalog_filters():
     genre_program_sql = """
         (
             LOWER(COALESCE(c.genres, '')) LIKE '%%reality%%'
@@ -1440,14 +1440,7 @@ def webseries_catalog_filters(programs: bool = False):
         )
     """
 
-    if programs:
-        return [
-            "COALESCE(s.first_air_year, 0) BETWEEN 2000 AND 2025",
-            f"({genre_program_sql} OR {title_program_sql} OR {daily_program_sql})",
-        ]
-
     return [
-        "COALESCE(s.first_air_year, 0) BETWEEN 2000 AND 2025",
         "c.poster_path IS NOT NULL",
         "TRIM(CAST(c.poster_path AS TEXT)) <> ''",
         "(COALESCE(c.vote_count, s.vote_count, 0) > 0 OR c.omdb_imdb_rating ~ '^[0-9]+(\\.[0-9]+)?$')",
@@ -1466,7 +1459,6 @@ def search_webseries(
     provider: Optional[str] = None,
     availability: Optional[str] = None,
     sort: str = "popular",
-    programs: bool = False,
 ):
     if not table_exists(WEBSERIES_SEARCH_TABLE):
         return 0, []
@@ -1546,7 +1538,7 @@ def search_webseries(
         )
         params.extend(provider_params)
 
-    where.extend(webseries_catalog_filters(programs=programs))
+    where.extend(webseries_catalog_filters())
 
     where_clause = "WHERE " + " AND ".join(where) if where else ""
 
@@ -1632,9 +1624,7 @@ def search_webseries(
             """,
             params + order_params + [limit],
         )
-        item_domain = "tvprograms" if programs else "webseries"
-        item_label = "TV Programs" if programs else "Webseries"
-        items = [webseries_card(dict(r), item_domain, item_label) for r in cur.fetchall()]
+        items = [webseries_card(dict(r)) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -3553,12 +3543,11 @@ def global_search(
         requested = {"modern", "hollywood", "historical"}
 
     requested_type = str(content_type or "movies").strip().lower()
-    if requested_type not in {"movies", "webseries", "tvprograms", "people", "all"}:
+    if requested_type not in {"movies", "webseries", "people", "all"}:
         requested_type = "movies"
 
     search_movies = requested_type in {"movies", "all"}
     search_series = requested_type in {"webseries", "all"}
-    search_tv_programs = requested_type == "tvprograms"
     search_persons = requested_type == "people"
     scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
 
@@ -3618,21 +3607,6 @@ def global_search(
         total += webseries_total
         items.extend(webseries_items)
 
-    if search_tv_programs:
-        tv_total, tv_items = search_webseries(
-            query=query,
-            limit=fetch_limit,
-            scope=scope,
-            year=year,
-            language=language,
-            provider=provider,
-            availability=availability,
-            sort=sort,
-            programs=True,
-        )
-        total += tv_total
-        items.extend(tv_items)
-
     if search_persons:
         people_total, people_items = search_people(
             query=query,
@@ -3683,7 +3657,6 @@ def global_search(
             "modern": 300,
             "webseries": 250,
             "person": 240,
-            "tvprograms": 180,
             "hollywood": 200,
             "historical": 100,
         }.get(item.get("domain"), 0)
