@@ -1819,7 +1819,7 @@ def search_suggestions(
     try:
         cur = conn.cursor()
 
-        if requested_type in {"people", "all", "movies"} and 2 < len(compact_query) <= 4:
+        if requested_type == "people" and 2 < len(compact_query) <= 4:
             people_items = people_suggestion_rows(query, per_source_limit, cur)
             strong_people = [
                 item
@@ -1840,7 +1840,7 @@ def search_suggestions(
         if requested_type in {"webseries", "all"}:
             items.extend(suggestion_rows(WEBSERIES_SEARCH_TABLE, "webseries", query, per_source_limit, None, cur))
 
-        if requested_type in {"people", "all", "movies"}:
+        if requested_type == "people":
             items.extend(people_suggestion_rows(query, per_source_limit, cur))
     finally:
         conn.close()
@@ -2906,24 +2906,11 @@ def global_search(
 
     search_movies = requested_type in {"movies", "all"}
     search_series = requested_type in {"webseries", "all"}
-    search_persons = requested_type in {"people", "all"}
+    search_persons = requested_type == "people"
     scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
 
     total = 0
     items = []
-
-    if requested_type == "movies" and query:
-        person_query = normalize_people_query(query)
-        if person_query and person_query.lower() != query.lower():
-            people_total, people_items = search_people(
-                query=query,
-                limit=fetch_limit,
-                scope=scope,
-            )
-            if people_items:
-                total += people_total
-                items.extend(people_items)
-                search_movies = False
 
     if search_movies and ("modern" in requested or "indian" in requested):
         modern_total, modern_items = search_modern(
@@ -2960,15 +2947,6 @@ def global_search(
         )
         total += historical_total
         items.extend(historical_items)
-
-    if requested_type == "movies" and query and total == 0:
-        people_total, people_items = search_people(
-            query=query,
-            limit=fetch_limit,
-            scope=scope,
-        )
-        total += people_total
-        items.extend(people_items)
 
     if search_series:
         webseries_total, webseries_items = search_webseries(
