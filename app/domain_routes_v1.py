@@ -1275,10 +1275,7 @@ def person_search_card(row: Dict[str, Any], domain: str = "historical"):
     person_slug = row.get("person_slug")
     person_name = row.get("person_name")
     source_domain = row.get("domain") or row.get("source_domain") or domain
-    if source_domain == "historical":
-        movie_url = f"/historical/person/{person_slug}" if person_slug else None
-    else:
-        movie_url = f"/person/{person_slug}" if person_slug else None
+    movie_url = f"/person/{person_slug}" if person_slug else None
 
     return {
         "domain": "person",
@@ -2506,6 +2503,269 @@ def _fhp_person_movie_card(row):
     return data
 
 
+PROTECTED_PERSON_LANGUAGE_SLUGS = {
+    "n-t-rama-rao": {"te", "telugu"},
+    "ntr": {"te", "telugu"},
+    "n-t-rama-rao-jr": {"te", "telugu", "hi", "hindi"},
+    "nandamuri-balakrishna": {"te", "telugu"},
+    "balakrishna": {"te", "telugu"},
+    "mahesh-babu": {"te", "telugu", "ta", "tamil"},
+    "chiranjeevi": {"te", "telugu"},
+    "rajinikanth": {"ta", "tamil", "te", "telugu", "hi", "hindi", "kn", "kannada", "ml", "malayalam"},
+    "kamal-haasan": {"ta", "tamil", "te", "telugu", "hi", "hindi", "kn", "kannada", "ml", "malayalam"},
+    "mohanlal": {"ml", "malayalam", "ta", "tamil", "te", "telugu", "hi", "hindi", "kn", "kannada"},
+    "mammootty": {"ml", "malayalam", "ta", "tamil", "te", "telugu", "hi", "hindi", "kn", "kannada"},
+    "amitabh-bachchan": {"hi", "hindi", "bn", "bengali", "te", "telugu", "ta", "tamil"},
+}
+
+
+PROTECTED_PERSON_HISTORICAL_LANGUAGE_SLUGS = {
+    **PROTECTED_PERSON_LANGUAGE_SLUGS,
+    "amitabh-bachchan": {"hi", "hindi", "bn", "bengali"},
+}
+
+
+def _person_language_filter(alias: str, column: str = "mp.language_slug", profile: str = "historical"):
+    source = PROTECTED_PERSON_LANGUAGE_SLUGS
+    if profile == "historical":
+        source = PROTECTED_PERSON_HISTORICAL_LANGUAGE_SLUGS
+    allowed = source.get(str(alias or "").strip().lower())
+    if not allowed:
+        return "", []
+    return f" AND lower(coalesce({column}, '')) = ANY(%s)", [sorted(allowed)]
+
+
+def _unified_person_payload(row: Dict[str, Any]):
+    name = _fhp_pick(row, "display_name", "person_name") or ""
+    slug = _fhp_pick(row, "person_slug")
+    movie_count = _fhp_int(_fhp_pick(row, "movie_count"), 0)
+    youtube_count = _fhp_int(_fhp_pick(row, "youtube_movie_count"), 0)
+    role = _fhp_pick(row, "primary_role") or "actor"
+    return {
+        "person_slug": slug,
+        "person_name": name,
+        "display_name": name,
+        "domain": _fhp_pick(row, "domain", "source_domain") or "person",
+        "source_domain": _fhp_pick(row, "domain", "source_domain") or "person",
+        "primary_role": role,
+        "movie_count": movie_count,
+        "youtube_movie_count": youtube_count,
+        "active_year_max": _fhp_pick(row, "active_year_max", "last_year"),
+        "aliases": list_value(_fhp_pick(row, "aliases_json")),
+        "disambiguation_label": _fhp_pick(row, "disambiguation_label"),
+        "seo_url": f"/person/{slug}" if slug else None,
+        "seo_title": f"{name} Movies - Filmography, Cast and Watch Links" if name else "Person Movies",
+        "meta_description": (
+            f"Explore {name} movies, roles, filmography, and available YouTube full movie links on Flixyfy."
+            if name
+            else "Explore movies, roles, filmography, and available YouTube full movie links on Flixyfy."
+        ),
+        "title": f"{name} Movies" if name else "Person Movies",
+    }
+
+
+def _modern_person_movie_rows(person_slug: str, limit: int, offset: int):
+    if not _fhp_table_exists("modern_movie_people_seo_preprod_v1"):
+        return []
+    lang_sql, lang_params = _person_language_filter(person_slug, "mp.language_slug", "modern")
+    join_table = MODERN_SEARCH_TABLE if table_exists(MODERN_SEARCH_TABLE) else MODERN_TABLE
+    return _fhp_rows(
+        f"""
+        SELECT
+            COALESCE(m.slug, mp.movie_slug) AS slug,
+            COALESCE(m.title, mp.title) AS title,
+            COALESCE(m.release_year, mp.release_year) AS release_year,
+            COALESCE(m.language_slug, mp.language_slug) AS language_slug,
+            COALESCE(m.primary_language, mp.primary_language) AS primary_language,
+            m.id,
+            m.tmdb_id,
+            m.imdb_id,
+            m.poster_url,
+            m.poster_path,
+            m.backdrop_url,
+            m.backdrop_path,
+            m.vote_average,
+            m.vote_count,
+            m.rating,
+            m.popularity,
+            m.quality_score,
+            m.ott_primary,
+            m.ott_primary_key,
+            m.ott_count,
+            m.has_ott,
+            m.has_free_ott,
+            mp.role AS role_type
+        FROM public.{qident("modern_movie_people_seo_preprod_v1")} mp
+        LEFT JOIN public.{qident(join_table)} m ON m.slug = mp.movie_slug
+        WHERE mp.person_slug=%s
+          {lang_sql}
+        ORDER BY COALESCE(m.release_year, mp.release_year) DESC NULLS LAST,
+                 COALESCE(m.popularity, mp.popularity_score, 0) DESC NULLS LAST,
+                 COALESCE(m.title, mp.title) ASC
+        LIMIT %s OFFSET %s
+        """,
+        [person_slug] + lang_params + [limit, offset],
+    )
+
+
+def _historical_person_movie_rows(person_slug: str, limit: int, offset: int):
+    if not _fhp_table_exists("historical_movie_people_seo_preprod_v1"):
+        return []
+    lang_sql, lang_params = _person_language_filter(person_slug, profile="historical")
+    return _fhp_rows(
+        f"""
+        SELECT h.*,
+               mp.movie_id,
+               mp.movie_slug,
+               mp.title AS person_movie_title,
+               mp.release_year AS person_release_year,
+               mp.language_slug AS person_language_slug,
+               mp.role_type,
+               mp.has_youtube AS person_has_youtube
+        FROM historical_movie_people_seo_preprod_v1 mp
+        LEFT JOIN historical_card_serving_v1 h ON h.slug = mp.movie_slug
+        WHERE mp.person_slug=%s
+          {lang_sql}
+        ORDER BY COALESCE(mp.has_youtube, 0) DESC, mp.release_year DESC NULLS LAST, mp.title ASC
+        LIMIT %s OFFSET %s
+        """,
+        [person_slug] + lang_params + [limit, offset],
+    )
+
+
+def _modern_person_movie_count(person_slug: str) -> int:
+    if not _fhp_table_exists("modern_movie_people_seo_preprod_v1"):
+        return 0
+    lang_sql, lang_params = _person_language_filter(person_slug, "language_slug", "modern")
+    rows = _fhp_rows(
+        f"""
+        SELECT COUNT(DISTINCT movie_slug) AS total
+        FROM modern_movie_people_seo_preprod_v1
+        WHERE person_slug=%s
+          {lang_sql}
+        """,
+        [person_slug] + lang_params,
+    )
+    return _fhp_int(rows[0].get("total") if rows else 0, 0)
+
+
+def _historical_person_movie_count(person_slug: str) -> int:
+    if not _fhp_table_exists("historical_movie_people_seo_preprod_v1"):
+        return 0
+    lang_sql, lang_params = _person_language_filter(person_slug)
+    rows = _fhp_rows(
+        f"""
+        SELECT COUNT(DISTINCT movie_slug) AS total
+        FROM historical_movie_people_seo_preprod_v1 mp
+        WHERE person_slug=%s
+          {lang_sql}
+        """,
+        [person_slug] + lang_params,
+    )
+    return _fhp_int(rows[0].get("total") if rows else 0, 0)
+
+
+def _merge_person_movie_cards(modern_rows, historical_rows, limit: int):
+    cards = []
+    seen = set()
+    for row in modern_rows:
+        slug = _fhp_pick(row, "slug", "movie_slug")
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        cards.append(domain_card(dict(row), "modern"))
+    for row in historical_rows:
+        slug = _fhp_pick(row, "slug", "movie_slug")
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        cards.append(_fhp_person_movie_card(row))
+
+    def row_score(item):
+        try:
+            year = int(item.get("release_year") or 0)
+        except Exception:
+            year = 0
+        return (1 if item.get("has_ott") or item.get("has_free_ott") else 0, year, str(item.get("title") or ""))
+
+    cards.sort(key=row_score, reverse=True)
+    return cards[:limit]
+
+
+@router.get("/api/v3/person/{person_slug}")
+def unified_person_detail_v1(person_slug: str, page: int = 1, limit: int = 96):
+    slug = str(person_slug or "").strip().strip("/")
+    if not slug:
+        raise HTTPException(status_code=404, detail="Person not found")
+
+    person_rows = []
+    if _fhp_table_exists("people_search_cache_v1"):
+        person_rows = _fhp_rows(
+            """
+            SELECT *
+            FROM people_search_cache_v1
+            WHERE person_slug=%s
+            LIMIT 1
+            """,
+            [slug],
+        )
+
+    if not person_rows and _fhp_table_exists("historical_people_seo_preprod_v1"):
+        person_rows = _fhp_rows(
+            """
+            SELECT
+                person_slug,
+                person_name AS display_name,
+                'historical' AS domain,
+                primary_role,
+                movie_count,
+                youtube_movie_count,
+                NULL AS active_year_max,
+                NULL AS aliases_json,
+                NULL AS disambiguation_label
+            FROM historical_people_seo_preprod_v1
+            WHERE person_slug=%s
+               OR seo_url=%s
+               OR seo_url=%s
+            LIMIT 1
+            """,
+            [slug, f"/historical/person/{slug}", f"historical/person/{slug}"],
+        )
+
+    if not person_rows:
+        raise HTTPException(status_code=404, detail="Person not found")
+
+    person = _unified_person_payload(person_rows[0])
+    source_domain = str(person.get("source_domain") or "").lower()
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 96), 200))
+    offset = (page - 1) * limit
+    fetch_limit = offset + limit
+
+    include_modern = source_domain in {"modern", "modern_historical_bridge"}
+    include_historical = source_domain in {"historical", "modern_historical_bridge"}
+
+    modern_rows = _modern_person_movie_rows(slug, fetch_limit, 0) if include_modern else []
+    historical_rows = _historical_person_movie_rows(slug, fetch_limit, 0) if include_historical else []
+    merged = _merge_person_movie_cards(modern_rows, historical_rows, fetch_limit)
+    page_items = merged[offset:offset + limit]
+
+    modern_total = _modern_person_movie_count(slug) if include_modern else 0
+    historical_total = _historical_person_movie_count(slug) if include_historical else 0
+    total = modern_total + historical_total
+    person["movie_count"] = total
+
+    return {
+        "domain": "person",
+        "person": person,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "pages": (total + limit - 1) // limit if total else 0,
+        "items": page_items,
+    }
+
+
 @router.get("/api/v3/historical/combinations")
 def historical_combinations_patched_v1(
     page: int = 1,
@@ -2623,27 +2883,11 @@ def historical_person_detail_patched_v1(person_slug: str, page: int = 1, limit: 
     limit = max(1, min(int(limit or 96), 200))
     offset = (page - 1) * limit
 
-    movie_rows = _fhp_rows(
-        """
-        SELECT h.*,
-               mp.movie_id,
-               mp.movie_slug,
-               mp.title AS person_movie_title,
-               mp.release_year AS person_release_year,
-               mp.language_slug AS person_language_slug,
-               mp.role_type,
-               mp.has_youtube AS person_has_youtube
-        FROM historical_movie_people_seo_preprod_v1 mp
-        LEFT JOIN historical_card_serving_v1 h ON h.slug = mp.movie_slug
-        WHERE mp.person_slug=%s
-        ORDER BY COALESCE(mp.has_youtube, 0) DESC, mp.release_year DESC NULLS LAST, mp.title ASC
-        LIMIT %s OFFSET %s
-        """,
-        [person["person_slug"], limit, offset],
-    )
+    movie_rows = _historical_person_movie_rows(person["person_slug"], limit, offset)
 
     items = [_fhp_person_movie_card(row) for row in movie_rows if _fhp_pick(row, "slug", "movie_slug")]
-    total = _fhp_int(person.get("movie_count"), offset + len(items))
+    total = _historical_person_movie_count(person["person_slug"])
+    person["movie_count"] = total
 
     return {
         "domain": "historical",
@@ -2972,6 +3216,7 @@ def global_search(
     def score(item):
         title = str(item.get("title") or "").lower()
         release_year = item.get("release_year") or 0
+        compact_query = "".join(ch.lower() for ch in query_lower if ch.isalnum())
 
         exact = 0
 
@@ -2982,6 +3227,18 @@ def global_search(
                 exact = 50000
             elif query_lower in title:
                 exact = 25000
+
+        if item.get("domain") == "person":
+            compact_title = "".join(ch.lower() for ch in title if ch.isalnum())
+            aliases = item.get("aliases") or []
+            compact_aliases = ["".join(ch.lower() for ch in str(alias) if ch.isalnum()) for alias in aliases]
+            if compact_query:
+                if compact_title == compact_query or compact_query in compact_aliases:
+                    exact = max(exact, 100000)
+                elif compact_title.startswith(compact_query) or any(alias.startswith(compact_query) for alias in compact_aliases):
+                    exact = max(exact, 50000)
+                elif compact_query in compact_title or any(compact_query in alias for alias in compact_aliases):
+                    exact = max(exact, 25000)
 
         domain_boost = {
             "modern": 300,
@@ -2995,6 +3252,13 @@ def global_search(
             year_score = int(release_year or 0)
         except Exception:
             year_score = 0
+
+        if item.get("domain") == "person":
+            try:
+                person_rank = int(float(item.get("quality_score") or item.get("movie_count") or 0))
+            except Exception:
+                person_rank = 0
+            return exact + domain_boost + person_rank
 
         return exact + domain_boost + year_score
 
