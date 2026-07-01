@@ -143,6 +143,148 @@ def normalize_provider_key(value):
     return (value or "").strip().lower().replace(" ", "_").replace("-", "_")
 
 
+WEB_LANGUAGE_ALIASES = {
+    "hindi": ["hi", "hindi"],
+    "telugu": ["te", "telugu"],
+    "tamil": ["ta", "tamil"],
+    "malayalam": ["ml", "malayalam"],
+    "kannada": ["kn", "kannada"],
+    "bengali": ["bn", "bengali"],
+    "marathi": ["mr", "marathi"],
+    "punjabi": ["pa", "punjabi"],
+    "gujarati": ["gu", "gujarati"],
+    "odia": ["or", "odia"],
+    "assamese": ["as", "assamese"],
+    "english": ["en", "english"],
+    "korean": ["ko", "korean"],
+    "japanese": ["ja", "japanese"],
+    "chinese": ["zh", "chinese"],
+}
+
+
+WEB_PROVIDER_ALIASES = {
+    "prime": ["amazon prime video", "prime video", "amazon prime", "prime"],
+    "prime_video": ["amazon prime video", "prime video", "amazon prime", "prime"],
+    "amazon_prime_video": ["amazon prime video", "prime video", "amazon prime", "prime"],
+    "jiohotstar": ["jiohotstar", "hotstar", "disney hotstar"],
+    "hotstar": ["jiohotstar", "hotstar", "disney hotstar"],
+    "zee5": ["zee5", "zee 5"],
+    "sonyliv": ["sony liv", "sonyliv", "sony-liv"],
+    "sony_liv": ["sony liv", "sonyliv", "sony-liv"],
+    "sunnxt": ["sun nxt", "sunnxt", "sun-nxt"],
+    "sun_nxt": ["sun nxt", "sunnxt", "sun-nxt"],
+    "etvwin": ["etv win", "etvwin", "etv-win"],
+    "etv_win": ["etv win", "etvwin", "etv-win"],
+    "vi_movies_and_tv": ["vi movies and tv", "vi movies", "vi"],
+    "mx_player": ["mx player", "amazon mx player", "mxplayer"],
+    "amazon_mx_player": ["mx player", "amazon mx player", "mxplayer"],
+    "apple_tv": ["apple tv", "apple tv plus", "apple tv+"],
+    "apple_tv_plus": ["apple tv", "apple tv plus", "apple tv+"],
+    "disney_plus": ["disney plus", "disney+", "disney"],
+    "hbo_max": ["max", "hbo max"],
+    "max": ["max", "hbo max"],
+    "rakuten_viki": ["rakuten viki", "viki"],
+    "viki": ["rakuten viki", "viki"],
+    "kocowa": ["kocowa", "kocowa+"],
+    "tving": ["tving", "tvn"],
+    "wavve": ["wavve"],
+    "watcha": ["watcha"],
+    "coupang_play": ["coupang play", "coupang"],
+    "hoichoi": ["hoichoi"],
+    "discovery": ["discovery", "discovery+"],
+    "tubi": ["tubi", "tubi tv"],
+    "tubi_tv": ["tubi", "tubi tv"],
+}
+
+
+def language_match_values(value):
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return []
+
+    normalized = raw.replace("-", "_").replace(" ", "_")
+    values = {raw, normalized}
+
+    for item in WEB_LANGUAGE_ALIASES.get(normalized, []):
+        values.add(item)
+
+    return sorted(v for v in values if v)
+
+
+def provider_match_terms(value):
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return []
+
+    normalized = normalize_provider_key(raw)
+    spaced = normalized.replace("_", " ")
+    dashed = normalized.replace("_", "-")
+    terms = {raw, normalized, spaced, dashed}
+
+    for key in [normalized, raw.replace("-", "_").replace(" ", "_")]:
+        for item in WEB_PROVIDER_ALIASES.get(key, []):
+            terms.add(item)
+            terms.add(item.replace("-", " "))
+            terms.add(item.replace("_", " "))
+
+    return sorted(t for t in terms if t)
+
+
+def append_modern_provider_filters(where, params, provider=None, availability=None):
+    if not table_exists("ott_availability_normalized_v2"):
+        return where, params, []
+
+    def add_where(condition: str):
+        nonlocal where
+        where = f"{where} AND {condition}" if where else f"WHERE {condition}"
+
+    availability_value = str(availability or "").strip().lower()
+    if availability_value in {"ott", "available", "true", "1"}:
+        add_where(
+            """
+            CAST(tmdb_id AS TEXT) IN (
+                SELECT CAST(a.tmdb_id AS TEXT)
+                FROM public.ott_availability_normalized_v2 a
+            )
+            """
+        )
+    elif availability_value in {"youtube", "free"}:
+        add_where(
+            """
+            CAST(tmdb_id AS TEXT) IN (
+                SELECT CAST(a.tmdb_id AS TEXT)
+                FROM public.ott_availability_normalized_v2 a
+                WHERE LOWER(COALESCE(a.provider_category, a.provider_type, '')) IN ('free', 'free_with_ads', 'ads')
+                   OR LOWER(COALESCE(a.provider_key, '')) LIKE '%youtube%'
+                   OR LOWER(COALESCE(a.provider_display_name, '')) LIKE '%youtube%'
+            )
+            """
+        )
+
+    provider_terms = provider_match_terms(provider)
+    if provider_terms:
+        provider_conditions = []
+        provider_params = []
+        for term in provider_terms:
+            provider_conditions.append("LOWER(COALESCE(a.provider_key, '')) LIKE %s")
+            provider_params.append(f"%{term.replace(' ', '_').replace('-', '_')}%")
+            provider_conditions.append("LOWER(COALESCE(a.provider_display_name, '')) LIKE %s")
+            provider_params.append(f"%{term}%")
+
+        add_where(
+            f"""
+            CAST(tmdb_id AS TEXT) IN (
+                SELECT CAST(a.tmdb_id AS TEXT)
+                FROM public.ott_availability_normalized_v2 a
+                WHERE {" OR ".join(provider_conditions)}
+            )
+            """
+        )
+        params.extend(provider_params)
+
+    return where, params, provider_terms
+
+
 def first(row: Dict[str, Any], keys: List[str], default=None):
     for key in keys:
         value = row.get(key)
@@ -411,6 +553,9 @@ def fetch_rows(
 
     provider_text = str(provider or "").strip().lower()
     availability_text = str(availability or "").strip().lower()
+
+    if domain == "modern":
+        where, params, _ = append_modern_provider_filters(where, params, provider, availability)
 
     if domain == "hollywood" and table_exists(HOLLYWOOD_AVAILABILITY_TABLE):
         if availability_text == "ott":
@@ -945,7 +1090,15 @@ def modern_ott_v2_summaries(tmdb_ids: List[Any]) -> Dict[str, Dict[str, Any]]:
         conn.close()
 
 
-def search_modern(query: str, limit: int, language: Optional[str], year: Optional[int]):
+def search_modern(
+    query: str,
+    limit: int,
+    language: Optional[str],
+    year: Optional[int],
+    provider: Optional[str] = None,
+    availability: Optional[str] = None,
+    sort: str = "popular",
+):
     table_name = MODERN_SEARCH_TABLE if table_exists(MODERN_SEARCH_TABLE) else MODERN_TABLE
 
     if not table_exists(table_name):
@@ -970,18 +1123,22 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
         params.append(year)
 
     where_clause = "WHERE " + " AND ".join(where) if where else ""
+    where_clause, params, provider_terms = append_modern_provider_filters(
+        where_clause,
+        params,
+        provider,
+        availability,
+    )
 
     conn = get_conn()
     cur = conn.cursor()
 
     try:
-        total = None
-        if not query:
-            cur.execute(
-                f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where_clause}",
-                params,
-            )
-            total = cur.fetchone()["total"]
+        cur.execute(
+            f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where_clause}",
+            params,
+        )
+        total = cur.fetchone()["total"]
         order_params = []
 
         if query:
@@ -998,6 +1155,33 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
         else:
             order_sql = ""
 
+        sort_value = str(sort or "popular").strip().lower()
+        rating_expr = "COALESCE(rating, 0)"
+        vote_expr = "COALESCE(vote_count, 0)"
+        if sort_value == "latest":
+            ranking_sql = (
+                f"release_year DESC NULLS LAST, {rating_expr} DESC NULLS LAST, "
+                f"{vote_expr} DESC NULLS LAST, title ASC"
+            )
+        elif sort_value in {"rating", "imdb", "top_imdb", "top-imdb"}:
+            ranking_sql = (
+                f"{rating_expr} DESC NULLS LAST, release_year DESC NULLS LAST, "
+                f"{vote_expr} DESC NULLS LAST, title ASC"
+            )
+        elif provider_terms:
+            ranking_sql = (
+                f"{rating_expr} DESC NULLS LAST, COALESCE(popularity, quality_score, 0) DESC, "
+                f"release_year DESC NULLS LAST, title ASC"
+            )
+        else:
+            ranking_sql = (
+                "release_year DESC NULLS LAST, "
+                "has_ott DESC NULLS LAST, "
+                "(poster_url IS NOT NULL AND TRIM(CAST(poster_url AS TEXT)) <> '') DESC, "
+                f"{rating_expr} DESC NULLS LAST, "
+                "title ASC"
+            )
+
         cur.execute(
             f"""
             SELECT *
@@ -1005,18 +1189,14 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
             {where_clause}
             ORDER BY
                 {order_sql}
-                release_year DESC NULLS LAST,
-                has_ott DESC NULLS LAST,
-                (poster_url IS NOT NULL AND TRIM(CAST(poster_url AS TEXT)) <> '') DESC,
-                COALESCE(rating, 0) DESC NULLS LAST,
-                title ASC
+                {ranking_sql}
             LIMIT %s
             """,
             params + order_params + [limit],
         )
 
         rows = [dict(r) for r in cur.fetchall()]
-        ott_summaries = {} if query else modern_ott_v2_summaries([r.get("tmdb_id") for r in rows])
+        ott_summaries = modern_ott_v2_summaries([r.get("tmdb_id") for r in rows])
         items = []
 
         for row in rows:
@@ -1027,8 +1207,6 @@ def search_modern(query: str, limit: int, language: Optional[str], year: Optiona
                 row["availability"] = summary["watch_providers"]
 
             items.append(modern_card(row))
-        if total is None:
-            total = len(items) + (1 if len(rows) == limit else 0)
     finally:
         conn.close()
 
@@ -1131,7 +1309,7 @@ def search_domain(table_name: str, domain: str, query: str, limit: int, language
 
 
 def webseries_card(row: Dict[str, Any]):
-    providers = parse_json(row.get("provider_names"), [])
+    providers = parse_json(row.get("card_provider_names") or row.get("provider_names"), [])
     major_providers = parse_json(row.get("major_provider_names"), [])
     provider_list = major_providers if major_providers else providers
     primary_provider = provider_list[0] if provider_list else None
@@ -1150,17 +1328,27 @@ def webseries_card(row: Dict[str, Any]):
         "language_slug": row.get("original_language"),
         "poster_url": fix_image_url(row.get("poster_path")),
         "rating": row.get("vote_average"),
-        "vote_count": row.get("vote_count"),
+        "vote_count": row.get("card_vote_count") or row.get("vote_count"),
         "popularity": row.get("popularity_score"),
         "quality_score": row.get("popularity_score"),
         "ott_primary": primary_provider,
+        "ott_primary_key": normalize_provider_key(primary_provider),
         "ott_count": row.get("availability_count"),
         "has_ott": as_bool(row.get("has_major_provider")) or bool(primary_provider),
         "raw": dict(row),
     }
 
 
-def search_webseries(query: str, limit: int, scope: str, year: Optional[int]):
+def search_webseries(
+    query: str,
+    limit: int,
+    scope: str,
+    year: Optional[int],
+    language: Optional[str] = None,
+    provider: Optional[str] = None,
+    availability: Optional[str] = None,
+    sort: str = "popular",
+):
     if not table_exists(WEBSERIES_SEARCH_TABLE):
         return 0, []
 
@@ -1182,19 +1370,74 @@ def search_webseries(query: str, limit: int, scope: str, year: Optional[int]):
         where.append("s.first_air_year = %s")
         params.append(year)
 
+    language_values = language_match_values(language)
+    if language_values:
+        where.append("LOWER(COALESCE(s.original_language, '')) = ANY(%s)")
+        params.append(language_values)
+
+    availability_value = str(availability or "").strip().lower()
+    if availability_value in {"ott", "available", "true", "1"}:
+        where.append(
+            f"""
+            (
+                COALESCE(s.has_major_provider, 0) = 1
+                OR EXISTS (
+                    SELECT 1
+                    FROM public.{qident(WEBSERIES_AVAILABILITY_TABLE)} a
+                    WHERE a.tmdb_id = s.tmdb_id
+                )
+            )
+            """
+        )
+    elif availability_value in {"youtube", "free"}:
+        where.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM public.{qident(WEBSERIES_AVAILABILITY_TABLE)} a
+                WHERE a.tmdb_id = s.tmdb_id
+                  AND (
+                    LOWER(COALESCE(a.monetization_type, '')) IN ('free', 'ads')
+                    OR LOWER(COALESCE(a.provider_name, '')) LIKE '%youtube%'
+                    OR LOWER(COALESCE(a.normalized_provider_name, '')) LIKE '%youtube%'
+                  )
+            )
+            """
+        )
+
+    provider_terms = provider_match_terms(provider)
+    if provider_terms:
+        provider_conditions = []
+        provider_params = []
+        for term in provider_terms:
+            provider_conditions.append("LOWER(COALESCE(a.provider_name, '')) LIKE %s")
+            provider_params.append(f"%{term}%")
+            provider_conditions.append("LOWER(COALESCE(a.normalized_provider_name, '')) LIKE %s")
+            provider_params.append(f"%{term}%")
+
+        where.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM public.{qident(WEBSERIES_AVAILABILITY_TABLE)} a
+                WHERE a.tmdb_id = s.tmdb_id
+                  AND ({" OR ".join(provider_conditions)})
+            )
+            """
+        )
+        params.extend(provider_params)
+
     where_clause = "WHERE " + " AND ".join(where) if where else ""
 
     conn = get_conn()
     cur = conn.cursor()
 
     try:
-        total = None
-        if not query:
-            cur.execute(
-                f"SELECT COUNT(*) AS total FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s {where_clause}",
-                params,
-            )
-            total = cur.fetchone()["total"]
+        cur.execute(
+            f"SELECT COUNT(*) AS total FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s {where_clause}",
+            params,
+        )
+        total = cur.fetchone()["total"]
 
         order_params = []
         if query:
@@ -1211,25 +1454,58 @@ def search_webseries(query: str, limit: int, scope: str, year: Optional[int]):
         else:
             order_sql = ""
 
+        imdb_rating_expr = (
+            "CASE WHEN c.omdb_imdb_rating ~ '^[0-9]+(\\.[0-9]+)?$' "
+            "THEN c.omdb_imdb_rating::DOUBLE PRECISION ELSE NULL END"
+        )
+        rating_expr = f"COALESCE({imdb_rating_expr}, c.vote_average, 0)"
+        vote_expr = "COALESCE(c.vote_count, s.vote_count, 0)"
+        sort_value = str(sort or "popular").strip().lower()
+
+        if sort_value == "latest":
+            ranking_sql = (
+                f"s.first_air_year DESC NULLS LAST, {rating_expr} DESC NULLS LAST, "
+                f"{vote_expr} DESC NULLS LAST, s.title ASC"
+            )
+        elif sort_value in {"rating", "imdb", "top_imdb", "top-imdb"}:
+            ranking_sql = (
+                f"{rating_expr} DESC NULLS LAST, s.first_air_year DESC NULLS LAST, "
+                f"{vote_expr} DESC NULLS LAST, s.title ASC"
+            )
+        elif provider_terms:
+            ranking_sql = (
+                f"{rating_expr} DESC NULLS LAST, COALESCE(s.popularity_score, 0) DESC, "
+                f"s.first_air_year DESC NULLS LAST, s.title ASC"
+            )
+        else:
+            ranking_sql = (
+                "COALESCE(s.has_major_provider, 0) DESC, "
+                "COALESCE(s.popularity_score, 0) DESC, "
+                "s.first_air_year DESC NULLS LAST, s.title ASC"
+            )
+
         cur.execute(
             f"""
-            SELECT s.*, c.poster_path, c.vote_average, c.major_provider_names, c.availability_count
+            SELECT
+                s.*,
+                c.poster_path,
+                c.vote_average,
+                c.vote_count AS card_vote_count,
+                c.provider_names AS card_provider_names,
+                c.major_provider_names,
+                c.availability_count,
+                c.omdb_imdb_rating
             FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s
             LEFT JOIN public.{qident(WEBSERIES_CARD_TABLE)} c ON c.slug = s.slug
             {where_clause}
             ORDER BY
                 {order_sql}
-                COALESCE(s.has_major_provider, 0) DESC,
-                COALESCE(s.popularity_score, 0) DESC,
-                s.first_air_year DESC NULLS LAST,
-                s.title ASC
+                {ranking_sql}
             LIMIT %s
             """,
             params + order_params + [limit],
         )
         items = [webseries_card(dict(r)) for r in cur.fetchall()]
-        if total is None:
-            total = len(items) + (1 if len(items) == limit else 0)
     finally:
         conn.close()
 
@@ -3132,6 +3408,9 @@ def global_search(
     limit: int = Query(24, ge=1, le=100),
     language: Optional[str] = None,
     year: Optional[int] = None,
+    sort: str = Query("popular"),
+    availability: Optional[str] = None,
+    provider: Optional[str] = None,
     domain: Optional[str] = Query(None),
     content_type: Optional[str] = Query(None, alias="type"),
 ):
@@ -3162,6 +3441,9 @@ def global_search(
             limit=fetch_limit,
             language=language,
             year=year,
+            provider=provider,
+            availability=availability,
+            sort=sort,
         )
         total += modern_total
         items.extend(modern_items)
@@ -3198,6 +3480,10 @@ def global_search(
             limit=fetch_limit,
             scope=scope,
             year=year,
+            language=language,
+            provider=provider,
+            availability=availability,
+            sort=sort,
         )
         total += webseries_total
         items.extend(webseries_items)
@@ -3212,6 +3498,14 @@ def global_search(
         items.extend(people_items)
 
     query_lower = query.lower()
+    sort_value = str(sort or "popular").strip().lower()
+    provider_selected = bool(str(provider or "").strip())
+
+    def number_value(value, default=0.0):
+        try:
+            return float(value or default)
+        except Exception:
+            return default
 
     def score(item):
         title = str(item.get("title") or "").lower()
@@ -3258,9 +3552,22 @@ def global_search(
                 person_rank = int(float(item.get("quality_score") or item.get("movie_count") or 0))
             except Exception:
                 person_rank = 0
-            return exact + domain_boost + person_rank
+            return (exact, domain_boost, person_rank)
 
-        return exact + domain_boost + year_score
+        rating_score = number_value(item.get("rating") or item.get("quality_score"))
+        popularity_score = number_value(item.get("popularity") or item.get("quality_score"))
+        provider_score = 1 if item.get("has_ott") or item.get("ott_primary") else 0
+
+        if sort_value == "latest":
+            return (exact, year_score, rating_score, provider_score, domain_boost, popularity_score)
+
+        if sort_value in {"rating", "imdb", "top_imdb", "top-imdb"}:
+            return (exact, rating_score, year_score, provider_score, domain_boost, popularity_score)
+
+        if provider_selected:
+            return (exact, provider_score, rating_score, popularity_score, year_score, domain_boost)
+
+        return (exact, domain_boost, year_score, provider_score, rating_score, popularity_score)
 
     items.sort(key=score, reverse=True)
     page_items = items[offset:offset + limit]
