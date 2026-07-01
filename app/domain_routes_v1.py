@@ -18,9 +18,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 MODERN_TABLE = os.getenv("SERVING_TABLE", "media_serving_v8_expanded")
 MODERN_SEARCH_TABLE = os.getenv("MODERN_SEARCH_TABLE", "media_serving_v8_expanded")
 
-WEBSERIES_SEARCH_TABLE = os.getenv("WEBSERIES_SEARCH_TABLE", "webseries_search_serving_v1")
-WEBSERIES_CARD_TABLE = os.getenv("WEBSERIES_CARD_TABLE", "webseries_card_serving_v1")
-WEBSERIES_DETAIL_TABLE = os.getenv("WEBSERIES_DETAIL_TABLE", "webseries_detail_serving_v1")
+WEBSERIES_SEARCH_TABLE = os.getenv("WEBSERIES_SEARCH_TABLE", "webseries_serving_v1")
+WEBSERIES_CARD_TABLE = os.getenv("WEBSERIES_CARD_TABLE", WEBSERIES_SEARCH_TABLE)
+WEBSERIES_DETAIL_TABLE = os.getenv("WEBSERIES_DETAIL_TABLE", WEBSERIES_SEARCH_TABLE)
 WEBSERIES_AVAILABILITY_TABLE = os.getenv("WEBSERIES_AVAILABILITY_TABLE", "webseries_availability_serving_v1")
 
 HOLLYWOOD_TABLE = os.getenv("HOLLYWOOD_SERVING_TABLE", "hollywood_serving_v3")
@@ -34,7 +34,9 @@ HISTORICAL_CARD_TABLE = os.getenv("HISTORICAL_CARD_TABLE", "historical_card_serv
 HISTORICAL_DETAIL_TABLE = os.getenv("HISTORICAL_DETAIL_TABLE", "historical_detail_serving_v1")
 HISTORICAL_SEARCH_TABLE = os.getenv("HISTORICAL_SEARCH_TABLE", "historical_search_serving_v1")
 HISTORICAL_AVAILABILITY_TABLE = os.getenv("HISTORICAL_AVAILABILITY_TABLE", "historical_availability_v2")
-PEOPLE_SEARCH_CACHE_TABLE = os.getenv("PEOPLE_SEARCH_CACHE_TABLE", "people_search_cache_v1")
+PEOPLE_SEARCH_CACHE_TABLE = os.getenv("PEOPLE_SEARCH_CACHE_TABLE", "people_serving_v1")
+PERSON_SLUG_REDIRECT_TABLE = os.getenv("PERSON_SLUG_REDIRECT_TABLE", "person_slug_redirect_v1")
+YOUTUBE_LINK_TABLE = os.getenv("YOUTUBE_LINK_TABLE", "youtube_link_serving_v1")
 
 router = APIRouter()
 
@@ -1376,6 +1378,9 @@ def webseries_card(row: Dict[str, Any], domain: str = "webseries", source_label:
     except Exception:
         imdb_rating_value = None
     rating = row.get("vote_average") or imdb_rating_value
+    latest_air_year = row.get("latest_air_year") or row.get("card_latest_air_year")
+    latest_air_date = row.get("latest_air_date") or row.get("card_latest_air_date")
+    display_year = latest_air_year or row.get("first_air_year")
 
     return {
         "domain": domain,
@@ -1385,8 +1390,11 @@ def webseries_card(row: Dict[str, Any], domain: str = "webseries", source_label:
         "title": row.get("title"),
         "slug": row.get("slug"),
         "movie_url": f"/webseries/{row.get('slug')}" if row.get("slug") else None,
-        "release_year": row.get("first_air_year"),
-        "year": row.get("first_air_year"),
+        "release_year": display_year,
+        "year": display_year,
+        "first_air_year": row.get("first_air_year"),
+        "latest_air_year": latest_air_year,
+        "latest_air_date": latest_air_date,
         "primary_language": row.get("original_language"),
         "language_slug": row.get("original_language"),
         "poster_url": fix_image_url(row.get("poster_path")),
@@ -1406,10 +1414,10 @@ def webseries_card(row: Dict[str, Any], domain: str = "webseries", source_label:
 def webseries_catalog_filters():
     genre_program_sql = """
         (
-            LOWER(COALESCE(c.genres, '')) LIKE '%%reality%%'
-            OR LOWER(COALESCE(c.genres, '')) LIKE '%%talk%%'
-            OR LOWER(COALESCE(c.genres, '')) LIKE '%%news%%'
-            OR LOWER(COALESCE(c.genres, '')) LIKE '%%game show%%'
+            LOWER(COALESCE(s.genres, '')) LIKE '%%reality%%'
+            OR LOWER(COALESCE(s.genres, '')) LIKE '%%talk%%'
+            OR LOWER(COALESCE(s.genres, '')) LIKE '%%news%%'
+            OR LOWER(COALESCE(s.genres, '')) LIKE '%%game show%%'
         )
     """
     title_program_sql = """
@@ -1429,21 +1437,21 @@ def webseries_catalog_filters():
     """
     daily_program_sql = """
         (
-            COALESCE(c.vote_count, s.vote_count, 0) = 0
-            AND NOT (c.omdb_imdb_rating ~ '^[0-9]+(\\.[0-9]+)?$')
+            COALESCE(s.vote_count, 0) = 0
+            AND NOT (CAST(s.omdb_imdb_rating AS TEXT) ~ '^[0-9]+(\\.[0-9]+)?$')
             AND (
-                LOWER(COALESCE(c.genres, '')) LIKE '%%family%%'
-                OR LOWER(COALESCE(c.genres, '')) LIKE '%%soap%%'
-                OR c.poster_path IS NULL
-                OR TRIM(CAST(c.poster_path AS TEXT)) = ''
+                LOWER(COALESCE(s.genres, '')) LIKE '%%family%%'
+                OR LOWER(COALESCE(s.genres, '')) LIKE '%%soap%%'
+                OR s.poster_path IS NULL
+                OR TRIM(CAST(s.poster_path AS TEXT)) = ''
             )
         )
     """
 
     return [
-        "c.poster_path IS NOT NULL",
-        "TRIM(CAST(c.poster_path AS TEXT)) <> ''",
-        "(COALESCE(c.vote_count, s.vote_count, 0) > 0 OR c.omdb_imdb_rating ~ '^[0-9]+(\\.[0-9]+)?$')",
+        "s.poster_path IS NOT NULL",
+        "TRIM(CAST(s.poster_path AS TEXT)) <> ''",
+        "(COALESCE(s.vote_count, 0) > 0 OR CAST(s.omdb_imdb_rating AS TEXT) ~ '^[0-9]+(\\.[0-9]+)?$')",
         f"NOT {genre_program_sql}",
         f"NOT {title_program_sql}",
         f"NOT {daily_program_sql}",
@@ -1489,31 +1497,17 @@ def search_webseries(
     availability_value = str(availability or "").strip().lower()
     if availability_value in {"ott", "available", "true", "1"}:
         where.append(
-            f"""
-            (
-                COALESCE(s.has_major_provider, 0) = 1
-                OR EXISTS (
-                    SELECT 1
-                    FROM public.{qident(WEBSERIES_AVAILABILITY_TABLE)} a
-                    WHERE a.tmdb_id = s.tmdb_id
-                )
-            )
-            """
+            "(COALESCE(s.has_major_provider, 0) = 1 OR COALESCE(s.availability_row_count, s.availability_count, 0) > 0)"
         )
     elif availability_value in {"youtube", "free"}:
         where.append(
-            f"""
-            EXISTS (
-                SELECT 1
-                FROM public.{qident(WEBSERIES_AVAILABILITY_TABLE)} a
-                WHERE a.tmdb_id = s.tmdb_id
-                  AND (
-                    LOWER(COALESCE(a.monetization_type, '')) IN ('free', 'ads')
-                    OR LOWER(COALESCE(a.provider_name, '')) LIKE '%%youtube%%'
-                    OR LOWER(COALESCE(a.normalized_provider_name, '')) LIKE '%%youtube%%'
-                  )
-            )
-            """
+            "("
+            "LOWER(COALESCE(s.provider_search_text, '')) LIKE '%%youtube%%' "
+            "OR LOWER(COALESCE(s.provider_names, '')) LIKE '%%youtube%%' "
+            "OR LOWER(COALESCE(s.availability_json, '')) LIKE '%%youtube%%' "
+            "OR LOWER(COALESCE(s.availability_json, '')) LIKE '%%\"monetization_type\"%%\"free\"%%' "
+            "OR LOWER(COALESCE(s.availability_json, '')) LIKE '%%\"monetization_type\"%%\"ads\"%%'"
+            ")"
         )
 
     provider_terms = provider_match_terms(provider)
@@ -1521,21 +1515,14 @@ def search_webseries(
         provider_conditions = []
         provider_params = []
         for term in provider_terms:
-            provider_conditions.append("LOWER(COALESCE(a.provider_name, '')) LIKE %s")
+            provider_conditions.append("LOWER(COALESCE(s.provider_names, '')) LIKE %s")
             provider_params.append(f"%{term}%")
-            provider_conditions.append("LOWER(COALESCE(a.normalized_provider_name, '')) LIKE %s")
+            provider_conditions.append("LOWER(COALESCE(s.provider_search_text, '')) LIKE %s")
+            provider_params.append(f"%{term}%")
+            provider_conditions.append("LOWER(COALESCE(s.availability_json, '')) LIKE %s")
             provider_params.append(f"%{term}%")
 
-        where.append(
-            f"""
-            EXISTS (
-                SELECT 1
-                FROM public.{qident(WEBSERIES_AVAILABILITY_TABLE)} a
-                WHERE a.tmdb_id = s.tmdb_id
-                  AND ({" OR ".join(provider_conditions)})
-            )
-            """
-        )
+        where.append(f"({' OR '.join(provider_conditions)})")
         params.extend(provider_params)
 
     where.extend(webseries_catalog_filters())
@@ -1550,7 +1537,6 @@ def search_webseries(
             f"""
             SELECT COUNT(*) AS total
             FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s
-            LEFT JOIN public.{qident(WEBSERIES_CARD_TABLE)} c ON c.slug = s.slug
             {where_clause}
             """,
             params,
@@ -1573,49 +1559,41 @@ def search_webseries(
             order_sql = ""
 
         imdb_rating_expr = (
-            "CASE WHEN c.omdb_imdb_rating ~ '^[0-9]+(\\.[0-9]+)?$' "
-            "THEN c.omdb_imdb_rating::DOUBLE PRECISION ELSE NULL END"
+            "CASE WHEN CAST(s.omdb_imdb_rating AS TEXT) ~ '^[0-9]+(\\.[0-9]+)?$' "
+            "THEN s.omdb_imdb_rating::DOUBLE PRECISION ELSE NULL END"
         )
-        rating_expr = f"COALESCE({imdb_rating_expr}, c.vote_average, 0)"
-        vote_expr = "COALESCE(c.vote_count, s.vote_count, 0)"
+        rating_expr = f"COALESCE({imdb_rating_expr}, s.vote_average, 0)"
+        vote_expr = "COALESCE(s.vote_count, 0)"
+        year_expr = "COALESCE(s.latest_air_year, s.first_air_year)"
         sort_value = str(sort or "popular").strip().lower()
 
         if sort_value == "latest":
             ranking_sql = (
-                f"s.first_air_year DESC NULLS LAST, {rating_expr} DESC NULLS LAST, "
+                f"{year_expr} DESC NULLS LAST, {rating_expr} DESC NULLS LAST, "
                 f"{vote_expr} DESC NULLS LAST, s.title ASC"
             )
         elif sort_value in {"rating", "imdb", "top_imdb", "top-imdb"}:
             ranking_sql = (
-                f"{rating_expr} DESC NULLS LAST, s.first_air_year DESC NULLS LAST, "
+                f"{rating_expr} DESC NULLS LAST, {year_expr} DESC NULLS LAST, "
                 f"{vote_expr} DESC NULLS LAST, s.title ASC"
             )
         elif provider_terms:
             ranking_sql = (
                 f"{rating_expr} DESC NULLS LAST, COALESCE(s.popularity_score, 0) DESC, "
-                f"s.first_air_year DESC NULLS LAST, s.title ASC"
+                f"{year_expr} DESC NULLS LAST, s.title ASC"
             )
         else:
             ranking_sql = (
                 "COALESCE(s.has_major_provider, 0) DESC, "
                 "COALESCE(s.popularity_score, 0) DESC, "
-                "s.first_air_year DESC NULLS LAST, s.title ASC"
+                f"{year_expr} DESC NULLS LAST, s.title ASC"
             )
 
         cur.execute(
             f"""
             SELECT
-                s.*,
-                c.poster_path,
-                c.vote_average,
-                c.vote_count AS card_vote_count,
-                c.provider_names AS card_provider_names,
-                c.major_provider_names,
-                c.availability_count,
-                c.omdb_imdb_rating,
-                c.genres
+                s.*
             FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s
-            LEFT JOIN public.{qident(WEBSERIES_CARD_TABLE)} c ON c.slug = s.slug
             {where_clause}
             ORDER BY
                 {order_sql}
@@ -1632,13 +1610,42 @@ def search_webseries(
 
 
 def webseries_availability(tmdb_id):
-    if not tmdb_id or not table_exists(WEBSERIES_AVAILABILITY_TABLE):
+    if not tmdb_id:
         return []
 
     conn = get_conn()
     cur = conn.cursor()
 
     try:
+        if table_exists(WEBSERIES_SEARCH_TABLE) and "availability_json" in table_columns(WEBSERIES_SEARCH_TABLE):
+            cur.execute(
+                f"""
+                SELECT availability_json
+                FROM public.{qident(WEBSERIES_SEARCH_TABLE)}
+                WHERE tmdb_id = %s
+                LIMIT 1
+                """,
+                [tmdb_id],
+            )
+            row = cur.fetchone()
+            availability_rows = parse_json(row.get("availability_json") if row else None, [])
+            if isinstance(availability_rows, list) and availability_rows:
+                return [
+                    {
+                        "provider_display_name": item.get("provider_name") or item.get("provider_display_name"),
+                        "provider_key": normalize_provider_key(item.get("provider_key") or item.get("normalized_provider_name") or item.get("provider_name")),
+                        "provider_type": item.get("monetization_type") or item.get("provider_type"),
+                        "region": item.get("watch_region") or item.get("region"),
+                        "final_url": item.get("tmdb_watch_link") or item.get("final_url"),
+                        "button_label": f"Watch on {item.get('provider_name')}" if item.get("provider_name") else "Watch",
+                    }
+                    for item in availability_rows
+                    if isinstance(item, dict)
+                ]
+
+        if not table_exists(WEBSERIES_AVAILABILITY_TABLE):
+            return []
+
         cur.execute(
             f"""
             SELECT provider_name, normalized_provider_name, monetization_type, watch_region,
@@ -1723,12 +1730,25 @@ def compact_people_query(query: str) -> str:
     return "".join(ch.lower() for ch in str(query or "") if ch.isalnum())
 
 
+SHORT_PERSON_ALIAS_SLUGS = {
+    "ntr": "n-t-rama-rao",
+    "anr": "akkineni-nageswara-rao",
+    "nbk": "nandamuri-balakrishna",
+}
+
+
+def exact_short_person_slug(query: str) -> Optional[str]:
+    compact = compact_people_query(normalize_people_query(query))
+    return SHORT_PERSON_ALIAS_SLUGS.get(compact)
+
+
 def search_people_cache(query: str, limit: int, scope: str):
     if not table_exists(PEOPLE_SEARCH_CACHE_TABLE):
         return None
 
     person_query = normalize_people_query(query)
     compact_person_query = compact_people_query(person_query)
+    exact_short_slug = exact_short_person_slug(person_query)
     where = ["COALESCE(indexable, 1) = 1"]
     params: List[Any] = []
 
@@ -1736,7 +1756,10 @@ def search_people_cache(query: str, limit: int, scope: str):
         where.append("domain IN ('modern', 'historical', 'modern_historical_bridge')")
 
     if person_query:
-        if len(compact_person_query) <= 3:
+        if exact_short_slug:
+            where.append("(person_slug = %s OR compact_aliases_text LIKE %s)")
+            params.extend([exact_short_slug, f"%|{compact_person_query}|%"])
+        elif len(compact_person_query) <= 3:
             where.append(
                 "("
                 "normalized_display_name = %s "
@@ -1781,6 +1804,7 @@ def search_people_cache(query: str, limit: int, scope: str):
         if person_query:
             order_sql = """
                 CASE
+                    WHEN person_slug = %s THEN 0
                     WHEN normalized_display_name = %s THEN 1
                     WHEN compact_display_name = %s THEN 2
                     WHEN compact_aliases_text LIKE %s THEN 3
@@ -1790,6 +1814,7 @@ def search_people_cache(query: str, limit: int, scope: str):
                 END,
             """
             order_params = [
+                exact_short_slug or "",
                 person_query.lower(),
                 compact_person_query,
                 f"%|{compact_person_query}|%",
@@ -1912,7 +1937,7 @@ def search_people(query: str, limit: int, scope: str):
 def suggestion_item(row: Dict[str, Any], domain: str, content_type: str = "movie") -> Dict[str, Any]:
     title = row.get("title") or row.get("person_name")
     slug = row.get("slug") or row.get("person_slug")
-    year = row.get("release_year") or row.get("year") or row.get("first_air_year") or row.get("last_year")
+    year = row.get("release_year") or row.get("year") or row.get("latest_air_year") or row.get("first_air_year") or row.get("last_year")
 
     if content_type == "person":
         movie_url = f"/historical/person/{slug}" if domain == "historical" and slug else (f"/person/{slug}" if slug else None)
@@ -1978,7 +2003,7 @@ def suggestion_rows(
             params.append(lang)
 
     score_col = next((col for col in ["rank_score", "search_rank", "quality_score", "popularity", "rating"] if col in cols), None)
-    year_col = "release_year" if "release_year" in cols else ("year" if "year" in cols else ("first_air_year" if "first_air_year" in cols else None))
+    year_col = "release_year" if "release_year" in cols else ("year" if "year" in cols else ("latest_air_year" if "latest_air_year" in cols else ("first_air_year" if "first_air_year" in cols else None)))
     score_sql = f"COALESCE({qident(score_col)}, 0) DESC NULLS LAST," if score_col else ""
     year_sql = f"{qident(year_col)} DESC NULLS LAST," if year_col else ""
     select_cols = [
@@ -1989,6 +2014,7 @@ def suggestion_rows(
             "slug",
             "release_year",
             "year",
+            "latest_air_year",
             "first_air_year",
             "language_slug",
             "language_name",
@@ -2110,6 +2136,7 @@ def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
 def people_suggestion_rows(query: str, limit: int, cur=None) -> List[Dict[str, Any]]:
     person_query = normalize_people_query(query)
     compact_query = compact_people_query(person_query)
+    exact_short_slug = exact_short_person_slug(person_query)
     if len(compact_query) < 2:
         return []
 
@@ -2125,7 +2152,7 @@ def people_suggestion_rows(query: str, limit: int, cur=None) -> List[Dict[str, A
             exact_alias = f"|{compact_query}|" in compact_aliases
             if not (compact_name.startswith(compact_query) or compact_slug.startswith(compact_query) or exact_alias):
                 continue
-            exact = 1 if compact_name == compact_query or exact_alias else 0
+            exact = 2 if exact_short_slug and slug_text == exact_short_slug else (1 if compact_name == compact_query or exact_alias else 0)
             matches.append(
                 (
                     exact,
@@ -2280,7 +2307,7 @@ def webseries_detail(slug: str):
 
     data.update(
         {
-            "overview": row.get("overview") or row.get("omdb_plot"),
+            "overview": row.get("overview") or row.get("card_overview") or row.get("omdb_plot"),
             "genres": parse_json(row.get("genres"), []),
             "backdrop_url": fix_image_url(row.get("backdrop_path")),
             "imdb_id": row.get("imdb_id"),
@@ -2290,7 +2317,7 @@ def webseries_detail(slug: str):
             "first_air_date": row.get("first_air_date"),
             "number_of_seasons": row.get("number_of_seasons"),
             "number_of_episodes": row.get("number_of_episodes"),
-            "series_status": row.get("series_status"),
+            "series_status": row.get("series_status") or row.get("status"),
             "series_type": row.get("series_type"),
             "availability": availability,
             "ott_all": availability,
@@ -2509,6 +2536,62 @@ def _fhp_verified_links(slug):
 
     out = []
 
+    if _fhp_table_exists(YOUTUBE_LINK_TABLE):
+        rows = _fhp_rows(
+            f"""
+            SELECT *
+            FROM public.{qident(YOUTUBE_LINK_TABLE)}
+            WHERE content_slug=%s
+              AND COALESCE(active, 1)=1
+              AND LOWER(COALESCE(content_domain, 'historical')) IN ('historical', 'classic')
+            ORDER BY COALESCE(is_primary, 0) DESC,
+                     COALESCE(source_rank, 0) DESC,
+                     COALESCE(quality_score, match_score, 0) DESC,
+                     COALESCE(view_count, 0) DESC,
+                     youtube_video_id ASC
+            LIMIT 20
+            """,
+            [slug],
+        )
+        for row in rows:
+            url = _fhp_pick(row, "youtube_url", "final_url", "url")
+            if not _fhp_is_youtube_url(url):
+                continue
+
+            out.append(
+                {
+                    "domain": "historical",
+                    "slug": slug,
+                    "title": _fhp_pick(row, "title", "youtube_title"),
+                    "provider": "YouTube",
+                    "provider_key": "youtube",
+                    "provider_display_name": "YouTube",
+                    "provider_type": "free",
+                    "button_label": "Watch on YouTube",
+                    "final_url": url,
+                    "url": url,
+                    "youtube_url": url,
+                    "youtube_title": _fhp_pick(row, "youtube_title", "title"),
+                    "youtube_video_id": _fhp_pick(row, "youtube_video_id", "video_id"),
+                    "youtube_language": _fhp_pick(row, "youtube_language", "language_slug"),
+                    "youtube_view_count": _fhp_pick(row, "view_count", "youtube_view_count"),
+                    "youtube_duration_seconds": _fhp_pick(row, "duration_seconds", "youtube_duration_seconds"),
+                    "youtube_match_score": _fhp_pick(row, "match_score", "youtube_match_score"),
+                    "youtube_match_type": _fhp_pick(row, "match_type", "youtube_match_type"),
+                    "youtube_confidence": _fhp_pick(row, "confidence_score", "youtube_confidence"),
+                    "youtube_source": _fhp_pick(row, "source_table") or YOUTUBE_LINK_TABLE,
+                    "active": True,
+                    "is_free": True,
+                    "has_youtube": True,
+                    "has_ott": True,
+                    "ott_primary": "YouTube",
+                    "ott_primary_key": "youtube",
+                }
+            )
+
+    if out:
+        return out
+
     if _fhp_table_exists("historical_youtube_verified_links_v1"):
         rows = _fhp_rows(
             "SELECT * FROM historical_youtube_verified_links_v1 "
@@ -2718,8 +2801,8 @@ def _fhp_detail(row):
     data = _fhp_list_card(row)
     slug = data.get("slug")
     youtube_url = _fhp_pick(row, "youtube_url")
-    links = []
-    if _fhp_is_youtube_url(youtube_url):
+    links = _fhp_verified_links(slug)
+    if not links and _fhp_is_youtube_url(youtube_url):
         links.append(
             {
                 "domain": "historical",
@@ -2944,6 +3027,10 @@ def _unified_person_payload(row: Dict[str, Any]):
         "source_domain": _fhp_pick(row, "domain", "source_domain") or "person",
         "primary_role": role,
         "movie_count": movie_count,
+        "actor_count": _fhp_int(_fhp_pick(row, "actor_count"), 0),
+        "director_count": _fhp_int(_fhp_pick(row, "director_count"), 0),
+        "producer_count": _fhp_int(_fhp_pick(row, "producer_count"), 0),
+        "music_count": _fhp_int(_fhp_pick(row, "music_count"), 0),
         "youtube_movie_count": youtube_count,
         "active_year_max": _fhp_pick(row, "active_year_max", "last_year"),
         "aliases": list_value(_fhp_pick(row, "aliases_json")),
@@ -2957,6 +3044,33 @@ def _unified_person_payload(row: Dict[str, Any]):
         ),
         "title": f"{name} Movies" if name else "Person Movies",
     }
+
+
+def _resolve_person_slug(slug: str) -> Tuple[str, Optional[str]]:
+    requested = str(slug or "").strip().strip("/").lower()
+    if not requested:
+        return "", None
+
+    short_slug = exact_short_person_slug(requested)
+    if short_slug:
+        return short_slug, requested if requested != short_slug else None
+
+    if _fhp_table_exists(PERSON_SLUG_REDIRECT_TABLE):
+        rows = _fhp_rows(
+            f"""
+            SELECT canonical_slug
+            FROM public.{qident(PERSON_SLUG_REDIRECT_TABLE)}
+            WHERE old_slug=%s
+              AND COALESCE(active, 1)=1
+            LIMIT 1
+            """,
+            [requested],
+        )
+        if rows and rows[0].get("canonical_slug"):
+            canonical = str(rows[0]["canonical_slug"]).strip()
+            return canonical, requested if canonical != requested else None
+
+    return requested, None
 
 
 def _modern_person_movie_rows(person_slug: str, limit: int, offset: int):
@@ -3089,16 +3203,16 @@ def _merge_person_movie_cards(modern_rows, historical_rows, limit: int):
 
 @router.get("/api/v3/person/{person_slug}")
 def unified_person_detail_v1(person_slug: str, page: int = 1, limit: int = 96):
-    slug = str(person_slug or "").strip().strip("/")
+    slug, redirected_from = _resolve_person_slug(person_slug)
     if not slug:
         raise HTTPException(status_code=404, detail="Person not found")
 
     person_rows = []
-    if _fhp_table_exists("people_search_cache_v1"):
+    if _fhp_table_exists(PEOPLE_SEARCH_CACHE_TABLE):
         person_rows = _fhp_rows(
-            """
+            f"""
             SELECT *
-            FROM people_search_cache_v1
+            FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)}
             WHERE person_slug=%s
             LIMIT 1
             """,
@@ -3148,7 +3262,10 @@ def unified_person_detail_v1(person_slug: str, page: int = 1, limit: int = 96):
     modern_total = _modern_person_movie_count(slug) if include_modern else 0
     historical_total = _historical_person_movie_count(slug) if include_historical else 0
     total = modern_total + historical_total
-    person["movie_count"] = total
+    person["movie_count"] = max(total, _fhp_int(person.get("movie_count"), 0))
+    if redirected_from:
+        person["redirected_from"] = redirected_from
+        person["canonical_slug"] = slug
 
     return {
         "domain": "person",
@@ -3166,7 +3283,7 @@ def historical_combinations_patched_v1(
     page: int = 1,
     limit: int = 48,
     q: str = None,
-    min_movies: int = 4,
+    min_movies: int = 5,
     youtube_only: bool = False,
 ):
     page = max(1, int(page or 1))
@@ -3213,7 +3330,7 @@ def historical_people_patched_v1(
     page: int = 1,
     limit: int = 48,
     q: str = None,
-    min_movies: int = 11,
+    min_movies: int = 50,
     youtube_only: bool = False,
 ):
     page = max(1, int(page or 1))
@@ -3417,7 +3534,15 @@ def historical_movies_patched_v1(
     youtube_only = provider_text == "youtube" or availability_text in ("youtube", "free", "true", "ott", "1")
 
     join_sql = ""
-    if youtube_only and _fhp_table_exists("historical_youtube_verified_links_v1"):
+    if youtube_only and _fhp_table_exists(YOUTUBE_LINK_TABLE):
+        join_sql = (
+            " JOIN ("
+            f"   SELECT DISTINCT content_slug FROM public.{qident(YOUTUBE_LINK_TABLE)} "
+            "   WHERE COALESCE(active, 1)=1 "
+            "     AND LOWER(COALESCE(content_domain, 'historical')) IN ('historical', 'classic')"
+            " ) ytv ON ytv.content_slug = h.slug "
+        )
+    elif youtube_only and _fhp_table_exists("historical_youtube_verified_links_v1"):
         join_sql = (
             " JOIN ("
             "   SELECT DISTINCT slug FROM historical_youtube_verified_links_v1 "
