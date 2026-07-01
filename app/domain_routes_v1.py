@@ -1504,9 +1504,9 @@ def search_webseries(
             "("
             "LOWER(COALESCE(s.provider_search_text, '')) LIKE '%%youtube%%' "
             "OR LOWER(COALESCE(s.provider_names, '')) LIKE '%%youtube%%' "
-            "OR LOWER(COALESCE(s.availability_json, '')) LIKE '%%youtube%%' "
-            "OR LOWER(COALESCE(s.availability_json, '')) LIKE '%%\"monetization_type\"%%\"free\"%%' "
-            "OR LOWER(COALESCE(s.availability_json, '')) LIKE '%%\"monetization_type\"%%\"ads\"%%'"
+            "OR LOWER(COALESCE(CAST(s.availability_json AS TEXT), '')) LIKE '%%youtube%%' "
+            "OR LOWER(COALESCE(CAST(s.availability_json AS TEXT), '')) LIKE '%%\"monetization_type\"%%\"free\"%%' "
+            "OR LOWER(COALESCE(CAST(s.availability_json AS TEXT), '')) LIKE '%%\"monetization_type\"%%\"ads\"%%'"
             ")"
         )
 
@@ -1519,7 +1519,7 @@ def search_webseries(
             provider_params.append(f"%{term}%")
             provider_conditions.append("LOWER(COALESCE(s.provider_search_text, '')) LIKE %s")
             provider_params.append(f"%{term}%")
-            provider_conditions.append("LOWER(COALESCE(s.availability_json, '')) LIKE %s")
+            provider_conditions.append("LOWER(COALESCE(CAST(s.availability_json AS TEXT), '')) LIKE %s")
             provider_params.append(f"%{term}%")
 
         where.append(f"({' OR '.join(provider_conditions)})")
@@ -1734,6 +1734,10 @@ SHORT_PERSON_ALIAS_SLUGS = {
     "ntr": "n-t-rama-rao",
     "anr": "akkineni-nageswara-rao",
     "nbk": "nandamuri-balakrishna",
+    "shobanbabu": "sobhan-babu",
+    "shobhanbabu": "sobhan-babu",
+    "uppalapatikrishnamraju": "krishnam-raju",
+    "ukrishnamraju": "krishnam-raju",
 }
 
 
@@ -1831,9 +1835,9 @@ def search_people_cache(query: str, limit: int, scope: str):
                 primary_role,
                 movie_count,
                 youtube_movie_count,
-                active_year_max AS last_year,
+                NULL AS last_year,
                 aliases_json,
-                disambiguation_label,
+                NULL AS disambiguation_label,
                 search_rank
             FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)}
             {where_clause}
@@ -2068,11 +2072,11 @@ def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
                     primary_role,
                     movie_count,
                     youtube_movie_count,
-                    active_year_max AS last_year,
+                    NULL AS last_year,
                     aliases_json,
                     compact_aliases_text,
                     search_rank,
-                    disambiguation_label
+                    NULL AS disambiguation_label
                 FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)}
                 WHERE COALESCE(indexable, 1) = 1
                 ORDER BY COALESCE(search_rank, 0) DESC, display_name ASC
