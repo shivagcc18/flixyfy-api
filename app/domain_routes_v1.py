@@ -34,6 +34,7 @@ HISTORICAL_CARD_TABLE = os.getenv("HISTORICAL_CARD_TABLE", "historical_card_serv
 HISTORICAL_DETAIL_TABLE = os.getenv("HISTORICAL_DETAIL_TABLE", "historical_detail_serving_v1")
 HISTORICAL_SEARCH_TABLE = os.getenv("HISTORICAL_SEARCH_TABLE", "historical_search_serving_v1")
 HISTORICAL_AVAILABILITY_TABLE = os.getenv("HISTORICAL_AVAILABILITY_TABLE", "historical_availability_v2")
+PEOPLE_SEARCH_CACHE_TABLE = os.getenv("PEOPLE_SEARCH_CACHE_TABLE", "people_search_cache_v1")
 
 router = APIRouter()
 
@@ -1072,13 +1073,28 @@ def search_domain(table_name: str, domain: str, query: str, limit: int, language
             order_params.extend([query, f"{query}%"])
 
         match_sql = "CASE " + " ".join(match_parts) + " ELSE 5 END," if match_parts else ""
-        year_sql = "release_year DESC NULLS LAST," if "release_year" in cols else ("year DESC NULLS LAST," if "year" in cols else "")
         youtube_sql = "COALESCE(has_youtube, 0) DESC," if "has_youtube" in cols else ""
         ott_sql = "COALESCE(has_ott, 0) DESC," if "has_ott" in cols else ""
         poster_sql = "(poster_url IS NOT NULL AND TRIM(CAST(poster_url AS TEXT)) <> '') DESC," if "poster_url" in cols else ""
+        language_expr = None
+        for language_col in ["language_slug", "primary_language", "language"]:
+            if language_col in cols:
+                language_expr = f"LOWER(COALESCE(CAST({qident(language_col)} AS TEXT), ''))"
+                break
+        tier1_language_sql = (
+            f"CASE WHEN {language_expr} IN ('telugu', 'tamil', 'hindi', 'kannada', 'malayalam') THEN 0 "
+            f"WHEN {language_expr} IN ('bengali', 'marathi', 'gujarati', 'punjabi', 'odia', 'assamese', 'bhojpuri', 'urdu', 'sanskrit') THEN 1 "
+            "ELSE 2 END,"
+            if language_expr
+            else ""
+        )
+        year_sql = "release_year DESC NULLS LAST," if "release_year" in cols else ("year DESC NULLS LAST," if "year" in cols else "")
         score_col = next((col for col in ["quality_score", "popularity", "rating", "vote_average"] if col in cols), None)
         score_sql = f"COALESCE({qident(score_col)}, 0) DESC NULLS LAST," if score_col else ""
-        order = f"{match_sql} {year_sql} {youtube_sql} {ott_sql} {poster_sql} {score_sql} title ASC"
+        if domain == "historical":
+            order = f"{match_sql} {youtube_sql} {ott_sql} {poster_sql} {tier1_language_sql} {year_sql} {score_sql} title ASC"
+        else:
+            order = f"{match_sql} {year_sql} {youtube_sql} {ott_sql} {poster_sql} {score_sql} title ASC"
     else:
         order = order_sql(table_name, "popular")
 
@@ -1258,23 +1274,30 @@ def webseries_availability(tmdb_id):
 def person_search_card(row: Dict[str, Any], domain: str = "historical"):
     person_slug = row.get("person_slug")
     person_name = row.get("person_name")
+    source_domain = row.get("domain") or row.get("source_domain") or domain
+    if source_domain == "historical":
+        movie_url = f"/historical/person/{person_slug}" if person_slug else None
+    else:
+        movie_url = f"/person/{person_slug}" if person_slug else None
 
     return {
         "domain": "person",
         "content_type": "person",
-        "source_domain": domain,
+        "source_domain": source_domain,
         "source_label": "People",
         "title": person_name,
         "person_name": person_name,
         "person_slug": person_slug,
         "slug": person_slug,
-        "movie_url": f"/historical/person/{person_slug}" if domain == "historical" and person_slug else None,
+        "movie_url": movie_url,
         "primary_role": row.get("primary_role"),
         "release_year": row.get("last_year"),
         "year": row.get("last_year"),
         "movie_count": row.get("movie_count"),
         "youtube_movie_count": row.get("youtube_movie_count"),
-        "quality_score": row.get("movie_count") or 0,
+        "quality_score": row.get("search_rank") or row.get("movie_count") or 0,
+        "aliases": list_value(row.get("aliases_json")),
+        "disambiguation_label": row.get("disambiguation_label"),
         "raw": dict(row),
     }
 
@@ -1304,12 +1327,127 @@ def normalize_people_query(query: str) -> str:
     return " ".join(meaningful).strip() or text
 
 
+def compact_people_query(query: str) -> str:
+    return "".join(ch.lower() for ch in str(query or "") if ch.isalnum())
+
+
+def search_people_cache(query: str, limit: int, scope: str):
+    if not table_exists(PEOPLE_SEARCH_CACHE_TABLE):
+        return None
+
+    person_query = normalize_people_query(query)
+    compact_person_query = compact_people_query(person_query)
+    where = ["COALESCE(indexable, 1) = 1"]
+    params: List[Any] = []
+
+    if scope == "indian":
+        where.append("domain IN ('modern', 'historical', 'modern_historical_bridge')")
+
+    if person_query:
+        if len(compact_person_query) <= 3:
+            where.append(
+                "("
+                "normalized_display_name = %s "
+                "OR compact_display_name = %s "
+                "OR compact_aliases_text LIKE %s"
+                ")"
+            )
+            params.extend([person_query.lower(), compact_person_query, f"%|{compact_person_query}|%"])
+        else:
+            where.append(
+                "("
+                "display_name ILIKE %s "
+                "OR aliases_search_text ILIKE %s "
+                "OR compact_display_name LIKE %s "
+                "OR compact_aliases_text LIKE %s"
+                ")"
+            )
+            params.extend(
+                [
+                    f"%{person_query}%",
+                    f"%{person_query}%",
+                    f"{compact_person_query}%",
+                    f"%|{compact_person_query}|%",
+                ]
+            )
+
+    where_clause = "WHERE " + " AND ".join(where)
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        total = None
+        if not person_query:
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)} {where_clause}",
+                params,
+            )
+            total = cur.fetchone()["total"]
+
+        order_sql = ""
+        order_params: List[Any] = []
+        if person_query:
+            order_sql = """
+                CASE
+                    WHEN normalized_display_name = %s THEN 1
+                    WHEN compact_display_name = %s THEN 2
+                    WHEN compact_aliases_text LIKE %s THEN 3
+                    WHEN display_name ILIKE %s THEN 4
+                    WHEN aliases_search_text ILIKE %s THEN 5
+                    ELSE 6
+                END,
+            """
+            order_params = [
+                person_query.lower(),
+                compact_person_query,
+                f"%|{compact_person_query}|%",
+                f"{person_query}%",
+                f"%{person_query}%",
+            ]
+
+        cur.execute(
+            f"""
+            SELECT
+                person_slug,
+                display_name AS person_name,
+                domain,
+                primary_role,
+                movie_count,
+                youtube_movie_count,
+                active_year_max AS last_year,
+                aliases_json,
+                disambiguation_label,
+                search_rank
+            FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)}
+            {where_clause}
+            ORDER BY
+                {order_sql}
+                COALESCE(search_rank, 0) DESC,
+                COALESCE(youtube_movie_count, 0) DESC,
+                COALESCE(movie_count, 0) DESC,
+                display_name ASC
+            LIMIT %s
+            """,
+            params + order_params + [limit],
+        )
+        items = [person_search_card(dict(r), r.get("domain") or "historical") for r in cur.fetchall()]
+        if total is None:
+            total = len(items) + (1 if len(items) == limit else 0)
+        return total, items
+    finally:
+        conn.close()
+
+
 def search_people(query: str, limit: int, scope: str):
+    cached_result = search_people_cache(query, limit, scope)
+    if cached_result is not None:
+        return cached_result
+
     if not table_exists("historical_people_seo_preprod_v1"):
         return 0, []
 
     person_query = normalize_people_query(query)
-    compact_person_query = "".join(ch.lower() for ch in person_query if ch.isalnum())
+    compact_person_query = compact_people_query(person_query)
     where = []
     params = []
 
@@ -1385,7 +1523,7 @@ def suggestion_item(row: Dict[str, Any], domain: str, content_type: str = "movie
     year = row.get("release_year") or row.get("year") or row.get("first_air_year") or row.get("last_year")
 
     if content_type == "person":
-        movie_url = f"/historical/person/{slug}" if slug else None
+        movie_url = f"/historical/person/{slug}" if domain == "historical" and slug else (f"/person/{slug}" if slug else None)
         label = "People"
     elif domain == "webseries":
         movie_url = f"/webseries/{slug}" if slug else None
@@ -1407,6 +1545,8 @@ def suggestion_item(row: Dict[str, Any], domain: str, content_type: str = "movie
         "primary_language": row.get("language_name") or row.get("primary_language") or row.get("language_slug") or row.get("language"),
         "poster_url": fix_image_url(row.get("poster_url") or row.get("poster_path")),
         "rank_score": row.get("rank_score") or row.get("quality_score") or row.get("popularity") or row.get("movie_count") or 0,
+        "aliases": list_value(row.get("aliases_json")),
+        "disambiguation_label": row.get("disambiguation_label"),
     }
 
 
@@ -1497,6 +1637,49 @@ def suggestion_rows(
 
 @lru_cache(maxsize=1)
 def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
+    if table_exists(PEOPLE_SEARCH_CACHE_TABLE):
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                SELECT
+                    display_name AS person_name,
+                    person_slug,
+                    domain,
+                    primary_role,
+                    movie_count,
+                    youtube_movie_count,
+                    active_year_max AS last_year,
+                    aliases_json,
+                    compact_aliases_text,
+                    search_rank,
+                    disambiguation_label
+                FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)}
+                WHERE COALESCE(indexable, 1) = 1
+                ORDER BY COALESCE(search_rank, 0) DESC, display_name ASC
+                LIMIT 10000
+                """
+            )
+            return tuple(
+                (
+                    row.get("person_name"),
+                    row.get("person_slug"),
+                    row.get("domain") or "historical",
+                    row.get("primary_role"),
+                    row.get("movie_count"),
+                    row.get("youtube_movie_count"),
+                    row.get("last_year"),
+                    row.get("aliases_json"),
+                    row.get("compact_aliases_text"),
+                    row.get("search_rank"),
+                    row.get("disambiguation_label"),
+                )
+                for row in cur.fetchall()
+            )
+        finally:
+            conn.close()
+
     if not table_exists("historical_people_seo_preprod_v1"):
         return tuple()
 
@@ -1516,10 +1699,15 @@ def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
             (
                 row.get("person_name"),
                 row.get("person_slug"),
+                "historical",
                 row.get("primary_role"),
                 row.get("movie_count"),
                 row.get("youtube_movie_count"),
                 row.get("last_year"),
+                None,
+                None,
+                None,
+                None,
             )
             for row in cur.fetchall()
         )
@@ -1529,38 +1717,44 @@ def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
 
 def people_suggestion_rows(query: str, limit: int, cur=None) -> List[Dict[str, Any]]:
     person_query = normalize_people_query(query)
-    compact_query = "".join(ch.lower() for ch in person_query if ch.isalnum())
+    compact_query = compact_people_query(person_query)
     if len(compact_query) < 2:
         return []
 
     cached = cached_people_suggestion_rows()
     if cached:
         matches = []
-        for name, slug, role, movie_count, youtube_count, last_year in cached:
+        for name, slug, domain, role, movie_count, youtube_count, last_year, aliases_json, compact_aliases_text, search_rank, disambiguation_label in cached:
             name_text = str(name or "")
             slug_text = str(slug or "")
-            compact_name = "".join(ch.lower() for ch in name_text if ch.isalnum())
-            compact_slug = "".join(ch.lower() for ch in slug_text if ch.isalnum())
-            if not (compact_name.startswith(compact_query) or compact_slug.startswith(compact_query)):
+            compact_name = compact_people_query(name_text)
+            compact_slug = compact_people_query(slug_text)
+            compact_aliases = str(compact_aliases_text or "")
+            exact_alias = f"|{compact_query}|" in compact_aliases
+            if not (compact_name.startswith(compact_query) or compact_slug.startswith(compact_query) or exact_alias):
                 continue
-            exact = 1 if compact_name == compact_query else 0
+            exact = 1 if compact_name == compact_query or exact_alias else 0
             matches.append(
                 (
                     exact,
+                    int(search_rank or 0),
                     int(youtube_count or 0),
                     int(movie_count or 0),
                     {
                         "person_name": name,
                         "person_slug": slug,
+                        "domain": domain,
                         "primary_role": role,
                         "movie_count": movie_count,
                         "youtube_movie_count": youtube_count,
                         "last_year": last_year,
+                        "aliases_json": aliases_json,
+                        "disambiguation_label": disambiguation_label,
                     },
                 )
             )
-        matches.sort(key=lambda item: (item[0], item[1], item[2], str(item[3].get("person_name") or "")), reverse=True)
-        return [suggestion_item(row, "historical", "person") for *_score, row in matches[:limit]]
+        matches.sort(key=lambda item: (item[0], item[1], item[2], item[3], str(item[4].get("person_name") or "")), reverse=True)
+        return [suggestion_item(row, row.get("domain") or "historical", "person") for *_score, row in matches[:limit]]
 
     if not table_exists("historical_people_seo_preprod_v1"):
         return []
