@@ -285,6 +285,35 @@ def append_modern_provider_filters(where, params, provider=None, availability=No
     return where, params, provider_terms
 
 
+def provider_item_matches(item, provider_terms):
+    if not provider_terms:
+        return False
+
+    provider_key = str(item.get("provider_key") or "").lower()
+    provider_name = str(item.get("provider_display_name") or item.get("provider_name") or "").lower()
+    provider_text = f"{provider_key} {provider_key.replace('_', ' ')} {provider_name}"
+
+    for term in provider_terms:
+        normalized = term.lower().replace("-", " ").replace("_", " ")
+        key_term = term.lower().replace("-", "_").replace(" ", "_")
+        if normalized and normalized in provider_text:
+            return True
+        if key_term and key_term in provider_key:
+            return True
+
+    return False
+
+
+def prioritize_selected_provider(providers, provider):
+    provider_terms = provider_match_terms(provider)
+    if not provider_terms or not providers:
+        return providers
+
+    matched = [item for item in providers if provider_item_matches(item, provider_terms)]
+    rest = [item for item in providers if not provider_item_matches(item, provider_terms)]
+    return matched + rest
+
+
 def first(row: Dict[str, Any], keys: List[str], default=None):
     for key in keys:
         value = row.get(key)
@@ -610,6 +639,26 @@ def fetch_rows(
     has_more = len(rows) > limit
     rows = rows[:limit]
     total = offset + len(rows) + (1 if has_more else 0)
+    item_rows = [dict(r) for r in rows]
+
+    if domain == "modern":
+        ott_summaries = modern_ott_v2_summaries([r.get("tmdb_id") for r in item_rows])
+        for row in item_rows:
+            summary = ott_summaries.get(str(row.get("tmdb_id")))
+            if not summary:
+                continue
+
+            watch_providers = prioritize_selected_provider(summary["watch_providers"], provider)
+            row.update(summary)
+            row["watch_providers"] = watch_providers
+            row["availability"] = watch_providers
+            row["ott_all"] = watch_providers
+            if watch_providers:
+                selected_primary = watch_providers[0]
+                row["ott_primary"] = selected_primary.get("provider_display_name")
+                row["ott_primary_key"] = selected_primary.get("provider_key") or normalize_provider_key(
+                    selected_primary.get("provider_display_name")
+                )
 
     return {
         "domain": domain,
@@ -618,7 +667,7 @@ def fetch_rows(
         "limit": limit,
         "total": total,
         "pages": page + (1 if has_more else 0),
-        "items": [domain_card(dict(r), domain) for r in rows],
+        "items": [domain_card(r, domain) for r in item_rows],
     }
 
 
@@ -1202,9 +1251,17 @@ def search_modern(
         for row in rows:
             summary = ott_summaries.get(str(row.get("tmdb_id")))
             if summary:
+                watch_providers = prioritize_selected_provider(summary["watch_providers"], provider)
                 row.update(summary)
-                row["ott_all"] = summary["watch_providers"]
-                row["availability"] = summary["watch_providers"]
+                row["watch_providers"] = watch_providers
+                row["ott_all"] = watch_providers
+                row["availability"] = watch_providers
+                if watch_providers:
+                    selected_primary = watch_providers[0]
+                    row["ott_primary"] = selected_primary.get("provider_display_name")
+                    row["ott_primary_key"] = selected_primary.get("provider_key") or normalize_provider_key(
+                        selected_primary.get("provider_display_name")
+                    )
 
             items.append(modern_card(row))
     finally:
