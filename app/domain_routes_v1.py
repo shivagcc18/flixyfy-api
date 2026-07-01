@@ -255,8 +255,8 @@ def append_modern_provider_filters(where, params, provider=None, availability=No
                 SELECT CAST(a.tmdb_id AS TEXT)
                 FROM public.ott_availability_normalized_v2 a
                 WHERE LOWER(COALESCE(a.provider_category, a.provider_type, '')) IN ('free', 'free_with_ads', 'ads')
-                   OR LOWER(COALESCE(a.provider_key, '')) LIKE '%youtube%'
-                   OR LOWER(COALESCE(a.provider_display_name, '')) LIKE '%youtube%'
+                   OR LOWER(COALESCE(a.provider_key, '')) LIKE '%%youtube%%'
+                   OR LOWER(COALESCE(a.provider_display_name, '')) LIKE '%%youtube%%'
             )
             """
         )
@@ -1365,16 +1365,22 @@ def search_domain(table_name: str, domain: str, query: str, limit: int, language
     return total, items
 
 
-def webseries_card(row: Dict[str, Any]):
+def webseries_card(row: Dict[str, Any], domain: str = "webseries", source_label: str = "Webseries"):
     providers = parse_json(row.get("card_provider_names") or row.get("provider_names"), [])
     major_providers = parse_json(row.get("major_provider_names"), [])
     provider_list = major_providers if major_providers else providers
     primary_provider = provider_list[0] if provider_list else None
+    imdb_rating = row.get("omdb_imdb_rating")
+    try:
+        imdb_rating_value = float(imdb_rating) if imdb_rating not in {None, "", "N/A"} else None
+    except Exception:
+        imdb_rating_value = None
+    rating = row.get("vote_average") or imdb_rating_value
 
     return {
-        "domain": "webseries",
-        "content_type": "webseries",
-        "source_label": "Webseries",
+        "domain": domain,
+        "content_type": domain,
+        "source_label": source_label,
         "tmdb_id": row.get("tmdb_id"),
         "title": row.get("title"),
         "slug": row.get("slug"),
@@ -1384,7 +1390,8 @@ def webseries_card(row: Dict[str, Any]):
         "primary_language": row.get("original_language"),
         "language_slug": row.get("original_language"),
         "poster_url": fix_image_url(row.get("poster_path")),
-        "rating": row.get("vote_average"),
+        "rating": rating,
+        "imdb_rating": imdb_rating_value,
         "vote_count": row.get("card_vote_count") or row.get("vote_count"),
         "popularity": row.get("popularity_score"),
         "quality_score": row.get("popularity_score"),
@@ -1396,6 +1403,60 @@ def webseries_card(row: Dict[str, Any]):
     }
 
 
+def webseries_catalog_filters(programs: bool = False):
+    genre_program_sql = """
+        (
+            LOWER(COALESCE(c.genres, '')) LIKE '%%reality%%'
+            OR LOWER(COALESCE(c.genres, '')) LIKE '%%talk%%'
+            OR LOWER(COALESCE(c.genres, '')) LIKE '%%news%%'
+            OR LOWER(COALESCE(c.genres, '')) LIKE '%%game show%%'
+        )
+    """
+    title_program_sql = """
+        (
+            LOWER(COALESCE(s.title, '')) LIKE '%%bigg boss%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%celebrity%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%challenge%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%juniors%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%superstar%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%super family%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%sa re ga ma%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%dance%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%singing%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%awards%%'
+            OR LOWER(COALESCE(s.title, '')) LIKE '%%award%%'
+        )
+    """
+    daily_program_sql = """
+        (
+            COALESCE(c.vote_count, s.vote_count, 0) = 0
+            AND NOT (c.omdb_imdb_rating ~ '^[0-9]+(\\.[0-9]+)?$')
+            AND (
+                LOWER(COALESCE(c.genres, '')) LIKE '%%family%%'
+                OR LOWER(COALESCE(c.genres, '')) LIKE '%%soap%%'
+                OR c.poster_path IS NULL
+                OR TRIM(CAST(c.poster_path AS TEXT)) = ''
+            )
+        )
+    """
+
+    if programs:
+        return [
+            "COALESCE(s.first_air_year, 0) BETWEEN 2000 AND 2025",
+            f"({genre_program_sql} OR {title_program_sql} OR {daily_program_sql})",
+        ]
+
+    return [
+        "COALESCE(s.first_air_year, 0) BETWEEN 2000 AND 2025",
+        "c.poster_path IS NOT NULL",
+        "TRIM(CAST(c.poster_path AS TEXT)) <> ''",
+        "(COALESCE(c.vote_count, s.vote_count, 0) > 0 OR c.omdb_imdb_rating ~ '^[0-9]+(\\.[0-9]+)?$')",
+        f"NOT {genre_program_sql}",
+        f"NOT {title_program_sql}",
+        f"NOT {daily_program_sql}",
+    ]
+
+
 def search_webseries(
     query: str,
     limit: int,
@@ -1405,6 +1466,7 @@ def search_webseries(
     provider: Optional[str] = None,
     availability: Optional[str] = None,
     sort: str = "popular",
+    programs: bool = False,
 ):
     if not table_exists(WEBSERIES_SEARCH_TABLE):
         return 0, []
@@ -1455,8 +1517,8 @@ def search_webseries(
                 WHERE a.tmdb_id = s.tmdb_id
                   AND (
                     LOWER(COALESCE(a.monetization_type, '')) IN ('free', 'ads')
-                    OR LOWER(COALESCE(a.provider_name, '')) LIKE '%youtube%'
-                    OR LOWER(COALESCE(a.normalized_provider_name, '')) LIKE '%youtube%'
+                    OR LOWER(COALESCE(a.provider_name, '')) LIKE '%%youtube%%'
+                    OR LOWER(COALESCE(a.normalized_provider_name, '')) LIKE '%%youtube%%'
                   )
             )
             """
@@ -1484,6 +1546,8 @@ def search_webseries(
         )
         params.extend(provider_params)
 
+    where.extend(webseries_catalog_filters(programs=programs))
+
     where_clause = "WHERE " + " AND ".join(where) if where else ""
 
     conn = get_conn()
@@ -1491,7 +1555,12 @@ def search_webseries(
 
     try:
         cur.execute(
-            f"SELECT COUNT(*) AS total FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s {where_clause}",
+            f"""
+            SELECT COUNT(*) AS total
+            FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s
+            LEFT JOIN public.{qident(WEBSERIES_CARD_TABLE)} c ON c.slug = s.slug
+            {where_clause}
+            """,
             params,
         )
         total = cur.fetchone()["total"]
@@ -1551,7 +1620,8 @@ def search_webseries(
                 c.provider_names AS card_provider_names,
                 c.major_provider_names,
                 c.availability_count,
-                c.omdb_imdb_rating
+                c.omdb_imdb_rating,
+                c.genres
             FROM public.{qident(WEBSERIES_SEARCH_TABLE)} s
             LEFT JOIN public.{qident(WEBSERIES_CARD_TABLE)} c ON c.slug = s.slug
             {where_clause}
@@ -1562,7 +1632,9 @@ def search_webseries(
             """,
             params + order_params + [limit],
         )
-        items = [webseries_card(dict(r)) for r in cur.fetchall()]
+        item_domain = "tvprograms" if programs else "webseries"
+        item_label = "TV Programs" if programs else "Webseries"
+        items = [webseries_card(dict(r), item_domain, item_label) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -3481,11 +3553,12 @@ def global_search(
         requested = {"modern", "hollywood", "historical"}
 
     requested_type = str(content_type or "movies").strip().lower()
-    if requested_type not in {"movies", "webseries", "people", "all"}:
+    if requested_type not in {"movies", "webseries", "tvprograms", "people", "all"}:
         requested_type = "movies"
 
     search_movies = requested_type in {"movies", "all"}
     search_series = requested_type in {"webseries", "all"}
+    search_tv_programs = requested_type == "tvprograms"
     search_persons = requested_type == "people"
     scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
 
@@ -3545,6 +3618,21 @@ def global_search(
         total += webseries_total
         items.extend(webseries_items)
 
+    if search_tv_programs:
+        tv_total, tv_items = search_webseries(
+            query=query,
+            limit=fetch_limit,
+            scope=scope,
+            year=year,
+            language=language,
+            provider=provider,
+            availability=availability,
+            sort=sort,
+            programs=True,
+        )
+        total += tv_total
+        items.extend(tv_items)
+
     if search_persons:
         people_total, people_items = search_people(
             query=query,
@@ -3595,6 +3683,7 @@ def global_search(
             "modern": 300,
             "webseries": 250,
             "person": 240,
+            "tvprograms": 180,
             "hollywood": 200,
             "historical": 100,
         }.get(item.get("domain"), 0)
