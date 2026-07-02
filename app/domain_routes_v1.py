@@ -3341,13 +3341,46 @@ def historical_people_patched_v1(
     limit = max(1, min(int(limit or 48), 100))
     offset = (page - 1) * limit
 
+    exact_short_slug = exact_short_person_slug(q or "")
+    if exact_short_slug:
+        person_rows = _fhp_rows(
+            """
+            SELECT *
+            FROM historical_people_seo_preprod_v1
+            WHERE person_slug=%s
+            LIMIT 1
+            """,
+            [exact_short_slug],
+        )
+        if person_rows:
+            return {
+                "domain": "historical",
+                "page": page,
+                "limit": limit,
+                "total": 1,
+                "pages": 1,
+                "items": [_fhp_person_payload(person_rows[0])],
+            }
+
     where = ["COALESCE(indexable, 0) = 1", "COALESCE(movie_count, 0) >= %s"]
     params = [max(1, int(min_movies or 1))]
 
     if q:
-        text = f"%{str(q).strip().lower()}%"
-        where.append("(LOWER(person_name) LIKE %s OR LOWER(seo_title) LIKE %s)")
-        params.extend([text, text])
+        clean_q = str(q).strip().lower()
+        compact_q = compact_people_query(clean_q)
+        if len(compact_q) <= 3:
+            where.append(
+                "("
+                "LOWER(person_name) = %s "
+                "OR LOWER(person_slug) = %s "
+                "OR regexp_replace(LOWER(COALESCE(person_name, '')), '[^a-z0-9]+', '', 'g') = %s"
+                ")"
+            )
+            params.extend([clean_q, clean_q, compact_q])
+        else:
+            text = f"%{clean_q}%"
+            where.append("(LOWER(person_name) LIKE %s OR LOWER(seo_title) LIKE %s)")
+            params.extend([text, text])
 
     if youtube_only:
         where.append("COALESCE(youtube_movie_count, 0) > 0")
@@ -3378,7 +3411,7 @@ def historical_people_patched_v1(
 
 @router.get("/api/v3/historical/person/{person_slug}")
 def historical_person_detail_patched_v1(person_slug: str, page: int = 1, limit: int = 96):
-    slug = str(person_slug or "").strip().strip("/")
+    slug, redirected_from = _resolve_person_slug(person_slug)
     person_rows = _fhp_rows(
         """
         SELECT *
@@ -3395,6 +3428,9 @@ def historical_person_detail_patched_v1(person_slug: str, page: int = 1, limit: 
         raise HTTPException(status_code=404, detail="Historical person not found")
 
     person = _fhp_person_payload(person_rows[0])
+    if redirected_from:
+        person["redirected_from"] = redirected_from
+        person["canonical_slug"] = person["person_slug"]
     page = max(1, int(page or 1))
     limit = max(1, min(int(limit or 96), 200))
     offset = (page - 1) * limit
