@@ -1482,8 +1482,32 @@ def search_webseries(
         )
         params.extend([f"{query}%", f"{query}%", f"{query}%"])
 
-    if scope == "indian":
-        where.append("LOWER(COALESCE(s.region, '')) = 'indian'")
+    scope_value = str(scope or "").strip().lower()
+    indian_languages = ['hi', 'te', 'ta', 'ml', 'kn', 'bn', 'mr', 'pa', 'gu', 'or', 'as']
+
+    if scope_value in {'indian', 'india', 'in'}:
+        where.append(
+            "("
+            "LOWER(COALESCE(s.region, '')) = 'indian' "
+            "OR LOWER(COALESCE(s.original_language, '')) = ANY(%s)"
+            ")"
+        )
+        params.append(indian_languages)
+    elif scope_value in {'korean', 'korea', 'kr'}:
+        where.append(
+            "("
+            "LOWER(COALESCE(s.region, '')) = 'korean' "
+            "OR LOWER(COALESCE(s.original_language, '')) = 'ko'"
+            ")"
+        )
+    elif scope_value in {'global', 'world', 'international'}:
+        where.append(
+            "("
+            "LOWER(COALESCE(s.region, '')) <> 'indian' "
+            "AND LOWER(COALESCE(s.original_language, '')) <> ALL(%s)"
+            ")"
+        )
+        params.append(indian_languages)
 
     if year:
         where.append("s.first_air_year = %s")
@@ -3799,6 +3823,7 @@ def global_search(
     availability: Optional[str] = None,
     provider: Optional[str] = None,
     domain: Optional[str] = Query(None),
+    region: Optional[str] = Query(None),
     content_type: Optional[str] = Query(None, alias="type"),
 ):
     query = q.strip()
@@ -3817,7 +3842,19 @@ def global_search(
     search_movies = requested_type in {"movies", "all"}
     search_series = requested_type in {"webseries", "all"}
     search_persons = requested_type == "people"
-    scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
+
+    requested_region = str(region or "").strip().lower()
+    if requested_type == "webseries":
+        if requested_region in {"indian", "india", "in"}:
+            scope = "indian"
+        elif requested_region in {"global", "world", "international"}:
+            scope = "global"
+        elif requested_region in {"korean", "korea", "kr"}:
+            scope = "korean"
+        else:
+            scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
+    else:
+        scope = "indian" if requested and requested <= {"modern", "indian"} else "global"
 
     total = 0
     items = []
@@ -3959,6 +3996,7 @@ def global_search(
 
     if not search_persons:
         items.sort(key=score, reverse=True)
+
     page_items = items[offset:offset + limit]
 
     return {
@@ -3971,6 +4009,8 @@ def global_search(
         "pages": (total + limit - 1) // limit,
         "items": page_items,
     }
+
+
 
 
 @router.get("/api/v3/domain-movie/{slug}")
