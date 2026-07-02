@@ -3331,12 +3331,217 @@ def _merge_person_movie_cards(modern_rows, historical_rows, limit: int):
     cards.sort(key=row_score, reverse=True)
     return cards[:limit]
 
+# BEGIN PERSON_PAGE_SERVING_V1_API_FORCE_PATCH
+
+PERSON_PAGE_SERVING_TABLE = os.getenv("PERSON_PAGE_SERVING_TABLE", "person_page_serving_v1")
+
+
+def _pps_language(value):
+    raw = str(value or "telugu").strip().lower()
+    aliases = {
+        "te": "telugu",
+        "telugu": "telugu",
+        "ta": "tamil",
+        "tamil": "tamil",
+        "hi": "hindi",
+        "hindi": "hindi",
+        "kn": "kannada",
+        "kannada": "kannada",
+        "ml": "malayalam",
+        "malayalam": "malayalam",
+        "bn": "bengali",
+        "bengali": "bengali",
+        "mr": "marathi",
+        "marathi": "marathi",
+        "pa": "punjabi",
+        "punjabi": "punjabi",
+        "gu": "gujarati",
+        "gujarati": "gujarati",
+        "or": "odia",
+        "od": "odia",
+        "odia": "odia",
+        "as": "assamese",
+        "assamese": "assamese",
+    }
+    return aliases.get(raw, raw or "telugu")
+
+
+def _pps_row(person_slug: str, language: str):
+    if not _fhp_table_exists(PERSON_PAGE_SERVING_TABLE):
+        return None
+
+    rows = _fhp_rows(
+        f"""
+        SELECT *
+        FROM public.{qident(PERSON_PAGE_SERVING_TABLE)}
+        WHERE person_slug=%s
+          AND LOWER(COALESCE(primary_language_slug, ''))=LOWER(%s)
+          AND COALESCE(page_status, '')='ready'
+        LIMIT 1
+        """,
+        [str(person_slug or "").strip().lower(), _pps_language(language)],
+    )
+
+    return dict(rows[0]) if rows else None
+
+
+def _pps_movie_card(movie):
+    if not isinstance(movie, dict):
+        return None
+
+    slug = movie.get("slug") or movie.get("movie_slug")
+    title = movie.get("title") or movie.get("movie_title")
+    domain = str(movie.get("domain") or "modern").strip().lower()
+    language = movie.get("language") or movie.get("language_slug")
+    roles = movie.get("roles") or []
+
+    if not slug and not title:
+        return None
+
+    return {
+        "domain": domain,
+        "source_domain": domain,
+        "source_label": domain_label(domain),
+        "content_type": "movie",
+        "title": title,
+        "slug": slug,
+        "movie_url": route_for(domain, slug),
+        "release_year": movie.get("year") or movie.get("release_year"),
+        "year": movie.get("year") or movie.get("release_year"),
+        "primary_language": language,
+        "language_name": str(language or "").title() if language else None,
+        "language_slug": language,
+        "poster_url": fix_image_url(movie.get("poster_url")),
+        "has_youtube": as_bool(movie.get("has_youtube")),
+        "is_free": as_bool(movie.get("has_youtube")),
+        "roles": roles,
+        "role_type": ", ".join(roles) if isinstance(roles, list) else str(roles or ""),
+        "raw": movie,
+    }
+
+
+def _pps_cards(value):
+    movies = parse_json(value, [])
+    if not isinstance(movies, list):
+        return []
+
+    out = []
+    seen = set()
+
+    for movie in movies:
+        card = _pps_movie_card(movie)
+        if not card:
+            continue
+
+        key = card.get("slug") or f"{card.get('title')}:{card.get('year')}:{card.get('language_slug')}"
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(card)
+
+    return out
+
+
+def _pps_payload(row):
+    name = _fhp_pick(row, "display_name", "person_name") or ""
+    slug = _fhp_pick(row, "person_slug")
+    language = _pps_language(_fhp_pick(row, "primary_language_slug") or "telugu")
+
+    primary_items = _pps_cards(_fhp_pick(row, "primary_language_filmography_json"))
+    career_items = _pps_cards(_fhp_pick(row, "career_filmography_json"))
+
+    primary_count = _fhp_int(_fhp_pick(row, "primary_language_movie_count"), len(primary_items))
+    career_count = _fhp_int(_fhp_pick(row, "career_attached_movie_count", "career_movie_count"), len(career_items))
+
+    person = {
+        "person_slug": slug,
+        "person_name": name,
+        "display_name": name,
+        "domain": "person",
+        "source_domain": "person",
+        "primary_role": _fhp_pick(row, "primary_role", "page_role") or "actor",
+        "primary_language_slug": language,
+        "primary_language_name": _fhp_pick(row, "primary_language_name") or language.title(),
+
+        "movie_count": primary_count,
+        "total_movie_count": primary_count,
+        "primary_language_movie_count": primary_count,
+        "primary_language_actor_count": _fhp_int(_fhp_pick(row, "primary_language_actor_count"), 0),
+        "primary_language_director_count": _fhp_int(_fhp_pick(row, "primary_language_director_count"), 0),
+        "primary_language_writer_count": _fhp_int(_fhp_pick(row, "primary_language_writer_count"), 0),
+
+        "actor_count": _fhp_int(_fhp_pick(row, "primary_language_actor_count"), 0),
+        "director_count": _fhp_int(_fhp_pick(row, "primary_language_director_count"), 0),
+        "writer_count": _fhp_int(_fhp_pick(row, "primary_language_writer_count"), 0),
+
+        "career_attached_movie_count": career_count,
+        "career_movie_count": career_count,
+        "career_actor_count": _fhp_int(_fhp_pick(row, "career_actor_count"), 0),
+        "career_director_count": _fhp_int(_fhp_pick(row, "career_director_count"), 0),
+        "career_writer_count": _fhp_int(_fhp_pick(row, "career_writer_count"), 0),
+
+        "youtube_movie_count": _fhp_int(_fhp_pick(row, "youtube_movie_count"), 0),
+        "primary_youtube_movie_count": _fhp_int(_fhp_pick(row, "primary_youtube_movie_count"), 0),
+        "latest_year": _fhp_pick(row, "latest_year"),
+        "career_latest_year": _fhp_pick(row, "career_latest_year"),
+
+        "page_title": _fhp_pick(row, "page_title") or f"{name} {language.title()} Movies",
+        "page_summary": _fhp_pick(row, "page_summary"),
+        "seo_url": f"/person/{slug}" if slug else None,
+        "seo_title": _fhp_pick(row, "meta_title") or f"{name} {language.title()} Movies | Flixyfy",
+        "meta_title": _fhp_pick(row, "meta_title") or f"{name} {language.title()} Movies | Flixyfy",
+        "meta_description": _fhp_pick(row, "meta_description", "page_summary"),
+        "title": _fhp_pick(row, "page_title") or f"{name} Movies",
+        "source_table": PERSON_PAGE_SERVING_TABLE,
+    }
+
+    return person, primary_items, career_items
+
 
 @router.get("/api/v3/person/{person_slug}")
-def unified_person_detail_v1(person_slug: str, page: int = 1, limit: int = 96):
+def unified_person_detail_v1(
+    person_slug: str,
+    page: int = 1,
+    limit: int = 96,
+    language: Optional[str] = Query("telugu"),
+):
     slug, redirected_from = _resolve_person_slug(person_slug)
     if not slug:
         raise HTTPException(status_code=404, detail="Person not found")
+
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 96), 200))
+    offset = (page - 1) * limit
+    requested_language = _pps_language(language)
+
+    row = _pps_row(slug, requested_language)
+
+    if row:
+        person, primary_items, career_items = _pps_payload(row)
+
+        if redirected_from:
+            person["redirected_from"] = redirected_from
+            person["canonical_slug"] = slug
+
+        total = _fhp_int(person.get("primary_language_movie_count"), len(primary_items))
+        page_items = primary_items[offset:offset + limit]
+
+        return {
+            "domain": "person",
+            "source_table": PERSON_PAGE_SERVING_TABLE,
+            "language": requested_language,
+            "person": person,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit if total else 0,
+            "items": page_items,
+            "primary_language_movie_count": person.get("primary_language_movie_count"),
+            "primary_language_filmography": primary_items,
+            "career_attached_movie_count": person.get("career_attached_movie_count"),
+            "career_filmography": career_items,
+        }
 
     person_rows = []
     if _fhp_table_exists(PEOPLE_SEARCH_CACHE_TABLE):
@@ -3377,9 +3582,6 @@ def unified_person_detail_v1(person_slug: str, page: int = 1, limit: int = 96):
 
     person = _unified_person_payload(person_rows[0])
     source_domain = str(person.get("source_domain") or "").lower()
-    page = max(1, int(page or 1))
-    limit = max(1, min(int(limit or 96), 200))
-    offset = (page - 1) * limit
     fetch_limit = offset + limit
 
     include_modern = source_domain in {"modern", "modern_historical_bridge"}
@@ -3394,6 +3596,7 @@ def unified_person_detail_v1(person_slug: str, page: int = 1, limit: int = 96):
     historical_total = _historical_person_movie_count(slug) if include_historical else 0
     total = modern_total + historical_total
     person["movie_count"] = max(total, _fhp_int(person.get("movie_count"), 0))
+
     if redirected_from:
         person["redirected_from"] = redirected_from
         person["canonical_slug"] = slug
@@ -3408,6 +3611,7 @@ def unified_person_detail_v1(person_slug: str, page: int = 1, limit: int = 96):
         "items": page_items,
     }
 
+# END PERSON_PAGE_SERVING_V1_API_FORCE_PATCH
 
 @router.get("/api/v3/historical/combinations")
 def historical_combinations_patched_v1(
