@@ -1746,7 +1746,96 @@ def exact_short_person_slug(query: str) -> Optional[str]:
     return SHORT_PERSON_ALIAS_SLUGS.get(compact)
 
 
-def search_people_cache(query: str, limit: int, scope: str):
+def people_language_filter_sql(language: Optional[str], slug_column: str = "person_slug") -> Tuple[str, List[Any]]:
+    language_values = language_match_values(language)
+    if not language_values:
+        return "", []
+
+    clauses = []
+    params: List[Any] = []
+    for table_name in ("historical_movie_people_seo_preprod_v1", "modern_movie_people_seo_preprod_v1"):
+        if not table_exists(table_name):
+            continue
+
+        cols = set(table_columns_cached(table_name))
+        if "person_slug" not in cols:
+            continue
+
+        language_cols = [
+            col
+            for col in ("language_slug", "primary_language", "language_name", "language")
+            if col in cols
+        ]
+        if not language_cols:
+            continue
+
+        language_checks = []
+        for col in language_cols:
+            language_checks.append(f"LOWER(CAST({qident(col)} AS TEXT)) = ANY(%s)")
+            params.append(language_values)
+
+        clauses.append(
+            f"""
+            {slug_column} IN (
+                SELECT DISTINCT person_slug
+                FROM public.{qident(table_name)}
+                WHERE {" OR ".join(language_checks)}
+            )
+            """
+        )
+
+    if not clauses:
+        return "", []
+
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def people_language_score_sql(language: Optional[str], outer_slug_column: str = "person_slug") -> Tuple[str, List[Any]]:
+    language_values = language_match_values(language)
+    if not language_values:
+        return "", []
+
+    clauses = []
+    params: List[Any] = []
+    for table_name in ("historical_movie_people_seo_preprod_v1", "modern_movie_people_seo_preprod_v1"):
+        if not table_exists(table_name):
+            continue
+
+        cols = set(table_columns_cached(table_name))
+        if "person_slug" not in cols:
+            continue
+
+        language_cols = [
+            col
+            for col in ("language_slug", "primary_language", "language_name", "language")
+            if col in cols
+        ]
+        if not language_cols:
+            continue
+
+        language_checks = []
+        for col in language_cols:
+            language_checks.append(f"LOWER(CAST(mp.{qident(col)} AS TEXT)) = ANY(%s)")
+            params.append(language_values)
+
+        clauses.append(
+            f"""
+            (
+                SELECT COUNT(*)
+                FROM public.{qident(table_name)} mp
+                WHERE mp.person_slug = {outer_slug_column}
+                  AND ({" OR ".join(language_checks)})
+            )
+            """
+        )
+
+    if not clauses:
+        return "", []
+
+    return " + ".join(clauses), params
+
+
+def search_people_cache(query: str, limit: int, scope: str, language: Optional[str] = None):
     if not table_exists(PEOPLE_SEARCH_CACHE_TABLE):
         return None
 
@@ -1758,6 +1847,11 @@ def search_people_cache(query: str, limit: int, scope: str):
 
     if scope == "indian":
         where.append("domain IN ('modern', 'historical', 'modern_historical_bridge')")
+
+    language_sql, language_params = people_language_filter_sql(language, "p.person_slug")
+    if language_sql:
+        where.append(language_sql)
+        params.extend(language_params)
 
     if person_query:
         if exact_short_slug:
@@ -1798,7 +1892,7 @@ def search_people_cache(query: str, limit: int, scope: str):
         total = None
         if not person_query:
             cur.execute(
-                f"SELECT COUNT(*) AS total FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)} {where_clause}",
+                f"SELECT COUNT(*) AS total FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)} p {where_clause}",
                 params,
             )
             total = cur.fetchone()["total"]
@@ -1826,6 +1920,10 @@ def search_people_cache(query: str, limit: int, scope: str):
                 f"%{person_query}%",
             ]
 
+        language_order_sql, language_order_params = people_language_score_sql(language, "p.person_slug")
+        if language_order_sql:
+            language_order_sql = f"({language_order_sql}) DESC,"
+
         cur.execute(
             f"""
             SELECT
@@ -1839,17 +1937,18 @@ def search_people_cache(query: str, limit: int, scope: str):
                 aliases_json,
                 NULL AS disambiguation_label,
                 search_rank
-            FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)}
+            FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)} p
             {where_clause}
             ORDER BY
                 {order_sql}
+                {language_order_sql}
                 COALESCE(search_rank, 0) DESC,
                 COALESCE(youtube_movie_count, 0) DESC,
                 COALESCE(movie_count, 0) DESC,
                 display_name ASC
             LIMIT %s
             """,
-            params + order_params + [limit],
+            params + order_params + language_order_params + [limit],
         )
         items = [person_search_card(dict(r), r.get("domain") or "historical") for r in cur.fetchall()]
         if total is None:
@@ -1859,8 +1958,8 @@ def search_people_cache(query: str, limit: int, scope: str):
         conn.close()
 
 
-def search_people(query: str, limit: int, scope: str):
-    cached_result = search_people_cache(query, limit, scope)
+def search_people(query: str, limit: int, scope: str, language: Optional[str] = None):
+    cached_result = search_people_cache(query, limit, scope, language)
     if cached_result is not None:
         return cached_result
 
@@ -1886,6 +1985,10 @@ def search_people(query: str, limit: int, scope: str):
             params.extend([f"%{person_query}%", f"%{person_query}%"])
 
     where.append("COALESCE(indexable, 1) = 1")
+    language_sql, language_params = people_language_filter_sql(language)
+    if language_sql:
+        where.append(language_sql)
+        params.extend(language_params)
     where_clause = "WHERE " + " AND ".join(where)
 
     conn = get_conn()
@@ -3777,6 +3880,7 @@ def global_search(
             query=query,
             limit=fetch_limit,
             scope=scope,
+            language=language,
         )
         total += people_total
         items.extend(people_items)
@@ -3853,7 +3957,8 @@ def global_search(
 
         return (exact, domain_boost, year_score, provider_score, rating_score, popularity_score)
 
-    items.sort(key=score, reverse=True)
+    if not search_persons:
+        items.sort(key=score, reverse=True)
     page_items = items[offset:offset + limit]
 
     return {
