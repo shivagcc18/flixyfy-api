@@ -1313,7 +1313,7 @@ def search(
 
     if language:
         where.append("language_slug = %s")
-        params.append(language.strip().lower())
+        params.append(language)
 
     if year:
         where.append("release_year = %s")
@@ -1321,15 +1321,21 @@ def search(
 
     if has_ott is not None:
         where.append("has_ott = %s")
-        params.append(1 if has_ott else 0)
+        params.append(has_ott)
 
     where_sql = "WHERE " + " AND ".join(where) if where else ""
 
     conn = get_conn()
     cur = conn.cursor()
+
+    movie_rows = []
+    movie_total = 0
+    person_rows = []
+    person_total = 0
+
     try:
         cur.execute(f"SELECT COUNT(*) AS total FROM {TABLE} {where_sql}", params)
-        total = cur.fetchone()["total"]
+        movie_total = cur.fetchone()["total"]
 
         if query:
             order_sql = """
@@ -1346,6 +1352,10 @@ def search(
             order_sql = ""
             order_params = []
 
+        movie_limit = limit
+        if query and page == 1:
+            movie_limit = limit
+
         cur.execute(
             f"""
             SELECT *
@@ -1359,11 +1369,172 @@ def search(
                 title ASC
             LIMIT %s OFFSET %s
             """,
-            params + order_params + [limit, offset],
+            params + order_params + [movie_limit, offset],
         )
-        rows = cur.fetchall()
+        movie_rows = cur.fetchall()
+
+        if query and page == 1 and table_exists("person_page_serving_v1"):
+            person_cols = table_columns("person_page_serving_v1")
+
+            def qi(name: str) -> str:
+                return '"' + name.replace('"', '""') + '"'
+
+            def first_col(names):
+                for name in names:
+                    if name in person_cols:
+                        return name
+                return None
+
+            slug_col = first_col(["slug", "person_slug", "canonical_slug"])
+            name_cols = [
+                c for c in ["display_name", "person_name", "name", "primary_name", "title"]
+                if c in person_cols
+            ]
+
+            if slug_col and name_cols:
+                name_expr = "COALESCE(" + ", ".join([f"CAST({qi(c)} AS TEXT)" for c in name_cols + [slug_col]]) + ")"
+
+                primary_language_slug_expr = (
+                    f"CAST({qi('primary_language_slug')} AS TEXT)"
+                    if "primary_language_slug" in person_cols
+                    else "NULL"
+                )
+
+                primary_language_expr = (
+                    f"CAST({qi('primary_language')} AS TEXT)"
+                    if "primary_language" in person_cols
+                    else "NULL"
+                )
+
+                primary_count_expr = (
+                    f"COALESCE({qi('primary_language_movie_count')}, 0)"
+                    if "primary_language_movie_count" in person_cols
+                    else "0"
+                )
+
+                career_count_expr = (
+                    f"COALESCE({qi('career_attached_movie_count')}, 0)"
+                    if "career_attached_movie_count" in person_cols
+                    else (
+                        f"COALESCE({qi('total_movie_count')}, 0)"
+                        if "total_movie_count" in person_cols
+                        else "0"
+                    )
+                )
+
+                photo_expr = "NULL"
+                photo_cols = [
+                    c for c in ["photo_url", "profile_image_url", "profile_path", "poster_url", "image_url"]
+                    if c in person_cols
+                ]
+                if photo_cols:
+                    photo_expr = "COALESCE(" + ", ".join([f"CAST({qi(c)} AS TEXT)" for c in photo_cols]) + ")"
+
+                known_for_expr = (
+                    f"{qi('known_for_titles')}"
+                    if "known_for_titles" in person_cols
+                    else "NULL"
+                )
+
+                search_parts = [f"LOWER(CAST({qi(c)} AS TEXT)) LIKE LOWER(%s)" for c in name_cols]
+                search_params = [f"%{query}%"] * len(name_cols)
+
+                slug_query = query.lower().replace(" ", "-")
+                search_parts.append(f"LOWER(CAST({qi(slug_col)} AS TEXT)) LIKE LOWER(%s)")
+                search_params.append(f"%{slug_query}%")
+
+                person_where = ["(" + " OR ".join(search_parts) + ")"]
+                person_params = list(search_params)
+
+                if language:
+                    lang_parts = []
+                    if "primary_language_slug" in person_cols:
+                        lang_parts.append(f"LOWER(CAST({qi('primary_language_slug')} AS TEXT)) = LOWER(%s)")
+                        person_params.append(language)
+                    if "primary_language" in person_cols:
+                        lang_parts.append(f"LOWER(CAST({qi('primary_language')} AS TEXT)) = LOWER(%s)")
+                        person_params.append(language)
+                    if lang_parts:
+                        person_where.append("(" + " OR ".join(lang_parts) + ")")
+
+                person_where_sql = "WHERE " + " AND ".join(person_where)
+
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) AS total
+                    FROM person_page_serving_v1
+                    {person_where_sql}
+                    """,
+                    person_params,
+                )
+                person_total = cur.fetchone()["total"]
+
+                cur.execute(
+                    f"""
+                    SELECT
+                        'person' AS type,
+                        CAST({qi(slug_col)} AS TEXT) AS slug,
+                        {name_expr} AS title,
+                        {name_expr} AS name,
+                        {primary_language_slug_expr} AS primary_language_slug,
+                        {primary_language_expr} AS primary_language,
+                        {primary_count_expr} AS primary_language_movie_count,
+                        {career_count_expr} AS career_attached_movie_count,
+                        {photo_expr} AS photo_url,
+                        {known_for_expr} AS known_for_titles
+                    FROM person_page_serving_v1
+                    {person_where_sql}
+                    ORDER BY
+                        CASE
+                            WHEN LOWER({name_expr}) = LOWER(%s) THEN 1
+                            WHEN LOWER({name_expr}) LIKE LOWER(%s) THEN 2
+                            ELSE 3
+                        END,
+                        {primary_count_expr} DESC NULLS LAST,
+                        {career_count_expr} DESC NULLS LAST,
+                        {name_expr} ASC
+                    LIMIT 8
+                    """,
+                    person_params + [query, f"{query}%"],
+                )
+                person_rows = cur.fetchall()
+
     finally:
         conn.close()
+
+    person_items = []
+    for row in person_rows:
+        slug = row.get("slug")
+        name = row.get("name") or row.get("title") or slug
+        person_items.append(
+            {
+                "type": "person",
+                "result_type": "person",
+                "slug": slug,
+                "title": name,
+                "name": name,
+                "display_name": name,
+                "poster_url": row.get("photo_url"),
+                "photo_url": row.get("photo_url"),
+                "primary_language_slug": row.get("primary_language_slug"),
+                "primary_language": row.get("primary_language"),
+                "primary_language_movie_count": row.get("primary_language_movie_count") or 0,
+                "career_attached_movie_count": row.get("career_attached_movie_count") or 0,
+                "known_for_titles": row.get("known_for_titles"),
+                "href": f"/person/{slug}" if slug else None,
+                "detail_path": f"/person/{slug}" if slug else None,
+            }
+        )
+
+    movie_items = [movie_card(r) for r in movie_rows]
+
+    if query and page == 1:
+        remaining = max(limit - len(person_items), 0)
+        items = person_items + movie_items[:remaining]
+    else:
+        items = movie_items
+
+    total = movie_total + person_total if query else movie_total
 
     return {
         "query": query,
@@ -1371,9 +1542,9 @@ def search(
         "page": page,
         "limit": limit,
         "total": total,
-        "count": len(rows),
+        "count": len(items),
         "pages": (total + limit - 1) // limit,
-        "items": [movie_card(r) for r in rows],
+        "items": items,
     }
 
 
