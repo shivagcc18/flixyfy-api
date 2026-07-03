@@ -1502,29 +1502,57 @@ def search(
     finally:
         conn.close()
 
-    person_items = []
+    person_items_by_slug = {}
     for row in person_rows:
         slug = row.get("slug")
         name = row.get("name") or row.get("title") or slug
-        person_items.append(
-            {
-                "type": "person",
-                "result_type": "person",
-                "slug": slug,
-                "title": name,
-                "name": name,
-                "display_name": name,
-                "poster_url": row.get("photo_url"),
-                "photo_url": row.get("photo_url"),
-                "primary_language_slug": row.get("primary_language_slug"),
-                "primary_language": row.get("primary_language"),
-                "primary_language_movie_count": row.get("primary_language_movie_count") or 0,
-                "career_attached_movie_count": row.get("career_attached_movie_count") or 0,
-                "known_for_titles": row.get("known_for_titles"),
-                "href": f"/person/{slug}" if slug else None,
-                "detail_path": f"/person/{slug}" if slug else None,
-            }
+
+        if not slug:
+            continue
+
+        item = {
+            "type": "person",
+            "result_type": "person",
+            "slug": slug,
+            "title": name,
+            "name": name,
+            "display_name": name,
+            "poster_url": row.get("photo_url"),
+            "photo_url": row.get("photo_url"),
+            "primary_language_slug": row.get("primary_language_slug"),
+            "primary_language": row.get("primary_language"),
+            "primary_language_movie_count": row.get("primary_language_movie_count") or 0,
+            "career_attached_movie_count": row.get("career_attached_movie_count") or 0,
+            "known_for_titles": row.get("known_for_titles"),
+            "href": f"/person/{slug}",
+            "detail_path": f"/person/{slug}",
+        }
+
+        existing = person_items_by_slug.get(slug)
+        if not existing:
+            person_items_by_slug[slug] = item
+            continue
+
+        existing_score = (
+            existing.get("primary_language_movie_count") or 0,
+            existing.get("career_attached_movie_count") or 0,
         )
+        item_score = (
+            item.get("primary_language_movie_count") or 0,
+            item.get("career_attached_movie_count") or 0,
+        )
+
+        if item_score > existing_score:
+            person_items_by_slug[slug] = item
+
+    person_items = list(person_items_by_slug.values())
+    person_items.sort(
+        key=lambda x: (
+            -(x.get("primary_language_movie_count") or 0),
+            -(x.get("career_attached_movie_count") or 0),
+            x.get("name") or "",
+        )
+    )
 
     movie_items = [movie_card(r) for r in movie_rows]
 
