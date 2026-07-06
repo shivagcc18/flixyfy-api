@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 from typing import Optional
 from urllib.parse import quote_plus
@@ -1811,3 +1811,494 @@ def stats():
 from app.domain_routes_v1 import router as domain_router
 app.include_router(domain_router)
 
+# FLIXYFY_MOVIE_DETAIL_PREPROD_COMPAT_PATCH_V1_START
+# Purpose:
+# - Prevent /api/v3/movie/{slug} HTTP 500 when old compatibility tables are absent.
+# - Fall back from ott_availability_normalized_v2 to ott_availability_normalized_v1/current_availability_serving_v5.
+# - Return [] for YouTube full-movie links when youtube_full_movie_links_v2/youtube_link_serving_v1 are absent.
+# - Safe runtime override only; historical routes are untouched.
+
+from psycopg2.extras import RealDictCursor as _FlixyfyRealDictCursor
+
+def _flixyfy_compat_qident(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+def _flixyfy_compat_as_bool(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "active", "available"}
+
+def _flixyfy_compat_first(row, keys, default=None):
+    if not row:
+        return default
+    for key in keys:
+        try:
+            value = row.get(key)
+        except Exception:
+            value = None
+        if value not in (None, ""):
+            return value
+    return default
+
+def _flixyfy_compat_table_exists(table_name):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=_FlixyfyRealDictCursor)
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema='public' AND table_name=%s
+            UNION ALL
+            SELECT 1
+            FROM information_schema.views
+            WHERE table_schema='public' AND table_name=%s
+            LIMIT 1
+            """,
+            (table_name, table_name),
+        )
+        return cur.fetchone() is not None
+    except Exception as exc:
+        print("flixyfy compat table_exists failed:", table_name, repr(exc))
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def _flixyfy_compat_columns(table_name):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=_FlixyfyRealDictCursor)
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        )
+        return {r["column_name"] for r in cur.fetchall()}
+    except Exception as exc:
+        print("flixyfy compat columns failed:", table_name, repr(exc))
+        return set()
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def _flixyfy_compat_normalize_availability_row(row, table_name):
+    provider_name = _flixyfy_compat_first(
+        row,
+        ["provider_display_name", "provider_name", "platform", "provider", "name"],
+        "Watch",
+    )
+    provider_key = _flixyfy_compat_first(
+        row,
+        ["provider_key", "platform_key", "provider_slug", "provider", "platform"],
+        str(provider_name or "").lower().replace(" ", "_"),
+    )
+    url = _flixyfy_compat_first(
+        row,
+        ["deep_link", "final_url", "watch_url", "url", "provider_url", "web_url", "youtube_url"],
+    )
+    category = _flixyfy_compat_first(
+        row,
+        ["provider_category", "provider_type", "monetization_type", "type"],
+        "",
+    )
+    category_l = str(category or "").lower()
+    provider_l = str(provider_name or "").lower() + " " + str(provider_key or "").lower()
+
+    is_free = (
+        _flixyfy_compat_as_bool(_flixyfy_compat_first(row, ["is_free", "free"]))
+        or category_l in {"free", "free_with_ads", "ads"}
+        or "youtube" in provider_l
+    )
+
+    return {
+        "provider_key": provider_key,
+        "provider_name": provider_name,
+        "provider_display_name": provider_name,
+        "provider_type": category or ("free" if is_free else "subscription"),
+        "provider_category": category or ("free" if is_free else "subscription"),
+        "region": _flixyfy_compat_first(row, ["region", "country"], "IN"),
+        "deep_link": url,
+        "final_url": url,
+        "watch_url": url,
+        "url": url,
+        "button_label": _flixyfy_compat_first(row, ["button_label"], "Watch now"),
+        "priority": _flixyfy_compat_first(row, ["priority"], 999),
+        "active": True,
+        "is_free": is_free,
+        "has_ott": True,
+        "source_table": table_name,
+    }
+
+def _flixyfy_compat_fetch_availability(table_name, tmdb_id=None, slug=None):
+    if not _flixyfy_compat_table_exists(table_name):
+        return []
+
+    cols = _flixyfy_compat_columns(table_name)
+    if not cols:
+        return []
+
+    filters = []
+    params = []
+
+    if slug:
+        for col in ["slug", "movie_slug", "content_slug"]:
+            if col in cols:
+                filters.append(f"{_flixyfy_compat_qident(col)}=%s")
+                params.append(slug)
+                break
+
+    if tmdb_id is not None:
+        for col in ["tmdb_id", "movie_id", "content_id"]:
+            if col in cols:
+                filters.append(f"CAST({_flixyfy_compat_qident(col)} AS TEXT)=CAST(%s AS TEXT)")
+                params.append(tmdb_id)
+                break
+
+    if not filters:
+        return []
+
+    where_sql = " OR ".join(filters)
+
+    order_sql = ""
+    if "priority" in cols:
+        order_sql = " ORDER BY priority NULLS LAST"
+    elif "provider_display_name" in cols:
+        order_sql = " ORDER BY provider_display_name"
+
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=_FlixyfyRealDictCursor)
+        cur.execute(
+            f"""
+            SELECT *
+            FROM public.{_flixyfy_compat_qident(table_name)}
+            WHERE {where_sql}
+            {order_sql}
+            LIMIT 80
+            """,
+            params,
+        )
+        return [_flixyfy_compat_normalize_availability_row(dict(r), table_name) for r in cur.fetchall()]
+    except Exception as exc:
+        print("flixyfy compat availability failed:", table_name, repr(exc))
+        return []
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def load_ott_links(tmdb_id):
+    """
+    Compatibility override for movie_detail().
+    Old code queried ott_availability_normalized_v2 directly.
+    Preprod has ott_availability_normalized_v1/current_availability_serving_v5.
+    """
+    links = []
+    seen = set()
+
+    for table_name in [
+        "ott_availability_normalized_v2",
+        "ott_availability_normalized_v1",
+    ]:
+        for item in _flixyfy_compat_fetch_availability(table_name, tmdb_id=tmdb_id):
+            key = (
+                str(item.get("provider_key") or item.get("provider_name") or "").lower(),
+                str(item.get("final_url") or item.get("deep_link") or item.get("watch_url") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(item)
+
+    return links
+
+def _flixyfy_compat_fetch_youtube(table_name, row_or_slug, domain=None):
+    if not _flixyfy_compat_table_exists(table_name):
+        return []
+
+    cols = _flixyfy_compat_columns(table_name)
+    if not cols:
+        return []
+
+    if isinstance(row_or_slug, dict):
+        slug = row_or_slug.get("slug") or row_or_slug.get("movie_slug") or row_or_slug.get("content_slug")
+        tmdb_id = row_or_slug.get("tmdb_id")
+    else:
+        slug = row_or_slug
+        tmdb_id = None
+
+    filters = []
+    params = []
+
+    if slug:
+        for col in ["movie_slug", "slug", "content_slug"]:
+            if col in cols:
+                filters.append(f"{_flixyfy_compat_qident(col)}=%s")
+                params.append(slug)
+                break
+
+    if tmdb_id is not None:
+        for col in ["tmdb_id", "movie_id", "content_id"]:
+            if col in cols:
+                filters.append(f"CAST({_flixyfy_compat_qident(col)} AS TEXT)=CAST(%s AS TEXT)")
+                params.append(tmdb_id)
+                break
+
+    if not filters:
+        return []
+
+    status_sql = ""
+    if "status" in cols:
+        status_sql = " AND COALESCE(status, 'active') IN ('active','live','verified','youtube_available')"
+
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=_FlixyfyRealDictCursor)
+        cur.execute(
+            f"""
+            SELECT *
+            FROM public.{_flixyfy_compat_qident(table_name)}
+            WHERE ({' OR '.join(filters)})
+            {status_sql}
+            LIMIT 20
+            """,
+            params,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        print("flixyfy compat youtube failed:", table_name, repr(exc))
+        return []
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+    out = []
+    for r in rows:
+        url = _flixyfy_compat_first(r, ["youtube_url", "video_url", "watch_url", "final_url", "url"])
+        video_id = _flixyfy_compat_first(r, ["youtube_video_id", "video_id"])
+        title = _flixyfy_compat_first(r, ["youtube_title", "video_title", "title"], "YouTube")
+        if not url and video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+        if not url:
+            continue
+        out.append(
+            {
+                "provider_name": "YouTube",
+                "provider_display_name": "YouTube",
+                "provider_key": "youtube",
+                "provider_type": "free",
+                "provider_category": "free",
+                "youtube_url": url,
+                "video_url": url,
+                "watch_url": url,
+                "url": url,
+                "youtube_video_id": video_id,
+                "video_id": video_id,
+                "youtube_title": title,
+                "title": title,
+                "channel_title": _flixyfy_compat_first(r, ["channel_title", "youtube_channel_title"]),
+                "duration_seconds": _flixyfy_compat_first(r, ["duration_seconds", "youtube_duration_seconds"]),
+                "view_count": _flixyfy_compat_first(r, ["view_count", "youtube_view_count"]),
+                "active": True,
+                "is_free": True,
+                "has_youtube": True,
+                "has_ott": True,
+                "source": _flixyfy_compat_first(r, ["source", "source_table"], table_name),
+                "source_table": table_name,
+            }
+        )
+    return out
+
+def load_youtube_variants(row, domain=None):
+    """
+    Compatibility override.
+    If YouTube tables are absent, return [] instead of crashing movie detail.
+    """
+    links = []
+    seen = set()
+
+    for table_name in ["youtube_full_movie_links_v2", "youtube_link_serving_v1"]:
+        for item in _flixyfy_compat_fetch_youtube(table_name, row, domain=domain):
+            key = item.get("youtube_video_id") or item.get("youtube_url") or item.get("video_url")
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(item)
+
+    return links
+
+# Extra aliases, in case an older movie_detail code path calls these names.
+def load_youtube_links(row, domain=None):
+    return load_youtube_variants(row, domain=domain)
+
+def load_youtube_full_movies(row, domain=None):
+    return load_youtube_variants(row, domain=domain)
+
+print("FLIXYFY_MOVIE_DETAIL_PREPROD_COMPAT_PATCH_V1_LOADED")
+# FLIXYFY_MOVIE_DETAIL_PREPROD_COMPAT_PATCH_V1_END
+
+
+# FLIXYFY_MOVIE_DETAIL_PREPROD_COMPAT_PATCH_V2_START
+# Fix V1 wrapper signature:
+# movie_detail() calls load_youtube_links(tmdb_id=..., slug=..., domain=...)
+# This override accepts both old row-style calls and keyword-style calls.
+
+def load_youtube_variants(row=None, domain=None, **kwargs):
+    links = []
+    seen = set()
+
+    if isinstance(row, dict):
+        payload = dict(row)
+    else:
+        payload = {}
+
+    if row is not None and not isinstance(row, dict):
+        payload["slug"] = row
+
+    if kwargs.get("slug"):
+        payload["slug"] = kwargs.get("slug")
+        payload["movie_slug"] = kwargs.get("slug")
+
+    if kwargs.get("movie_slug"):
+        payload["slug"] = kwargs.get("movie_slug")
+        payload["movie_slug"] = kwargs.get("movie_slug")
+
+    if kwargs.get("tmdb_id") is not None:
+        payload["tmdb_id"] = kwargs.get("tmdb_id")
+
+    if kwargs.get("movie_id") is not None:
+        payload["movie_id"] = kwargs.get("movie_id")
+
+    if kwargs.get("domain"):
+        domain = kwargs.get("domain")
+
+    for table_name in ["youtube_full_movie_links_v2", "youtube_link_serving_v1"]:
+        for item in _flixyfy_compat_fetch_youtube(table_name, payload, domain=domain):
+            key = item.get("youtube_video_id") or item.get("youtube_url") or item.get("video_url")
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(item)
+
+    return links
+
+def load_youtube_links(row=None, domain=None, **kwargs):
+    return load_youtube_variants(row=row, domain=domain, **kwargs)
+
+def load_youtube_full_movies(row=None, domain=None, **kwargs):
+    return load_youtube_variants(row=row, domain=domain, **kwargs)
+
+print("FLIXYFY_MOVIE_DETAIL_PREPROD_COMPAT_PATCH_V2_LOADED")
+# FLIXYFY_MOVIE_DETAIL_PREPROD_COMPAT_PATCH_V2_END
+
+# FLIXYFY_MOVIE_DETAIL_PROVIDER_FALLBACK_PATCH_V3_START
+# Fix:
+# - movie_detail() calls load_ott_links(tmdb_id)
+# - preprod provider rows are available by slug/content_slug in ott_availability_normalized_v1/current_availability_serving_v5
+# - this resolves slug from media_serving_v8_expanded when only tmdb_id is provided
+
+def _flixyfy_compat_slug_for_tmdb(tmdb_id):
+    if tmdb_id is None:
+        return None
+
+    for table_name in ["media_serving_v8_expanded", "media_serving_v7_final", "global_search_serving_v5"]:
+        if not _flixyfy_compat_table_exists(table_name):
+            continue
+
+        cols = _flixyfy_compat_columns(table_name)
+        if "tmdb_id" not in cols or "slug" not in cols:
+            continue
+
+        conn = None
+        try:
+            conn = get_conn()
+            cur = conn.cursor(cursor_factory=_FlixyfyRealDictCursor)
+            cur.execute(
+                f"""
+                SELECT slug
+                FROM public.{_flixyfy_compat_qident(table_name)}
+                WHERE CAST(tmdb_id AS TEXT)=CAST(%s AS TEXT)
+                LIMIT 1
+                """,
+                (tmdb_id,),
+            )
+            row = cur.fetchone()
+            if row and row.get("slug"):
+                return row.get("slug")
+        except Exception as exc:
+            print("flixyfy compat slug_for_tmdb failed:", table_name, repr(exc))
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    return None
+
+def load_ott_links(tmdb_id=None, slug=None, **kwargs):
+    """
+    Compatibility override V3.
+    Fetch provider rows from all available current/modern availability tables.
+    Supports old call style load_ott_links(tmdb_id) and future keyword calls.
+    """
+    if kwargs.get("tmdb_id") is not None:
+        tmdb_id = kwargs.get("tmdb_id")
+
+    if kwargs.get("slug"):
+        slug = kwargs.get("slug")
+
+    if kwargs.get("movie_slug"):
+        slug = kwargs.get("movie_slug")
+
+    if slug is None and tmdb_id is not None:
+        slug = _flixyfy_compat_slug_for_tmdb(tmdb_id)
+
+    links = []
+    seen = set()
+
+    for table_name in [
+        "ott_availability_normalized_v2",
+        "ott_availability_normalized_v1",
+        "current_availability_serving_v5",
+        "global_availability_serving_v5",
+    ]:
+        for item in _flixyfy_compat_fetch_availability(table_name, tmdb_id=tmdb_id, slug=slug):
+            provider_key = str(item.get("provider_key") or item.get("provider_name") or "").lower().strip()
+            url = str(item.get("final_url") or item.get("deep_link") or item.get("watch_url") or item.get("url") or "").strip()
+            key = (provider_key, url)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            links.append(item)
+
+    return links
+
+print("FLIXYFY_MOVIE_DETAIL_PROVIDER_FALLBACK_PATCH_V3_LOADED")
+# FLIXYFY_MOVIE_DETAIL_PROVIDER_FALLBACK_PATCH_V3_END

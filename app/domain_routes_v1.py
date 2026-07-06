@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import re
 from functools import lru_cache
@@ -39,6 +39,182 @@ PERSON_SLUG_REDIRECT_TABLE = os.getenv("PERSON_SLUG_REDIRECT_TABLE", "person_slu
 YOUTUBE_LINK_TABLE = os.getenv("YOUTUBE_LINK_TABLE", "youtube_link_serving_v1")
 
 router = APIRouter()
+
+
+# FLIXYFY_HISTORICAL_PERSON_DETAIL_FIRST_MATCH_V2
+@router.get("/api/v3/historical/person/{person_slug}")
+def historical_person_detail_first_match_v2(person_slug: str, page: int = 1, limit: int = 96):
+    alias_map = {
+        "ntr": "n-t-rama-rao",
+        "anr": "akkineni-nageshwara-rao",
+        "mgr": "m-g-ramachandran",
+    }
+
+    requested_slug = str(person_slug or "").strip().lower()
+    slug = alias_map.get(requested_slug, requested_slug)
+
+    people_table = "historical_people_seo_preprod_v1"
+    index_table = "historical_movie_people_seo_preprod_v1"
+    serving_table = "historical_card_serving_v1"
+
+    person_rows = _fhp_rows(
+        f"""
+        SELECT *
+        FROM public.{qident(people_table)}
+        WHERE person_slug = %s
+        LIMIT 1
+        """,
+        [slug],
+    )
+
+    if not person_rows:
+        raise HTTPException(status_code=404, detail="Historical person not found")
+
+    person_row = person_rows[0]
+    person = _fhp_person_payload(person_row)
+
+    primary_language_slug = str(_fhp_pick(person_row, "primary_language_slug") or "").strip().lower()
+    primary_count = _fhp_int(
+        _fhp_pick(person_row, "primary_language_movie_count", "movie_count", "career_attached_movie_count"),
+        0,
+    )
+
+    person["person_slug"] = _fhp_pick(person_row, "person_slug") or slug
+    person["person_name"] = _fhp_pick(person_row, "person_name", "display_name") or person.get("person_name")
+    person["display_name"] = _fhp_pick(person_row, "display_name", "person_name") or person.get("display_name")
+    person["primary_language_slug"] = primary_language_slug
+    person["primary_language_name"] = _fhp_pick(person_row, "primary_language_name")
+    person["movie_count"] = primary_count
+    person["primary_language_movie_count"] = primary_count
+    person["total_movie_count"] = _fhp_int(
+        _fhp_pick(person_row, "career_attached_movie_count", "total_movie_count", "movie_count"),
+        primary_count,
+    )
+    person["profile_path"] = _fhp_pick(person_row, "profile_path") or f"/historical/person/{slug}"
+    person["source_table"] = people_table
+
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 96), 200))
+    offset = (page - 1) * limit
+
+    where = ["mp.person_slug = %s"]
+    params = [slug]
+
+    if primary_language_slug:
+        where.append("LOWER(COALESCE(mp.language_slug, '')) = %s")
+        params.append(primary_language_slug)
+
+    where_sql = "WHERE " + " AND ".join(where)
+
+    total_rows = _fhp_rows(
+        f"""
+        SELECT COUNT(DISTINCT mp.movie_slug) AS total
+        FROM public.{qident(index_table)} mp
+        {where_sql}
+        """,
+        params,
+    )
+    total = _fhp_int(total_rows[0].get("total") if total_rows else 0, 0)
+
+    has_card_table = _fhp_table_exists(serving_table)
+
+    if has_card_table:
+        movie_rows = _fhp_rows(
+            f"""
+            SELECT
+                h.*,
+                mp.movie_slug AS mp_movie_slug,
+                mp.title AS mp_title,
+                mp.release_year AS mp_release_year,
+                mp.language_slug AS mp_language_slug,
+                mp.role_type AS role_type,
+                mp.has_youtube AS mp_has_youtube
+            FROM public.{qident(index_table)} mp
+            LEFT JOIN public.{qident(serving_table)} h
+              ON h.slug = mp.movie_slug
+            {where_sql}
+            ORDER BY COALESCE(mp.has_youtube, 0) DESC,
+                     mp.release_year DESC NULLS LAST,
+                     mp.title ASC
+            LIMIT %s OFFSET %s
+            """,
+            params + [limit, offset],
+        )
+    else:
+        movie_rows = _fhp_rows(
+            f"""
+            SELECT
+                mp.movie_slug AS mp_movie_slug,
+                mp.title AS mp_title,
+                mp.release_year AS mp_release_year,
+                mp.language_slug AS mp_language_slug,
+                mp.role_type AS role_type,
+                mp.has_youtube AS mp_has_youtube
+            FROM public.{qident(index_table)} mp
+            {where_sql}
+            ORDER BY COALESCE(mp.has_youtube, 0) DESC,
+                     mp.release_year DESC NULLS LAST,
+                     mp.title ASC
+            LIMIT %s OFFSET %s
+            """,
+            params + [limit, offset],
+        )
+
+    def detail_movie_card(row):
+        slug_value = _fhp_pick(row, "slug", "mp_movie_slug", "movie_slug")
+        title_value = _fhp_pick(row, "title", "mp_title")
+        year_value = _fhp_int(_fhp_pick(row, "release_year", "mp_release_year"), None)
+        language_value = _fhp_pick(row, "language_slug", "mp_language_slug") or primary_language_slug
+
+        has_youtube = _fhp_bool(_fhp_pick(row, "has_youtube", "mp_has_youtube"))
+        youtube_count = _fhp_int(_fhp_pick(row, "youtube_count"), 0)
+        if has_youtube and youtube_count <= 0:
+            youtube_count = 1
+
+        return {
+            "domain": "historical",
+            "media_type": "movie",
+            "type": "movie",
+            "title": title_value,
+            "slug": slug_value,
+            "release_year": year_value,
+            "year": year_value,
+            "language_slug": language_value,
+            "language": language_value,
+            "poster_url": _fhp_pick(row, "poster_url", "poster", "image_url"),
+            "overview": _fhp_pick(row, "overview", "description"),
+            "rating": _fhp_pick(row, "rating", "vote_average"),
+            "vote_count": _fhp_pick(row, "vote_count"),
+            "has_ott": _fhp_bool(_fhp_pick(row, "has_ott", "ott_available")),
+            "ott_count": _fhp_int(_fhp_pick(row, "ott_count"), 0),
+            "has_youtube": has_youtube,
+            "youtube_count": youtube_count,
+            "role_type": _fhp_pick(row, "role_type"),
+            "source_table": index_table,
+        }
+
+    items = [
+        detail_movie_card(row)
+        for row in movie_rows
+        if _fhp_pick(row, "slug", "mp_movie_slug", "movie_slug")
+    ]
+
+    return {
+        "domain": "historical",
+        "type": "person",
+        "source_table": people_table,
+        "movie_index_table": index_table,
+        "person": person,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "count": len(items),
+        "pages": (total + limit - 1) // limit if total else 0,
+        "items": items,
+        "redirected_from": requested_slug if requested_slug != slug else None,
+    }
+
+
 
 PROVIDER_HOME = {
     "netflix": "https://www.netflix.com/in/",
@@ -625,6 +801,16 @@ def fetch_rows(
     try:
         cur.execute(
             f"""
+            SELECT COUNT(*) AS total
+            FROM public.{qident(table_name)}
+            {where}
+            """,
+            params,
+        )
+        true_total = int(cur.fetchone()["total"] or 0)
+
+        cur.execute(
+            f"""
             SELECT *
             FROM public.{qident(table_name)}
             {where}
@@ -640,7 +826,8 @@ def fetch_rows(
 
     has_more = len(rows) > limit
     rows = rows[:limit]
-    total = offset + len(rows) + (1 if has_more else 0)
+    total = true_total
+    pages = (total + limit - 1) // limit if total else 0
     item_rows = [dict(r) for r in rows]
 
     if domain == "modern":
@@ -668,7 +855,7 @@ def fetch_rows(
         "page": page,
         "limit": limit,
         "total": total,
-        "pages": page + (1 if has_more else 0),
+        "pages": pages,
         "items": [domain_card(r, domain) for r in item_rows],
     }
 
@@ -1860,13 +2047,18 @@ def people_language_score_sql(language: Optional[str], outer_slug_column: str = 
 
 
 def search_people_cache(query: str, limit: int, scope: str, language: Optional[str] = None):
+    # FLIXYFY_PREPROD_V5_PATCH:
+    # Disable stale PEOPLE_SEARCH_CACHE_TABLE path. Pre-prod V5 people source is
+    # historical_people_seo_preprod_v1, and old cache tables may lack compatibility columns.
+    return None
+
     if not table_exists(PEOPLE_SEARCH_CACHE_TABLE):
         return None
 
     person_query = normalize_people_query(query)
     compact_person_query = compact_people_query(person_query)
     exact_short_slug = exact_short_person_slug(person_query)
-    where = ["COALESCE(indexable, 1) = 1"]
+    where = ["1 = 1"]
     params: List[Any] = []
 
     if scope == "indian":
@@ -1983,82 +2175,104 @@ def search_people_cache(query: str, limit: int, scope: str, language: Optional[s
 
 
 def search_people(query: str, limit: int, scope: str, language: Optional[str] = None):
-    cached_result = search_people_cache(query, limit, scope, language)
-    if cached_result is not None:
-        return cached_result
-
-    if not table_exists("historical_people_seo_preprod_v1"):
+    # FLIXYFY_V5_AUDITED_PATCH:
+    # Search historical_people_seo_preprod_v1 directly with only columns that exist.
+    # Avoid stale people cache and avoid hardcoded indexable/youtube_count columns.
+    table_name = "historical_people_seo_preprod_v1"
+    if not table_exists(table_name):
         return 0, []
 
+    cols = table_columns(table_name)
     person_query = normalize_people_query(query)
     compact_person_query = compact_people_query(person_query)
+    exact_short_slug = exact_short_person_slug(person_query)
+
     where = []
-    params = []
+    params: List[Any] = []
 
     if person_query:
-        if len(compact_person_query) <= 3:
-            where.append(
-                "("
-                "LOWER(person_name) = LOWER(%s) "
-                "OR regexp_replace(LOWER(COALESCE(person_name, '')), '[^a-z0-9]+', '', 'g') = %s"
-                ")"
-            )
-            params.extend([person_query, compact_person_query])
+        if exact_short_slug and "person_slug" in cols:
+            where.append("person_slug = %s")
+            params.append(exact_short_slug)
+        elif len(compact_person_query) <= 3:
+            parts = []
+            if "person_name" in cols:
+                parts.append("LOWER(person_name) = LOWER(%s)")
+                params.append(person_query)
+                parts.append("regexp_replace(LOWER(COALESCE(person_name, '')), '[^a-z0-9]+', '', 'g') = %s")
+                params.append(compact_person_query)
+            if "person_slug" in cols:
+                parts.append("regexp_replace(LOWER(COALESCE(person_slug, '')), '[^a-z0-9]+', '', 'g') = %s")
+                params.append(compact_person_query)
+            if parts:
+                where.append("(" + " OR ".join(parts) + ")")
         else:
-            where.append("(LOWER(person_name) LIKE LOWER(%s) OR LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s))")
-            params.extend([f"%{person_query}%", f"%{person_query}%"])
+            parts = []
+            for col in ("person_name", "display_name", "name", "seo_title", "search_text"):
+                if col in cols:
+                    parts.append(f"LOWER(COALESCE(CAST({qident(col)} AS TEXT), '')) LIKE LOWER(%s)")
+                    params.append(f"%{person_query}%")
+            if parts:
+                where.append("(" + " OR ".join(parts) + ")")
 
-    where.append("COALESCE(indexable, 1) = 1")
-    language_sql, language_params = people_language_filter_sql(language)
-    if language_sql:
-        where.append(language_sql)
-        params.extend(language_params)
-    where_clause = "WHERE " + " AND ".join(where)
+    if language:
+        language_values = language_match_values(language)
+        for col in ("primary_language_slug", "language_slug", "language"):
+            if col in cols:
+                where.append(f"LOWER(COALESCE(CAST({qident(col)} AS TEXT), '')) = ANY(%s)")
+                params.append(language_values)
+                break
+
+    where_clause = "WHERE " + " AND ".join(where) if where else ""
+
+    name_col = next((c for c in ("person_name", "display_name", "name") if c in cols), None)
+    name_expr = f"COALESCE({qident(name_col)}, '')" if name_col else "''"
+
+    count_col = next((c for c in ("movie_count", "total_movie_count", "credit_count") if c in cols), None)
+    count_expr = f"COALESCE({qident(count_col)}, 0)" if count_col else "0"
+
+    youtube_col = next((c for c in ("youtube_movie_count", "youtube_count") if c in cols), None)
+    youtube_expr = f"COALESCE({qident(youtube_col)}, 0)" if youtube_col else "0"
+
+    order_params: List[Any] = []
+    if person_query and name_col:
+        order_sql = f"""
+                CASE
+                    WHEN LOWER({qident(name_col)}) = LOWER(%s) THEN 1
+                    WHEN regexp_replace(LOWER(COALESCE({qident(name_col)}, '')), '[^a-z0-9]+', '', 'g') = %s THEN 2
+                    WHEN LOWER({qident(name_col)}) LIKE LOWER(%s) THEN 3
+                    ELSE 4
+                END,
+        """
+        order_params = [person_query, compact_person_query, f"{person_query}%"]
+    else:
+        order_sql = ""
 
     conn = get_conn()
     cur = conn.cursor()
-
     try:
-        total = None
-        if not person_query:
-            cur.execute(
-                f"SELECT COUNT(*) AS total FROM public.historical_people_seo_preprod_v1 {where_clause}",
-                params,
-            )
-            total = cur.fetchone()["total"]
-
-        order_params = []
-        if person_query:
-            order_sql = """
-                CASE
-                    WHEN LOWER(person_name) = LOWER(%s) THEN 1
-                    WHEN regexp_replace(LOWER(COALESCE(person_name, '')), '[^a-z0-9]+', '', 'g') = %s THEN 2
-                    WHEN LOWER(person_name) LIKE LOWER(%s) THEN 3
-                    WHEN LOWER(COALESCE(seo_title, '')) LIKE LOWER(%s) THEN 4
-                    ELSE 5
-                END,
-            """
-            order_params = [person_query, compact_person_query, f"{person_query}%", f"%{person_query}%"]
-        else:
-            order_sql = ""
+        cur.execute(
+            f"SELECT COUNT(*) AS total FROM public.{qident(table_name)} {where_clause}",
+            params,
+        )
+        total = int(cur.fetchone()["total"] or 0)
 
         cur.execute(
             f"""
             SELECT *
-            FROM public.historical_people_seo_preprod_v1
+            FROM public.{qident(table_name)}
             {where_clause}
             ORDER BY
                 {order_sql}
-                COALESCE(youtube_movie_count, 0) DESC,
-                COALESCE(movie_count, 0) DESC,
-                person_name ASC
+                {youtube_expr} DESC,
+                {count_expr} DESC,
+                {name_expr} ASC
             LIMIT %s
             """,
             params + order_params + [limit],
         )
+
         items = [person_search_card(dict(r), "historical") for r in cur.fetchall()]
-        if total is None:
-            total = len(items) + (1 if len(items) == limit else 0)
     finally:
         conn.close()
 
@@ -2205,7 +2419,7 @@ def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
                     search_rank,
                     NULL AS disambiguation_label
                 FROM public.{qident(PEOPLE_SEARCH_CACHE_TABLE)}
-                WHERE COALESCE(indexable, 1) = 1
+                WHERE 1 = 1
                 ORDER BY COALESCE(search_rank, 0) DESC, display_name ASC
                 LIMIT 10000
                 """
@@ -2239,7 +2453,7 @@ def cached_people_suggestion_rows() -> Tuple[Tuple[Any, ...], ...]:
             """
             SELECT person_name, person_slug, primary_role, movie_count, youtube_movie_count, NULL AS last_year
             FROM public.historical_people_seo_preprod_v1
-            WHERE COALESCE(indexable, 1) = 1
+            WHERE 1 = 1
             ORDER BY COALESCE(youtube_movie_count, 0) DESC, COALESCE(movie_count, 0) DESC, person_name ASC
             LIMIT 5000
             """
@@ -2319,7 +2533,7 @@ def people_suggestion_rows(query: str, limit: int, cur=None) -> List[Dict[str, A
             """
             SELECT *
             FROM public.historical_people_seo_preprod_v1
-            WHERE COALESCE(indexable, 1) = 1
+            WHERE 1 = 1
               AND (person_name ILIKE %s OR person_slug ILIKE %s)
             ORDER BY
               CASE
@@ -3045,7 +3259,7 @@ def _fhp_combo_payload(row):
         "seo_url": _fhp_pick(row, "seo_url"),
         "seo_title": _fhp_pick(row, "seo_title"),
         "meta_description": _fhp_pick(row, "meta_description"),
-        "indexable": _fhp_bool(_fhp_pick(row, "indexable")),
+        "indexable": True if _fhp_pick(row, "indexable") is None else _fhp_bool(_fhp_pick(row, "indexable")),
         "index_reason": _fhp_pick(row, "index_reason"),
     }
 
@@ -3085,7 +3299,7 @@ def _fhp_person_payload(row):
         "seo_url": _fhp_pick(row, "seo_url"),
         "seo_title": _fhp_pick(row, "seo_title"),
         "meta_description": _fhp_pick(row, "meta_description"),
-        "indexable": _fhp_bool(_fhp_pick(row, "indexable")),
+        "indexable": True if _fhp_pick(row, "indexable") is None else _fhp_bool(_fhp_pick(row, "indexable")),
         "index_reason": _fhp_pick(row, "index_reason"),
         "title": _fhp_pick(row, "seo_title") or f"{_fhp_pick(row, 'person_name')} Movies",
     }
@@ -3625,7 +3839,7 @@ def historical_combinations_patched_v1(
     limit = max(1, min(int(limit or 48), 100))
     offset = (page - 1) * limit
 
-    where = ["COALESCE(indexable, 0) = 1", "COALESCE(movie_count, 0) >= %s"]
+    where = ["1 = 1", "COALESCE(movie_count, 0) >= %s"]
     params = [max(1, int(min_movies or 1))]
 
     if q:
@@ -3661,84 +3875,234 @@ def historical_combinations_patched_v1(
 
 
 @router.get("/api/v3/historical/people")
+# FLIXYFY_PUBLIC_HISTORICAL_PEOPLE_LAUNCH_FILTER_V1
 def historical_people_patched_v1(
     page: int = 1,
     limit: int = 48,
-    q: str = None,
+    q: str = "",
+    language: str = "",
     min_movies: int = 50,
     youtube_only: bool = False,
 ):
+    # FLIXYFY_HISTORICAL_PEOPLE_PRIMARY_LANGUAGE_STRICT_V1
+    # This route must filter by primary_language_slug only.
+    # Do not use career/all-language counts for language-wise historical rows.
+    table_name = "historical_people_public_launch_v1"
+
     page = max(1, int(page or 1))
     limit = max(1, min(int(limit or 48), 100))
     offset = (page - 1) * limit
+    min_movies = max(0, int(min_movies or 0))
 
-    exact_short_slug = exact_short_person_slug(q or "")
-    if exact_short_slug:
-        person_rows = _fhp_rows(
-            """
-            SELECT *
-            FROM historical_people_seo_preprod_v1
-            WHERE person_slug=%s
-            LIMIT 1
-            """,
-            [exact_short_slug],
+    if not _fhp_table_exists(table_name):
+        return {
+            "domain": "historical",
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "pages": 0,
+            "items": [],
+            "source_table": table_name,
+            "language": language or None,
+        }
+
+    cols = set(_fhp_columns(table_name))
+
+    language_aliases = {
+        "hi": ["hi", "hindi"],
+        "hindi": ["hi", "hindi"],
+        "bollywood": ["hi", "hindi"],
+
+        "te": ["te", "telugu"],
+        "telugu": ["te", "telugu"],
+        "tollywood": ["te", "telugu"],
+
+        "ta": ["ta", "tamil"],
+        "tamil": ["ta", "tamil"],
+
+        "kn": ["kn", "kannada"],
+        "kannada": ["kn", "kannada"],
+
+        "ml": ["ml", "malayalam"],
+        "malayalam": ["ml", "malayalam"],
+    }
+
+    language_key = str(language or "").strip().lower()
+    all_language_values = {"", "all", "all_languages", "all-languages", "all indian languages"}
+
+    where = []
+    params = []
+
+    # FLIXYFY_HISTORICAL_PEOPLE_NOISE_BLOCKLIST_V1
+    # Hide known non-person/noise entities from public people rows.
+    blocked_person_slugs = {
+        "mukhyamantri-chandru",
+    }
+    if "person_slug" in cols and blocked_person_slugs:
+        placeholders = ", ".join(["%s"] * len(blocked_person_slugs))
+        where.append(f"COALESCE(person_slug, '') NOT IN ({placeholders})")
+        params.extend(sorted(blocked_person_slugs))
+
+    movie_count_columns = [
+        c for c in (
+            "primary_language_movie_count",
+            "movie_count",
+            "career_attached_movie_count",
+            "total_movie_count",
+            "credit_count",
         )
-        if person_rows:
-            return {
-                "domain": "historical",
-                "page": page,
-                "limit": limit,
-                "total": 1,
-                "pages": 1,
-                "items": [_fhp_person_payload(person_rows[0])],
-            }
+        if c in cols
+    ]
 
-    where = ["COALESCE(indexable, 0) = 1", "COALESCE(movie_count, 0) >= %s"]
-    params = [max(1, int(min_movies or 1))]
-
-    if q:
-        clean_q = str(q).strip().lower()
-        compact_q = compact_people_query(clean_q)
-        if len(compact_q) <= 3:
-            where.append(
-                "("
-                "LOWER(person_name) = %s "
-                "OR LOWER(person_slug) = %s "
-                "OR regexp_replace(LOWER(COALESCE(person_name, '')), '[^a-z0-9]+', '', 'g') = %s"
-                ")"
-            )
-            params.extend([clean_q, clean_q, compact_q])
+    if movie_count_columns:
+        if len(movie_count_columns) == 1:
+            movie_expr = f"COALESCE({qident(movie_count_columns[0])}, 0)"
         else:
-            text = f"%{clean_q}%"
-            where.append("(LOWER(person_name) LIKE %s OR LOWER(seo_title) LIKE %s)")
-            params.extend([text, text])
+            movie_expr = "GREATEST(" + ", ".join(
+                f"COALESCE({qident(c)}, 0)" for c in movie_count_columns
+            ) + ")"
+    else:
+        movie_expr = "0"
 
-    if youtube_only:
+    if min_movies:
+        where.append(f"{movie_expr} >= %s")
+        params.append(min_movies)
+    else:
+        where.append(f"{movie_expr} > 0")
+
+    if language_key not in all_language_values:
+        language_values = language_aliases.get(language_key, [language_key])
+        if "primary_language_slug" in cols:
+            where.append(
+                "LOWER(COALESCE(CAST(primary_language_slug AS TEXT), '')) = ANY(%s)"
+            )
+            params.append(language_values)
+        else:
+            # Without primary_language_slug this route cannot safely make language rows.
+            where.append("1 = 0")
+
+    query = str(q or "").strip()
+    if query:
+        import re as _flixyfy_re
+
+        search_parts = []
+        query_l = query.lower().strip()
+        is_short_token = bool(_flixyfy_re.fullmatch(r"[a-z0-9. ]{1,4}", query_l))
+
+        if is_short_token:
+            # For short people queries like NTR, ANR, MGR:
+            # match exact slug/name token only, never substring inside words like mukhyamaNTRi.
+            compact = _flixyfy_re.sub(r"[^a-z0-9]+", "", query_l)
+            token_pattern = rf"(^|[^a-z0-9]){_flixyfy_re.escape(compact)}([^a-z0-9]|$)"
+
+            # FLIXYFY_HISTORICAL_PEOPLE_SHORT_ALIAS_V1
+            # Common Indian cinema initials should resolve to canonical person slugs.
+            short_alias_slugs = {
+                "ntr": ["n-t-rama-rao"],
+                "anr": ["akkineni-nageshwara-rao"],
+                "mgr": ["m-g-ramachandran", "m-g-ramachandran"],
+            }
+            alias_slugs = short_alias_slugs.get(compact, [])
+            if alias_slugs and "person_slug" in cols:
+                placeholders = ", ".join(["%s"] * len(alias_slugs))
+                search_parts.append(f"person_slug IN ({placeholders})")
+                params.extend(alias_slugs)
+
+            for col in ("person_slug", "person_name", "display_name", "page_title", "meta_title"):
+                if col in cols:
+                    normalized_expr = (
+                        "LOWER(REGEXP_REPLACE("
+                        f"COALESCE(CAST({qident(col)} AS TEXT), ''), "
+                        "'[^a-zA-Z0-9]+', '', 'g'))"
+                    )
+                    token_expr = (
+                        "LOWER(REGEXP_REPLACE("
+                        f"COALESCE(CAST({qident(col)} AS TEXT), ''), "
+                        "'[^a-zA-Z0-9]+', ' ', 'g'))"
+                    )
+                    search_parts.append(f"({normalized_expr} = %s OR {token_expr} ~ %s)")
+                    params.extend([compact, token_pattern])
+        else:
+            for col in ("person_name", "display_name", "page_title", "meta_title", "person_slug"):
+                if col in cols:
+                    search_parts.append(
+                        f"LOWER(COALESCE(CAST({qident(col)} AS TEXT), '')) LIKE LOWER(%s)"
+                    )
+                    params.append(f"%{query}%")
+
+        if search_parts:
+            where.append("(" + " OR ".join(search_parts) + ")")
+
+    if youtube_only and "youtube_movie_count" in cols:
         where.append("COALESCE(youtube_movie_count, 0) > 0")
 
-    where_sql = "WHERE " + " AND ".join(where)
+    youtube_expr = "COALESCE(youtube_movie_count, 0)" if "youtube_movie_count" in cols else "0"
+    name_expr = (
+        "COALESCE(person_name, display_name, person_slug, '')"
+        if "display_name" in cols
+        else "COALESCE(person_name, person_slug, '')"
+    )
+
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
     rows = _fhp_rows(
         f"""
         SELECT *
-        FROM historical_people_seo_preprod_v1
+        FROM public.{qident(table_name)}
         {where_sql}
-        ORDER BY COALESCE(youtube_movie_count, 0) DESC, COALESCE(movie_count, 0) DESC, person_name ASC
+        ORDER BY {youtube_expr} DESC, {movie_expr} DESC, {name_expr} ASC
         LIMIT %s OFFSET %s
         """,
         params + [limit, offset],
     )
 
-    total = offset + len(rows) + (1 if len(rows) == limit else 0)
+    total_rows = _fhp_rows(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM public.{qident(table_name)}
+        {where_sql}
+        """,
+        params,
+    )
+
+    total = int((total_rows[0] or {}).get("total") or 0) if total_rows else 0
+    pages = (total + limit - 1) // limit if total else 0
+
+    def strict_payload(row):
+        data = _fhp_person_payload(row)
+
+        primary_count = _fhp_int(
+            _fhp_pick(row, "primary_language_movie_count", "movie_count", "career_attached_movie_count"),
+            0,
+        )
+        career_count = _fhp_int(
+            _fhp_pick(row, "career_attached_movie_count", "total_movie_count", "movie_count"),
+            primary_count,
+        )
+
+        data["movie_count"] = primary_count
+        data["primary_language_movie_count"] = primary_count
+        data["career_attached_movie_count"] = career_count
+        data["total_movie_count"] = career_count
+        data["primary_language_slug"] = _fhp_pick(row, "primary_language_slug")
+        data["primary_language_name"] = _fhp_pick(row, "primary_language_name")
+        data["source_table"] = table_name
+        data["language"] = _fhp_pick(row, "primary_language_slug")
+        return data
+
+    items = [strict_payload(row) for row in rows]
 
     return {
         "domain": "historical",
+        "source_table": table_name,
         "page": page,
         "limit": limit,
         "total": total,
-        "pages": page + (1 if len(rows) == limit else 0),
-        "items": [_fhp_person_payload(row) for row in rows],
+        "count": len(items),
+        "pages": pages,
+        "language": language or None,
+        "items": items,
     }
-
 
 @router.get("/api/v3/historical/person/{person_slug}")
 def historical_person_detail_patched_v1(person_slug: str, page: int = 1, limit: int = 96):
@@ -3948,8 +4312,13 @@ def historical_movies_patched_v1(
 
     if provider_text == "youtube" or availability_text in ("youtube", "free", "true", "ott", "1"):
         items = [item for item in items if item.get("youtube_count", 0) > 0 or item.get("has_ott") is True]
-    total = offset + len(items) + (1 if len(rows) == limit else 0)
-    pages = page + (1 if len(rows) == limit else 0)
+
+    total_rows = _fhp_rows(
+        f'SELECT COUNT(*) AS total FROM "{table}" h {join_sql} {where_sql}',
+        params,
+    )
+    total = int((total_rows[0] or {}).get("total") or 0) if total_rows else 0
+    pages = (total + limit - 1) // limit if total else 0
 
     return {
         "domain": "historical",
