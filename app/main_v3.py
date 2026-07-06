@@ -2302,3 +2302,103 @@ def load_ott_links(tmdb_id=None, slug=None, **kwargs):
 
 print("FLIXYFY_MOVIE_DETAIL_PROVIDER_FALLBACK_PATCH_V3_LOADED")
 # FLIXYFY_MOVIE_DETAIL_PROVIDER_FALLBACK_PATCH_V3_END
+
+# FLIXYFY_LAUNCH_DB_DEBUG_V1_START
+@app.get("/api/v3/debug/launch-db")
+def flixyfy_launch_db_debug_v1():
+    """
+    Temporary launch diagnostic.
+    Returns only table existence/counts and person counts.
+    Does not expose DATABASE_URL or password.
+    Remove after prod launch verification.
+    """
+    debug_tables = [
+        "historical_people_public_launch_v1",
+        "historical_people_internal_hidden_v1",
+        "historical_people_seo_preprod_v1",
+        "historical_people_seo_preprod_fixed_v1",
+        "historical_movie_people_seo_preprod_v1",
+    ]
+
+    out = {
+        "debug_marker": "FLIXYFY_LAUNCH_DB_DEBUG_V1",
+        "tables": {},
+        "people_rows": {},
+        "person_index_counts": {},
+    }
+
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        cur.execute("SELECT current_database() AS current_database")
+        out["current_database"] = cur.fetchone().get("current_database")
+    except Exception as exc:
+        out["current_database_error"] = repr(exc)
+
+    for table in debug_tables:
+        try:
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema='public' AND table_name=%s
+                UNION ALL
+                SELECT 1
+                FROM information_schema.views
+                WHERE table_schema='public' AND table_name=%s
+                LIMIT 1
+                """,
+                (table, table),
+            )
+            exists_flag = cur.fetchone() is not None
+
+            item = {"exists": exists_flag}
+
+            if exists_flag:
+                cur.execute(f'SELECT COUNT(*) AS n FROM public."{table}"')
+                item["count"] = int(cur.fetchone().get("n") or 0)
+
+            out["tables"][table] = item
+        except Exception as exc:
+            out["tables"][table] = {"exists": False, "error": repr(exc)}
+
+    for table in ["historical_people_public_launch_v1", "historical_people_seo_preprod_v1", "historical_people_seo_preprod_fixed_v1"]:
+        try:
+            if out["tables"].get(table, {}).get("exists"):
+                cur.execute(
+                    f'''
+                    SELECT person_slug, display_name, movie_count, youtube_movie_count, primary_language_slug
+                    FROM public."{table}"
+                    WHERE person_slug IN ('n-t-rama-rao','jaishankar','dharmendra')
+                    ORDER BY person_slug
+                    '''
+                )
+                out["people_rows"][table] = [dict(r) for r in cur.fetchall()]
+        except Exception as exc:
+            out["people_rows"][table] = {"error": repr(exc)}
+
+    try:
+        if out["tables"].get("historical_movie_people_seo_preprod_v1", {}).get("exists"):
+            cur.execute(
+                '''
+                SELECT person_slug, COUNT(*) AS total,
+                       MIN(language_slug) AS min_language_slug,
+                       MAX(language_slug) AS max_language_slug
+                FROM public."historical_movie_people_seo_preprod_v1"
+                WHERE person_slug IN ('n-t-rama-rao','jaishankar','dharmendra')
+                GROUP BY person_slug
+                ORDER BY person_slug
+                '''
+            )
+            out["person_index_counts"] = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        out["person_index_counts_error"] = repr(exc)
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+    return out
+# FLIXYFY_LAUNCH_DB_DEBUG_V1_END
