@@ -3101,7 +3101,13 @@ def _fhp_card(row):
 def _fhp_list_card(row):
     slug = _fhp_pick(row, "slug")
     youtube_url = _fhp_pick(row, "youtube_url")
-    has_youtube = _fhp_is_youtube_url(youtube_url) or _fhp_bool(_fhp_pick(row, "has_youtube"))
+    ott_count = _fhp_pick(row, "ott_count")
+    youtube_count = _fhp_int(_fhp_pick(row, "youtube_count"), 0)
+    has_youtube = (
+        _fhp_is_youtube_url(youtube_url)
+        or _fhp_bool(_fhp_pick(row, "has_youtube"))
+        or _fhp_bool(_fhp_pick(row, "fhp_force_youtube"))
+    )
     has_ott = has_youtube or _fhp_bool(_fhp_pick(row, "has_ott"))
 
     return {
@@ -3128,7 +3134,7 @@ def _fhp_list_card(row):
         "quality_score": _fhp_pick(row, "quality_score"),
         "ott_primary": "YouTube" if has_youtube else _fhp_pick(row, "ott_primary"),
         "ott_primary_key": "youtube" if has_youtube else (_fhp_pick(row, "ott_primary_key") or ""),
-        "ott_count": 1 if has_youtube else _fhp_pick(row, "ott_count"),
+        "ott_count": ott_count if ott_count is not None else (1 if has_youtube else None),
         "has_ott": has_ott,
         "has_free_ott": has_youtube or _fhp_bool(_fhp_pick(row, "has_free_ott")),
         "has_subscription_ott": _fhp_bool(_fhp_pick(row, "has_subscription_ott")),
@@ -3138,7 +3144,7 @@ def _fhp_list_card(row):
         "youtube_url": youtube_url,
         "youtube_title": _fhp_pick(row, "youtube_title"),
         "youtube_video_id": _fhp_pick(row, "youtube_video_id"),
-        "youtube_count": 1 if has_youtube else 0,
+        "youtube_count": youtube_count if youtube_count > 0 else (1 if has_youtube else 0),
     }
 
 
@@ -4106,17 +4112,119 @@ def historical_people_patched_v1(
 
 @router.get("/api/v3/historical/person/{person_slug}")
 def historical_person_detail_patched_v1(person_slug: str, page: int = 1, limit: int = 96):
+    people_table = "historical_people_seo_preprod_v1"
     slug, redirected_from = _resolve_person_slug(person_slug)
+
+    if not _fhp_table_exists(people_table):
+        raise HTTPException(status_code=404, detail="Historical person not found")
+
+    table_cols = set(_fhp_columns(people_table))
+
+    requested_slug = str(person_slug or "").strip().strip("/").lower()
+    requested_slug = re.sub(r"^historical/person/", "", requested_slug)
+
+    lookup_values = []
+
+    def add_lookup(value):
+        value = str(value or "").strip().strip("/").lower()
+        if value and value not in lookup_values:
+            lookup_values.append(value)
+
+    add_lookup(slug)
+    add_lookup(requested_slug)
+
+    ntr_aliases = {
+        "ntr",
+        "n-t-rama-rao",
+        "n-t-rama-rao-sr",
+        "nandamuri-taraka-rama-rao",
+    }
+    if slug in ntr_aliases or requested_slug in ntr_aliases:
+        for alias in sorted(ntr_aliases):
+            add_lookup(alias)
+
+    compact_values = []
+    for value in lookup_values:
+        compact = compact_people_query(value)
+        if compact and compact not in compact_values:
+            compact_values.append(compact)
+
+    where_parts = []
+    params = []
+
+    slug_lookup_cols = (
+        "slug",
+        "person_slug",
+        "name_slug",
+        "alias_slug",
+        "canonical_slug",
+        "person_key",
+        "canonical_person_key",
+    )
+    for col in slug_lookup_cols:
+        if col in table_cols and lookup_values:
+            where_parts.append(f"LOWER(COALESCE(CAST({qident(col)} AS TEXT), '')) = ANY(%s)")
+            params.append(lookup_values)
+
+    name_lookup_cols = ("person_name", "name", "display_name")
+    for col in name_lookup_cols:
+        if col in table_cols and compact_values:
+            normalized_expr = (
+                "LOWER(REGEXP_REPLACE("
+                f"COALESCE(CAST({qident(col)} AS TEXT), ''), "
+                "'[^a-zA-Z0-9]+', '', 'g'))"
+            )
+            where_parts.append(f"{normalized_expr} = ANY(%s)")
+            params.append(compact_values)
+
+    alias_lookup_cols = ("aliases", "aliases_json", "compact_aliases_text")
+    for col in alias_lookup_cols:
+        if col in table_cols and lookup_values:
+            alias_parts = []
+            for value in lookup_values + compact_values:
+                alias_parts.append(f"LOWER(COALESCE(CAST({qident(col)} AS TEXT), '')) LIKE %s")
+                params.append(f"%{value}%")
+            if alias_parts:
+                where_parts.append("(" + " OR ".join(alias_parts) + ")")
+
+    if "seo_url" in table_cols and lookup_values:
+        seo_values = []
+        for value in lookup_values:
+            for seo_value in (
+                value,
+                f"/historical/person/{value}",
+                f"historical/person/{value}",
+            ):
+                if seo_value not in seo_values:
+                    seo_values.append(seo_value)
+        where_parts.append("LOWER(COALESCE(CAST(seo_url AS TEXT), '')) = ANY(%s)")
+        params.append(seo_values)
+
+    if not where_parts:
+        raise HTTPException(status_code=404, detail="Historical person not found")
+
+    order_parts = []
+    if "person_slug" in table_cols:
+        order_parts.append("WHEN LOWER(COALESCE(CAST(person_slug AS TEXT), '')) = %s THEN 0")
+        params.append(slug)
+    for col in ("slug", "canonical_slug", "name_slug", "alias_slug"):
+        if col in table_cols:
+            order_parts.append(f"WHEN LOWER(COALESCE(CAST({qident(col)} AS TEXT), '')) = %s THEN 1")
+            params.append(slug)
+
+    order_sql = ""
+    if order_parts:
+        order_sql = "ORDER BY CASE " + " ".join(order_parts) + " ELSE 10 END"
+
     person_rows = _fhp_rows(
-        """
+        f"""
         SELECT *
-        FROM historical_people_seo_preprod_v1
-        WHERE person_slug=%s
-           OR seo_url=%s
-           OR seo_url=%s
+        FROM public.{qident(people_table)}
+        WHERE {" OR ".join(where_parts)}
+        {order_sql}
         LIMIT 1
         """,
-        [slug, f"/historical/person/{slug}", f"historical/person/{slug}"],
+        params,
     )
 
     if not person_rows:
@@ -4264,12 +4372,45 @@ def historical_movies_patched_v1(
     params.append(blocked_slugs)
 
     provider_text = str(provider or "").strip().lower()
-    availability_text = str(availability or has_ott or "").strip().lower()
+    availability_text = str(availability or "").strip().lower()
+    has_ott_text = str(has_ott or "").strip().lower()
 
-    youtube_only = provider_text == "youtube" or availability_text in ("youtube", "free", "true", "ott", "1")
+    youtube_provider_filter = provider_text == "youtube" or availability_text in ("youtube", "free")
+    ott_available_filter = (
+        availability_text in ("true", "ott", "1")
+        or has_ott_text in ("1", "true", "yes", "y", "ott", "youtube")
+    )
+    availability_filter = youtube_provider_filter or ott_available_filter
 
     join_sql = ""
-    if youtube_only and _fhp_table_exists(YOUTUBE_LINK_TABLE):
+    table_cols = set(_fhp_columns(table))
+    direct_availability_filters = []
+
+    if youtube_provider_filter:
+        if "ott_primary_key" in table_cols:
+            direct_availability_filters.append("LOWER(COALESCE(CAST(h.ott_primary_key AS TEXT), '')) = 'youtube'")
+        if "ott_primary" in table_cols:
+            direct_availability_filters.append("LOWER(COALESCE(CAST(h.ott_primary AS TEXT), '')) LIKE '%%youtube%%'")
+        if "has_youtube" in table_cols:
+            direct_availability_filters.append("LOWER(COALESCE(CAST(h.has_youtube AS TEXT), '')) IN ('1', 'true', 'yes', 'y')")
+        if "youtube_count" in table_cols:
+            direct_availability_filters.append("COALESCE(h.youtube_count, 0) > 0")
+        if "youtube_url" in table_cols:
+            direct_availability_filters.append(
+                "(h.youtube_url IS NOT NULL AND TRIM(CAST(h.youtube_url AS TEXT)) <> '' "
+                "AND (LOWER(CAST(h.youtube_url AS TEXT)) LIKE '%%youtube.com%%' "
+                "OR LOWER(CAST(h.youtube_url AS TEXT)) LIKE '%%youtu.be%%'))"
+            )
+
+    if ott_available_filter or (youtube_provider_filter and not direct_availability_filters):
+        if "has_ott" in table_cols:
+            direct_availability_filters.append("LOWER(COALESCE(CAST(h.has_ott AS TEXT), '')) IN ('1', 'true', 'yes', 'y')")
+        if "ott_count" in table_cols:
+            direct_availability_filters.append("COALESCE(h.ott_count, 0) > 0")
+
+    if availability_filter and direct_availability_filters:
+        where.append("(" + " OR ".join(direct_availability_filters) + ")")
+    elif availability_filter and _fhp_table_exists(YOUTUBE_LINK_TABLE):
         join_sql = (
             " JOIN ("
             f"   SELECT DISTINCT content_slug FROM public.{qident(YOUTUBE_LINK_TABLE)} "
@@ -4277,14 +4418,14 @@ def historical_movies_patched_v1(
             "     AND LOWER(COALESCE(content_domain, 'historical')) IN ('historical', 'classic')"
             " ) ytv ON ytv.content_slug = h.slug "
         )
-    elif youtube_only and _fhp_table_exists("historical_youtube_verified_links_v1"):
+    elif availability_filter and _fhp_table_exists("historical_youtube_verified_links_v1"):
         join_sql = (
             " JOIN ("
             "   SELECT DISTINCT slug FROM historical_youtube_verified_links_v1 "
             "   WHERE COALESCE(active, TRUE)=TRUE"
             " ) ytv ON ytv.slug = h.slug "
         )
-    elif youtube_only:
+    elif availability_filter:
         where.append(
             "youtube_url IS NOT NULL AND TRIM(CAST(youtube_url AS TEXT)) <> '' "
             "AND (LOWER(CAST(youtube_url AS TEXT)) LIKE %s OR LOWER(CAST(youtube_url AS TEXT)) LIKE %s)"
@@ -4303,15 +4444,14 @@ def historical_movies_patched_v1(
     else:
         order_sql += " release_year DESC NULLS LAST, title ASC"
 
+    select_sql = "h.*, TRUE AS fhp_force_youtube" if youtube_provider_filter else "h.*"
+
     rows = _fhp_rows(
-        f'SELECT h.* FROM "{table}" h {join_sql} {where_sql} {order_sql} LIMIT %s OFFSET %s',
+        f'SELECT {select_sql} FROM "{table}" h {join_sql} {where_sql} {order_sql} LIMIT %s OFFSET %s',
         params + [limit, offset],
     )
 
     items = [_fhp_list_card(row) for row in rows if not _fhp_bad_person_row(row)]
-
-    if provider_text == "youtube" or availability_text in ("youtube", "free", "true", "ott", "1"):
-        items = [item for item in items if item.get("youtube_count", 0) > 0 or item.get("has_ott") is True]
 
     total_rows = _fhp_rows(
         f'SELECT COUNT(*) AS total FROM "{table}" h {join_sql} {where_sql}',
