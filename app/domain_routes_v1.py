@@ -3177,14 +3177,33 @@ def _fhp_list_card(row):
     youtube_url = _fhp_pick(row, "youtube_url")
     ott_count = _fhp_pick(row, "ott_count")
     youtube_count = _fhp_int(_fhp_pick(row, "youtube_count"), 0)
+    forced_provider_key = _fhp_pick(row, "fhp_provider_key")
+    forced_provider_name = _fhp_pick(row, "fhp_provider_name") or forced_provider_key
+    forced_provider_type = _fhp_pick(row, "fhp_provider_type")
+    forced_provider_url = _fhp_pick(row, "fhp_provider_url")
+    normalized_forced_provider = normalize_provider_key(forced_provider_key or forced_provider_name)
     has_youtube = (
         _fhp_is_youtube_url(youtube_url)
         or _fhp_bool(_fhp_pick(row, "has_youtube"))
         or _fhp_bool(_fhp_pick(row, "fhp_force_youtube"))
+        or normalized_forced_provider == "youtube"
     )
-    has_ott = has_youtube or _fhp_bool(_fhp_pick(row, "has_ott"))
+    has_forced_provider = bool(forced_provider_key or forced_provider_name)
+    has_ott = has_youtube or has_forced_provider or _fhp_bool(_fhp_pick(row, "has_ott"))
+    provider_row = None
+    if has_forced_provider:
+        provider_row = {
+            "provider_key": normalized_forced_provider,
+            "provider_display_name": "YouTube" if has_youtube else forced_provider_name,
+            "provider_name": "YouTube" if has_youtube else forced_provider_name,
+            "provider_type": forced_provider_type or ("free" if has_youtube else None),
+            "provider_category": forced_provider_type or ("free" if has_youtube else None),
+            "final_url": forced_provider_url,
+            "url": forced_provider_url,
+            "button_label": f"Watch on {'YouTube' if has_youtube else forced_provider_name}",
+        }
 
-    return {
+    data = {
         "domain": "historical",
         "source_domain": "historical",
         "source_label": "Historical Indian",
@@ -3206,8 +3225,8 @@ def _fhp_list_card(row):
         "vote_count": _fhp_pick(row, "vote_count"),
         "popularity": _fhp_pick(row, "popularity"),
         "quality_score": _fhp_pick(row, "quality_score"),
-        "ott_primary": "YouTube" if has_youtube else _fhp_pick(row, "ott_primary"),
-        "ott_primary_key": "youtube" if has_youtube else (_fhp_pick(row, "ott_primary_key") or ""),
+        "ott_primary": "YouTube" if has_youtube else (forced_provider_name or _fhp_pick(row, "ott_primary")),
+        "ott_primary_key": "youtube" if has_youtube else (normalized_forced_provider or _fhp_pick(row, "ott_primary_key") or ""),
         "ott_count": ott_count if ott_count is not None else (1 if has_youtube else None),
         "has_ott": has_ott,
         "has_free_ott": has_youtube or _fhp_bool(_fhp_pick(row, "has_free_ott")),
@@ -3220,6 +3239,11 @@ def _fhp_list_card(row):
         "youtube_video_id": _fhp_pick(row, "youtube_video_id"),
         "youtube_count": youtube_count if youtube_count > 0 else (1 if has_youtube else 0),
     }
+    if provider_row:
+        data["availability"] = [provider_row]
+        data["ott_all"] = [provider_row]
+        data["watch_providers"] = [provider_row]
+    return data
 
 
 def _fhp_detail(row):
@@ -4450,14 +4474,17 @@ def historical_movies_patched_v1(
     has_ott_text = str(has_ott or "").strip().lower()
 
     youtube_provider_filter = provider_text == "youtube" or availability_text in ("youtube", "free")
+    provider_terms = provider_match_terms(provider or ("youtube" if youtube_provider_filter else ""))
     ott_available_filter = (
         availability_text in ("true", "ott", "1")
         or has_ott_text in ("1", "true", "yes", "y", "ott", "youtube")
     )
-    availability_filter = youtube_provider_filter or ott_available_filter
+    availability_filter = bool(provider_terms) or youtube_provider_filter or ott_available_filter
 
     join_sql = ""
+    join_params = []
     table_cols = set(_fhp_columns(table))
+    availability_cols = set(_fhp_columns(HISTORICAL_AVAILABILITY_TABLE)) if _fhp_table_exists(HISTORICAL_AVAILABILITY_TABLE) else set()
     direct_availability_filters = []
 
     if youtube_provider_filter:
@@ -4482,7 +4509,96 @@ def historical_movies_patched_v1(
         if "ott_count" in table_cols:
             direct_availability_filters.append("COALESCE(h.ott_count, 0) > 0")
 
-    if availability_filter and direct_availability_filters:
+    if provider_terms and "content_slug" in availability_cols:
+        provider_conditions = []
+        for term in provider_terms:
+            key_term = term.replace(" ", "_").replace("-", "_")
+            spaced_term = term.replace("_", " ").replace("-", " ")
+            if "provider_key" in availability_cols:
+                provider_conditions.append("LOWER(COALESCE(CAST(a.provider_key AS TEXT), '')) LIKE %s")
+                join_params.append(f"%{key_term}%")
+            if "provider_name" in availability_cols:
+                provider_conditions.append("LOWER(COALESCE(CAST(a.provider_name AS TEXT), '')) LIKE %s")
+                join_params.append(f"%{spaced_term}%")
+            if "provider_display_name" in availability_cols:
+                provider_conditions.append("LOWER(COALESCE(CAST(a.provider_display_name AS TEXT), '')) LIKE %s")
+                join_params.append(f"%{spaced_term}%")
+            if "normalized_provider_name" in availability_cols:
+                provider_conditions.append("LOWER(COALESCE(CAST(a.normalized_provider_name AS TEXT), '')) LIKE %s")
+                join_params.append(f"%{key_term}%")
+
+        provider_key_expr = "a.provider_key" if "provider_key" in availability_cols else (
+            "a.normalized_provider_name" if "normalized_provider_name" in availability_cols else "NULL"
+        )
+        provider_name_expr = "a.provider_name" if "provider_name" in availability_cols else (
+            "a.provider_display_name" if "provider_display_name" in availability_cols else (
+                "a.normalized_provider_name" if "normalized_provider_name" in availability_cols else provider_key_expr
+            )
+        )
+        provider_type_expr = "a.monetization_type" if "monetization_type" in availability_cols else (
+            "a.provider_type" if "provider_type" in availability_cols else (
+                "a.availability_type" if "availability_type" in availability_cols else "NULL"
+            )
+        )
+        provider_url_expr = "a.final_url" if "final_url" in availability_cols else (
+            "a.deep_link" if "deep_link" in availability_cols else (
+                "a.search_url" if "search_url" in availability_cols else "NULL"
+            )
+        )
+        provider_where = "WHERE " + " OR ".join(provider_conditions) if provider_conditions else ""
+        join_sql = (
+            " JOIN ("
+            "   SELECT DISTINCT ON (a.content_slug) "
+            "          a.content_slug, "
+            f"         {provider_key_expr} AS fhp_provider_key, "
+            f"         {provider_name_expr} AS fhp_provider_name, "
+            f"         {provider_type_expr} AS fhp_provider_type, "
+            f"         {provider_url_expr} AS fhp_provider_url "
+            f"   FROM public.{qident(HISTORICAL_AVAILABILITY_TABLE)} a "
+            f"   {provider_where} "
+            "   ORDER BY a.content_slug, "
+            "            CASE LOWER(COALESCE(CAST("
+            f"{provider_key_expr}"
+            " AS TEXT), '')) WHEN 'youtube' THEN 0 ELSE 1 END, "
+            "            LOWER(COALESCE(CAST("
+            f"{provider_name_expr}"
+            " AS TEXT), ''))"
+            " ) hav ON hav.content_slug = h.slug "
+        )
+    elif ott_available_filter and "content_slug" in availability_cols:
+        provider_key_expr = "a.provider_key" if "provider_key" in availability_cols else (
+            "a.normalized_provider_name" if "normalized_provider_name" in availability_cols else "NULL"
+        )
+        provider_name_expr = "a.provider_name" if "provider_name" in availability_cols else (
+            "a.provider_display_name" if "provider_display_name" in availability_cols else (
+                "a.normalized_provider_name" if "normalized_provider_name" in availability_cols else provider_key_expr
+            )
+        )
+        provider_type_expr = "a.monetization_type" if "monetization_type" in availability_cols else (
+            "a.provider_type" if "provider_type" in availability_cols else (
+                "a.availability_type" if "availability_type" in availability_cols else "NULL"
+            )
+        )
+        provider_url_expr = "a.final_url" if "final_url" in availability_cols else (
+            "a.deep_link" if "deep_link" in availability_cols else (
+                "a.search_url" if "search_url" in availability_cols else "NULL"
+            )
+        )
+        join_sql = (
+            " JOIN ("
+            "   SELECT DISTINCT ON (a.content_slug) "
+            "          a.content_slug, "
+            f"         {provider_key_expr} AS fhp_provider_key, "
+            f"         {provider_name_expr} AS fhp_provider_name, "
+            f"         {provider_type_expr} AS fhp_provider_type, "
+            f"         {provider_url_expr} AS fhp_provider_url "
+            f"   FROM public.{qident(HISTORICAL_AVAILABILITY_TABLE)} a "
+            "   ORDER BY a.content_slug, LOWER(COALESCE(CAST("
+            f"{provider_name_expr}"
+            " AS TEXT), ''))"
+            " ) hav ON hav.content_slug = h.slug "
+        )
+    elif availability_filter and direct_availability_filters:
         where.append("(" + " OR ".join(direct_availability_filters) + ")")
     elif availability_filter and _fhp_table_exists(YOUTUBE_LINK_TABLE):
         join_sql = (
@@ -4518,18 +4634,28 @@ def historical_movies_patched_v1(
     else:
         order_sql += " release_year DESC NULLS LAST, title ASC"
 
-    select_sql = "h.*, TRUE AS fhp_force_youtube" if youtube_provider_filter else "h.*"
+    select_parts = ["h.*"]
+    if youtube_provider_filter:
+        select_parts.append("TRUE AS fhp_force_youtube")
+    if join_sql and " hav " in join_sql:
+        select_parts.extend([
+            "hav.fhp_provider_key",
+            "hav.fhp_provider_name",
+            "hav.fhp_provider_type",
+            "hav.fhp_provider_url",
+        ])
+    select_sql = ", ".join(select_parts)
 
     rows = _fhp_rows(
         f'SELECT {select_sql} FROM "{table}" h {join_sql} {where_sql} {order_sql} LIMIT %s OFFSET %s',
-        params + [limit, offset],
+        join_params + params + [limit, offset],
     )
 
     items = [_fhp_list_card(row) for row in rows if not _fhp_bad_person_row(row)]
 
     total_rows = _fhp_rows(
         f'SELECT COUNT(*) AS total FROM "{table}" h {join_sql} {where_sql}',
-        params,
+        join_params + params,
     )
     total = int((total_rows[0] or {}).get("total") or 0) if total_rows else 0
     pages = (total + limit - 1) // limit if total else 0
