@@ -36,7 +36,7 @@ HISTORICAL_SEARCH_TABLE = os.getenv("HISTORICAL_SEARCH_TABLE", "historical_searc
 HISTORICAL_AVAILABILITY_TABLE = os.getenv("HISTORICAL_AVAILABILITY_TABLE", "historical_availability_v2")
 PEOPLE_SEARCH_CACHE_TABLE = os.getenv("PEOPLE_SEARCH_CACHE_TABLE", "people_serving_v1")
 PERSON_SLUG_REDIRECT_TABLE = os.getenv("PERSON_SLUG_REDIRECT_TABLE", "person_slug_redirect_v1")
-YOUTUBE_LINK_TABLE = os.getenv("YOUTUBE_LINK_TABLE", "youtube_link_serving_v1")
+YOUTUBE_LINK_TABLE = os.getenv("YOUTUBE_LINK_TABLE", "youtube_link_from_provider_v2")
 
 router = APIRouter()
 

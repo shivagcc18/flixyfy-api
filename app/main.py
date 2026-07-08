@@ -17,8 +17,8 @@ Canonical production serving rules:
         public.person_page_serving_v1
 
     - YouTube full-movie links:
-        public.youtube_link_serving_v1 is canonical.
-        public.youtube_full_movie_links_v2 is compatibility view only.
+        public.provider_availability_serving_v2 is canonical.
+        public.youtube_link_from_provider_v2 is the YouTube compatibility view.
 """
 
 from app.main_v3 import app
