@@ -24,17 +24,8 @@ Canonical production serving rules:
 from app.main_v3 import app
 
 __all__ = ["app"]
-
-# FLIXYFY_PROVIDER_FILTERS_V5_MIDDLEWARE_INSTALL_V1
-# Provider-filtered list requests use existing v5 availability tables only.
-try:
-    from app.provider_filter_v5_middleware import install_provider_filter_v5_middleware
-    install_provider_filter_v5_middleware(app)
-except Exception as _flixyfy_provider_filter_v5_exc:
-    print("FLIXYFY_PROVIDER_FILTERS_V5_MIDDLEWARE_INSTALL_V1_ERROR", repr(_flixyfy_provider_filter_v5_exc))
-# END_FLIXYFY_PROVIDER_FILTERS_V5_MIDDLEWARE_INSTALL_V1
 # FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_INSTALL_START
-# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_AUDIT_APPLY_V2
+# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_AUDIT_APPLY_V3
 # Provider-filtered list requests use existing domain availability_serving_v5 tables only.
 try:
     from app.provider_filter_v5_middleware import install_provider_filter_v5_middleware

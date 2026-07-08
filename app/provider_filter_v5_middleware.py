@@ -1,4 +1,4 @@
-# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_AUDIT_APPLY_V2
+# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_AUDIT_APPLY_V3
 # Provider-filtered list fallback for existing domain availability_serving_v5 tables.
 # DB policy: SELECT-only. No DDL. No table creation. No unified provider serving dependency.
 
@@ -49,7 +49,7 @@ BAD_CONTENT_NAME_PARTS = (
     "provider",
 )
 
-PROVIDER_ALIASES = {
+PROVIDER_CANONICAL_ALIASES = {
     "all": "",
     "all_providers": "",
     "all providers": "",
@@ -57,15 +57,17 @@ PROVIDER_ALIASES = {
     "youtube": "youtube",
     "yt": "youtube",
     "prime": "prime_video",
+    "prime video": "prime_video",
     "prime_video": "prime_video",
+    "amazon prime": "prime_video",
     "amazon_prime": "prime_video",
-    "amazon_prime_video": "amazon_prime_video",
-    "amazon video": "amazon_video",
-    "amazon_video": "amazon_video",
+    "amazon prime video": "prime_video",
+    "amazon_prime_video": "prime_video",
     "netflix": "netflix",
     "jio": "jiohotstar",
     "hotstar": "jiohotstar",
     "jiohotstar": "jiohotstar",
+    "disney hotstar": "jiohotstar",
     "disney_hotstar": "jiohotstar",
     "zee5": "zee5",
     "sony liv": "sonyliv",
@@ -76,7 +78,8 @@ PROVIDER_ALIASES = {
     "sun_nxt": "sun_nxt",
     "sunnxt": "sun_nxt",
     "apple tv": "apple_tv_store",
-    "apple_tv": "apple_tv",
+    "apple_tv": "apple_tv_store",
+    "apple tv store": "apple_tv_store",
     "apple_tv_store": "apple_tv_store",
     "google tv": "google_tv",
     "google_tv": "google_tv",
@@ -89,13 +92,41 @@ PROVIDER_ALIASES = {
     "shemaroome": "shemaroome",
 }
 
+PROVIDER_KEY_GROUPS = {
+    "youtube": ["youtube"],
+    "prime_video": ["prime_video", "amazon_prime_video", "amazon_prime_video_with_ads"],
+    "amazon_video": ["amazon_video"],
+    "netflix": ["netflix"],
+    "jiohotstar": ["jiohotstar", "hotstar"],
+    "zee5": ["zee5"],
+    "sonyliv": ["sonyliv", "sony_liv"],
+    "aha": ["aha"],
+    "sun_nxt": ["sun_nxt", "sunnxt"],
+    "apple_tv_store": ["apple_tv_store", "appletvstore", "apple_tv"],
+    "google_tv": ["google_tv"],
+    "google_play_movies": ["google_play_movies", "googleplay"],
+    "mx_player": ["mx_player", "mxplayer", "amazon_mx_player"],
+    "shemaroome": ["shemaroome", "shemaroo_me"],
+}
+
 
 def normalize_provider(value: Any) -> str:
     raw = str(value or "").strip().lower()
     raw = raw.replace("-", "_")
     raw = re.sub(r"\s+", " ", raw)
     compact = raw.replace(" ", "_")
-    return PROVIDER_ALIASES.get(raw) or PROVIDER_ALIASES.get(compact) or compact
+    return PROVIDER_CANONICAL_ALIASES.get(raw) or PROVIDER_CANONICAL_ALIASES.get(compact) or compact
+
+
+def provider_keys_for(provider: str) -> List[str]:
+    provider = normalize_provider(provider)
+    keys = PROVIDER_KEY_GROUPS.get(provider, [provider])
+    out: List[str] = []
+    for key in keys:
+        key = normalize_provider(key) or key
+        if key and key not in out:
+            out.append(key)
+    return out
 
 
 def normalize_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -252,7 +283,7 @@ def choose_content_table(objects: Sequence[Dict[str, str]], conn, kind: str, dom
         if "movie" in low:
             score += 3
         if "card" in low:
-            score += 1
+            score += 2
         if "detail" in low:
             score -= 1
         scored.append((score, name))
@@ -283,6 +314,13 @@ def order_expr(alias: str, cols: Sequence[str]) -> str:
     return ", ".join(parts) if parts else "1"
 
 
+def provider_condition_sql(kind: str, column_sql: str, provider: str) -> Tuple[str, List[Any]]:
+    keys = provider_keys_for(provider)
+    p = ph(kind)
+    placeholders = ", ".join([p] * len(keys))
+    return f"LOWER(COALESCE({column_sql}, '')) IN ({placeholders})", keys
+
+
 def build_items_from_content(conn, kind: str, domain: str, provider: str, page: int, limit: int, q: str = "") -> Dict[str, Any]:
     objects = fetch_all_objects(conn, kind)
     availability = DOMAIN_AVAILABILITY_TABLE[domain]
@@ -291,7 +329,7 @@ def build_items_from_content(conn, kind: str, domain: str, provider: str, page: 
 
     content = choose_content_table(objects, conn, kind, domain)
     if not content:
-        return build_items_from_availability(conn, kind, domain, provider, page, limit, q)
+        return build_items_from_availability(conn, kind, domain, provider, page, limit, q, reason="content_missing")
 
     mcols = fetch_columns(conn, kind, content)
     acols = fetch_columns(conn, kind, availability)
@@ -299,14 +337,15 @@ def build_items_from_content(conn, kind: str, domain: str, provider: str, page: 
     a_slug = first_col(acols, ("content_slug", "slug", "movie_slug", "series_slug"))
     a_provider = first_col(acols, ("provider_key", "normalized_provider_name", "provider_name", "provider_display_name"))
     if not (m_slug and a_slug and a_provider):
-        return build_items_from_availability(conn, kind, domain, provider, page, limit, q)
+        return build_items_from_availability(conn, kind, domain, provider, page, limit, q, reason="missing_join_columns")
 
     p = ph(kind)
+    provider_sql, provider_params = provider_condition_sql(kind, f"a.{qident(a_provider)}", provider)
     exists_parts = [
         f"a.{qident(a_slug)} = m.{qident(m_slug)}",
-        f"LOWER(COALESCE(a.{qident(a_provider)}, '')) = {p}",
+        provider_sql,
     ]
-    params: List[Any] = [provider]
+    params: List[Any] = list(provider_params)
     if "domain" in acols:
         exists_parts.append(f"LOWER(COALESCE(a.domain,'')) = {p}")
         params.append(domain)
@@ -353,6 +392,10 @@ def build_items_from_content(conn, kind: str, domain: str, provider: str, page: 
     cur = conn.cursor()
     cur.execute(f"SELECT COUNT(*) FROM {qident(content)} m WHERE {where_sql}", tuple(params))
     total = int(cur.fetchone()[0] or 0)
+    if total <= 0:
+        fallback = build_items_from_availability(conn, kind, domain, provider, page, limit, q, reason="zero_content_join")
+        fallback["attempted_content_table"] = content
+        return fallback
 
     sql = (
         f"SELECT {', '.join(select_cols)} "
@@ -373,7 +416,7 @@ def build_items_from_content(conn, kind: str, domain: str, provider: str, page: 
     }
 
 
-def build_items_from_availability(conn, kind: str, domain: str, provider: str, page: int, limit: int, q: str = "") -> Dict[str, Any]:
+def build_items_from_availability(conn, kind: str, domain: str, provider: str, page: int, limit: int, q: str = "", reason: str = "availability_only") -> Dict[str, Any]:
     objects = fetch_all_objects(conn, kind)
     availability = DOMAIN_AVAILABILITY_TABLE[domain]
     if not table_exists(objects, availability):
@@ -386,8 +429,9 @@ def build_items_from_availability(conn, kind: str, domain: str, provider: str, p
         return {"items": [], "total": 0, "source": "availability_missing_key_columns", "content_table": None}
 
     p = ph(kind)
-    where = [f"LOWER(COALESCE({qident(a_provider)}, '')) = {p}"]
-    params: List[Any] = [provider]
+    provider_sql, provider_params = provider_condition_sql(kind, qident(a_provider), provider)
+    where = [provider_sql]
+    params: List[Any] = list(provider_params)
     if "domain" in acols:
         where.append(f"LOWER(COALESCE(domain,'')) = {p}")
         params.append(domain)
@@ -403,6 +447,7 @@ def build_items_from_availability(conn, kind: str, domain: str, provider: str, p
     backdrop_col = first_col(acols, ("backdrop_url", "backdrop_path"))
     language_col = first_col(acols, ("primary_language", "language_name", "language"))
     lang_slug_col = first_col(acols, ("language_slug",))
+    url_col = first_col(acols, ("final_url", "watch_url", "url", "deep_link", "provider_url"))
 
     def min_expr(col: Optional[str], alias: str) -> str:
         if col:
@@ -419,6 +464,7 @@ def build_items_from_availability(conn, kind: str, domain: str, provider: str, p
         min_expr(backdrop_col, "backdrop_url"),
         min_expr(language_col, "primary_language"),
         min_expr(lang_slug_col, "language_slug"),
+        min_expr(url_col, "watch_url"),
         f"'{domain}' AS domain",
         f"'{provider}' AS ott_primary_key",
         f"'{provider_to_label(provider)}' AS ott_primary",
@@ -432,17 +478,21 @@ def build_items_from_availability(conn, kind: str, domain: str, provider: str, p
     ]
     where_sql = " AND ".join(where)
     offset = (page - 1) * limit
-    order_col = year_col or a_slug
     cur = conn.cursor()
     cur.execute(f"SELECT COUNT(DISTINCT {qident(a_slug)}) FROM {qident(availability)} WHERE {where_sql}", tuple(params))
     total = int(cur.fetchone()[0] or 0)
+
+    if year_col:
+        order_sql = f"ORDER BY MAX(COALESCE({qident(year_col)}, 0)) DESC"
+    else:
+        order_sql = f"ORDER BY {qident(a_slug)} ASC"
 
     sql = (
         f"SELECT {', '.join(select_cols)} "
         f"FROM {qident(availability)} "
         f"WHERE {where_sql} "
         f"GROUP BY {qident(a_slug)} "
-        f"ORDER BY MAX(COALESCE({qident(order_col)}, 0)) DESC "
+        f"{order_sql} "
         f"LIMIT {p} OFFSET {p}"
     )
     cur.execute(sql, tuple(params + [limit, offset]))
@@ -451,7 +501,7 @@ def build_items_from_availability(conn, kind: str, domain: str, provider: str, p
     return {
         "items": [normalize_item(row, domain, provider) for row in rows],
         "total": total,
-        "source": "availability_only_v5",
+        "source": f"{reason}_v5",
         "content_table": None,
         "availability_table": availability,
     }
@@ -473,13 +523,15 @@ def normalize_item(row: Dict[str, Any], domain: str, provider: str) -> Dict[str,
     item["ott_primary"] = provider_to_label(provider)
     item["ott_count"] = int(item.get("ott_count") or 1)
     item["has_ott"] = 1
-    item["availability"] = [
-        {
-            "provider_key": provider,
-            "provider_name": provider_to_label(provider),
-            "provider_display_name": provider_to_label(provider),
-        }
-    ]
+    provider_row = {
+        "provider_key": provider,
+        "provider_name": provider_to_label(provider),
+        "provider_display_name": provider_to_label(provider),
+    }
+    if item.get("watch_url"):
+        provider_row["url"] = item.get("watch_url")
+        provider_row["final_url"] = item.get("watch_url")
+    item["availability"] = [provider_row]
     item["watch_providers"] = item["availability"]
     if domain == "hollywood":
         item["movie_url"] = f"/hollywood/{slug}"
