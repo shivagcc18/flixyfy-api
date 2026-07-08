@@ -860,8 +860,17 @@ def build_filters(
         params.append(1 if is_free else 0)
 
     if provider:
-        where.append("LOWER(COALESCE(ott_primary_key, ott_primary, '')) LIKE LOWER(%s)")
-        params.append(f"%{provider.strip()}%")
+        provider_key = normalize_provider_key(provider)
+        if provider_key in {"youtube", "you_tube"}:
+            where.append(
+                "("
+                "LOWER(COALESCE(CAST(has_youtube AS TEXT), '')) IN ('1', 'true', 'yes', 'y') "
+                "OR LOWER(COALESCE(CAST(is_free AS TEXT), '')) IN ('1', 'true', 'yes', 'y')"
+                ")"
+            )
+        else:
+            where.append("LOWER(COALESCE(ott_primary_key, ott_primary, '')) LIKE LOWER(%s)")
+            params.append(f"%{provider.strip()}%")
 
     return ("WHERE " + " AND ".join(where)) if where else "", params
 
