@@ -544,7 +544,7 @@ def table_exists(table_name: str) -> bool:
 
     try:
         cur.execute(
-            """
+            f"""
             SELECT 1
             FROM information_schema.tables
             WHERE table_schema = 'public'
@@ -1119,8 +1119,93 @@ def normalize_availability(rows: List[Dict[str, Any]], domain: str):
     return out
 
 
+def is_bad_watch_url(url) -> bool:
+    value = str(url or "").strip().lower()
+    return not value or "themoviedb.org/" in value or "justwatch.com/" in value
+
+
+def has_direct_provider_url(rows: List[Dict[str, Any]]) -> bool:
+    for row in rows or []:
+        for key in ("deep_link", "provider_deep_link", "final_url", "watch_url", "url"):
+            if not is_bad_watch_url(row.get(key)):
+                return True
+    return False
+
+
+PROVIDER_LINK_TABLES = ("ott_availability_provider_links_v5", "ott_availability_provider_links_v2")
+
+
+def provider_links_availability(tmdb_id, domain: str) -> List[Dict[str, Any]]:
+    table_name = next((name for name in PROVIDER_LINK_TABLES if table_exists(name)), None)
+    if tmdb_id is None or not table_name:
+        return []
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT
+                provider_key,
+                provider_display_name,
+                provider_category,
+                provider_type,
+                region,
+                provider_deep_link,
+                provider_search_url,
+                provider_homepage_url,
+                tmdb_watch_url,
+                final_url,
+                final_url_source,
+                button_label,
+                priority
+            FROM public.{qident(table_name)}
+            WHERE CAST(tmdb_id AS TEXT) = CAST(%s AS TEXT)
+            ORDER BY priority NULLS LAST, provider_display_name
+            LIMIT 80
+            """,
+            (tmdb_id,),
+        )
+
+        rows = []
+        for row in cur.fetchall():
+            direct_url = (
+                row.get("provider_deep_link")
+                or (None if is_bad_watch_url(row.get("final_url")) else row.get("final_url"))
+                or row.get("provider_search_url")
+                or row.get("provider_homepage_url")
+            )
+            provider_name = row.get("provider_display_name")
+            rows.append(
+                {
+                    "domain": domain,
+                    "provider_key": row.get("provider_key") or normalize_provider_key(provider_name),
+                    "provider_display_name": provider_name,
+                    "provider_category": row.get("provider_category"),
+                    "provider_type": row.get("provider_type") or row.get("provider_category"),
+                    "region": row.get("region"),
+                    "deep_link": row.get("provider_deep_link"),
+                    "provider_deep_link": row.get("provider_deep_link"),
+                    "provider_search_url": row.get("provider_search_url"),
+                    "provider_homepage_url": row.get("provider_homepage_url"),
+                    "tmdb_watch_url": row.get("tmdb_watch_url"),
+                    "final_url": direct_url,
+                    "final_url_source": row.get("final_url_source"),
+                    "button_label": row.get("button_label") or (f"Watch on {provider_name}" if provider_name else "Watch"),
+                    "priority": row.get("priority"),
+                    "source_table": table_name,
+                }
+            )
+
+        return [row for row in rows if row.get("provider_key") or row.get("provider_display_name")]
+    finally:
+        conn.close()
+
+
 def domain_detail(row: Dict[str, Any], domain: str):
     data = domain_card(row, domain)
+    ott_summary = None
 
     raw_availability = availability_rows(
         domain=domain,
@@ -1132,6 +1217,20 @@ def domain_detail(row: Dict[str, Any], domain: str):
     )
 
     availability = normalize_availability(raw_availability, domain)
+    provider_link_rows = provider_links_availability(row.get("tmdb_id"), domain)
+
+    if provider_link_rows and not has_direct_provider_url(availability):
+        availability = provider_link_rows
+
+    # Domain detail pages can miss provider rows when the domain-specific
+    # availability table lags the normalized v2 OTT serving table.
+    if not availability and row.get("tmdb_id"):
+        ott_summary = modern_ott_v2_summaries([row.get("tmdb_id")]).get(str(row.get("tmdb_id")))
+        if ott_summary:
+            availability = ott_summary.get("watch_providers") or []
+
+    if provider_link_rows and not has_direct_provider_url(availability):
+        availability = provider_link_rows
 
     youtube_full_movies = []
 
@@ -1188,6 +1287,20 @@ def domain_detail(row: Dict[str, Any], domain: str):
             "raw": row,
         }
     )
+
+    if ott_summary:
+        data.update(
+            {
+                "ott_count": ott_summary.get("ott_count"),
+                "ott_primary": ott_summary.get("ott_primary"),
+                "ott_primary_key": ott_summary.get("ott_primary_key"),
+                "has_ott": ott_summary.get("has_ott"),
+                "has_free_ott": ott_summary.get("has_free_ott"),
+                "has_subscription_ott": ott_summary.get("has_subscription_ott"),
+                "has_rent_ott": ott_summary.get("has_rent_ott"),
+                "has_buy_ott": ott_summary.get("has_buy_ott"),
+            }
+        )
 
     return data
 

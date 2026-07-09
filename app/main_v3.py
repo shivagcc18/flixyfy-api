@@ -266,12 +266,23 @@ def normalize_ott_v2_row(row):
 
 
 def load_ott_provider_links_fallback(tmdb_id):
+    table_name = next(
+        (
+            name
+            for name in ["ott_availability_provider_links_v5", "ott_availability_provider_links_v2"]
+            if table_exists(name)
+        ),
+        None,
+    )
+    if not table_name:
+        return []
+
     conn = get_conn()
     cur = conn.cursor()
 
     try:
         cur.execute(
-            """
+            f"""
             SELECT
                 provider_key,
                 provider_display_name,
@@ -286,7 +297,7 @@ def load_ott_provider_links_fallback(tmdb_id):
                 final_url_source,
                 button_label,
                 priority
-            FROM ott_availability_provider_links_v2
+            FROM {quote_ident(table_name)}
             WHERE tmdb_id = %s
             ORDER BY priority NULLS LAST, provider_display_name
             """,
@@ -309,15 +320,29 @@ def load_ott_provider_links_fallback(tmdb_id):
                 "homepage_url": r.get("provider_homepage_url"),
                 "provider_homepage_url": r.get("provider_homepage_url"),
                 "tmdb_watch_url": r.get("tmdb_watch_url"),
-                "final_url": r.get("final_url"),
+                "final_url": r.get("provider_deep_link") or r.get("provider_search_url") or r.get("provider_homepage_url") or r.get("final_url"),
                 "final_url_source": r.get("final_url_source"),
                 "button_label": r.get("button_label") or r.get("provider_display_name"),
                 "priority": r.get("priority"),
+                "source_table": table_name,
             }
             for r in rows
         ]
     finally:
         conn.close()
+
+
+def _flixyfy_compat_is_bad_watch_url(url):
+    value = str(url or "").strip().lower()
+    return not value or "themoviedb.org/" in value or "justwatch.com/" in value
+
+
+def _flixyfy_compat_has_direct_provider_url(items):
+    for item in items or []:
+        for key in ("deep_link", "provider_deep_link", "final_url", "watch_url", "url"):
+            if not _flixyfy_compat_is_bad_watch_url(item.get(key)):
+                return True
+    return False
 
 
 
@@ -2423,8 +2448,25 @@ def load_ott_links(tmdb_id=None, slug=None, **kwargs):
             seen.add(key)
             links.append(item)
 
-        if links:
+        if _flixyfy_compat_has_direct_provider_url(links):
             return links
+
+    links = []
+    seen = set()
+
+    for item in load_ott_provider_links_fallback(tmdb_id):
+        provider_key = str(item.get("provider_key") or item.get("provider_name") or "").lower().strip()
+        url = str(item.get("final_url") or item.get("deep_link") or item.get("watch_url") or item.get("url") or "").strip()
+        key = (provider_key, url)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        links.append(item)
+
+    if links:
+        return links
 
     for table_name in ["ott_availability_normalized_v2", "ott_availability_normalized_v1", "current_availability_serving_v5", "global_availability_serving_v5"]:
         for item in _flixyfy_compat_fetch_availability(table_name, tmdb_id=tmdb_id, slug=slug):
@@ -2442,5 +2484,3 @@ def load_ott_links(tmdb_id=None, slug=None, **kwargs):
 
 print("FLIXYFY_MOVIE_DETAIL_PROVIDER_FALLBACK_PATCH_V3_LOADED")
 # FLIXYFY_MOVIE_DETAIL_PROVIDER_FALLBACK_PATCH_V3_END
-
-
