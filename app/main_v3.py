@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from app.provider_filter_v5_middleware import ProviderFilterV5Middleware
 
 load_dotenv()
 
@@ -31,6 +32,12 @@ app = FastAPI(
     version="3.0.0",
     description="Production API using Neon PostgreSQL",
 )
+
+
+app.add_middleware(ProviderFilterV5Middleware)
+from app.provider_filter_v5_middleware import install_provider_filter_v5_middleware
+
+install_provider_filter_v5_middleware(app)
 
 app.add_middleware(
     CORSMiddleware,

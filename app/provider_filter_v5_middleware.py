@@ -1,221 +1,146 @@
-# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_AUDIT_APPLY_V3
-# Provider-filtered list fallback for existing domain availability_serving_v5 tables.
-# DB policy: SELECT-only. No DDL. No table creation. No unified provider serving dependency.
-
+# FLIXYFY_UI_FILTERS_FAST_RESPONSE_FIX_V1
+# Fast v5 provider-filter middleware. No DB mutation. No DDL. SELECT-only.
 from __future__ import annotations
 
-import math
+import hashlib
 import os
-import re
-import sqlite3
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-DOMAIN_AVAILABILITY_TABLE = {
-    "current": "current_availability_serving_v5",
-    "hollywood": "hollywood_availability_serving_v5",
-    "historical": "historical_availability_serving_v5",
-    "webseries": "webseries_availability_serving_v5",
-}
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DOMAIN_CONTENT_HINTS = {
-    "current": ("current", "movie", "media"),
-    "hollywood": ("hollywood", "movie"),
-    "historical": ("historical", "movie"),
-    "webseries": ("webseries", "series", "show"),
-}
-
-BAD_CONTENT_NAME_PARTS = (
-    "availability",
-    "youtube",
-    "search",
-    "person",
-    "people",
-    "credit",
-    "registry",
-    "manifest",
-    "backup",
-    "__backup",
-    "__stg",
-    "quarantine",
-    "audit",
-    "run",
-    "log",
-    "source",
-    "provider",
-)
-
-PROVIDER_CANONICAL_ALIASES = {
-    "all": "",
-    "all_providers": "",
-    "all providers": "",
-    "": "",
-    "youtube": "youtube",
-    "yt": "youtube",
-    "prime": "prime_video",
-    "prime video": "prime_video",
-    "prime_video": "prime_video",
-    "amazon prime": "prime_video",
-    "amazon_prime": "prime_video",
-    "amazon prime video": "prime_video",
-    "amazon_prime_video": "prime_video",
+PROVIDER_ALIASES = {
+    "": "all", "all": "all", "all_provider": "all", "all providers": "all",
+    "youtube": "youtube", "yt": "youtube", "you tube": "youtube",
     "netflix": "netflix",
-    "jio": "jiohotstar",
-    "hotstar": "jiohotstar",
-    "jiohotstar": "jiohotstar",
-    "disney hotstar": "jiohotstar",
-    "disney_hotstar": "jiohotstar",
-    "zee5": "zee5",
-    "sony liv": "sonyliv",
-    "sony_liv": "sonyliv",
-    "sonyliv": "sonyliv",
-    "aha": "aha",
-    "sun nxt": "sun_nxt",
-    "sun_nxt": "sun_nxt",
-    "sunnxt": "sun_nxt",
-    "apple tv": "apple_tv_store",
-    "apple_tv": "apple_tv_store",
-    "apple tv store": "apple_tv_store",
-    "apple_tv_store": "apple_tv_store",
-    "google tv": "google_tv",
-    "google_tv": "google_tv",
-    "google play": "google_play_movies",
-    "google_play_movies": "google_play_movies",
-    "mx player": "mx_player",
-    "mx_player": "mx_player",
-    "shemaroo": "shemaroome",
-    "shemaroo me": "shemaroome",
-    "shemaroome": "shemaroome",
+    "prime": "prime_video", "prime video": "prime_video", "primevideo": "prime_video", "prime_video": "prime_video",
+    "amazon prime": "prime_video", "amazon prime video": "prime_video", "amazon_prime_video": "prime_video",
+    "amazon_prime_video_with_ads": "prime_video",
+    "jiohotstar": "jiohotstar", "jio hotstar": "jiohotstar", "hotstar": "jiohotstar", "disney hotstar": "jiohotstar",
+    "zee5": "zee5", "zee 5": "zee5", "sonyliv": "sonyliv", "sony liv": "sonyliv", "aha": "aha",
+    "sunnxt": "sun_nxt", "sun nxt": "sun_nxt", "sun_nxt": "sun_nxt",
+    "etvwin": "etv_win", "etv win": "etv_win", "etv_win": "etv_win",
+    "mxplayer": "mx_player", "mx player": "mx_player", "mx_player": "mx_player",
+    "shemaroome": "shemaroome", "shemaroo me": "shemaroome", "eros now": "eros_now", "eros_now": "eros_now",
+    "apple tv": "apple_tv_store", "apple_tv": "apple_tv_store", "apple tv store": "apple_tv_store", "apple_tv_store": "apple_tv_store",
+    "amazon video": "amazon_video", "amazon_video": "amazon_video", "google tv": "google_tv", "google_tv": "google_tv",
+    "disney+": "disney_plus", "disney_plus": "disney_plus", "hulu": "hulu", "max": "max", "viki": "viki",
+    "rakuten viki": "viki", "kocowa": "kocowa", "tving": "tving", "wavve": "wavve", "watcha": "watcha",
+    "coupang play": "coupang_play", "coupang_play": "coupang_play", "tubi": "tubi_tv", "tubi tv": "tubi_tv", "tubi_tv": "tubi_tv",
 }
 
-PROVIDER_KEY_GROUPS = {
-    "youtube": ["youtube"],
-    "prime_video": ["prime_video", "amazon_prime_video", "amazon_prime_video_with_ads"],
-    "amazon_video": ["amazon_video"],
-    "netflix": ["netflix"],
-    "jiohotstar": ["jiohotstar", "hotstar"],
-    "zee5": ["zee5"],
-    "sonyliv": ["sonyliv", "sony_liv"],
-    "aha": ["aha"],
-    "sun_nxt": ["sun_nxt", "sunnxt"],
-    "apple_tv_store": ["apple_tv_store", "appletvstore", "apple_tv"],
-    "google_tv": ["google_tv"],
-    "google_play_movies": ["google_play_movies", "googleplay"],
-    "mx_player": ["mx_player", "mxplayer", "amazon_mx_player"],
-    "shemaroome": ["shemaroome", "shemaroo_me"],
+PROVIDER_LABELS = {
+    "youtube": "YouTube", "netflix": "Netflix", "prime_video": "Prime Video", "jiohotstar": "JioHotstar",
+    "zee5": "ZEE5", "sonyliv": "SonyLIV", "aha": "Aha", "sun_nxt": "Sun NXT", "etv_win": "ETV Win",
+    "mx_player": "MX Player", "apple_tv_store": "Apple TV", "amazon_video": "Amazon Video", "google_tv": "Google TV",
+    "disney_plus": "Disney+", "hulu": "Hulu", "max": "Max", "viki": "Rakuten Viki", "kocowa": "Kocowa",
+    "tving": "TVING", "wavve": "Wavve", "watcha": "Watcha", "coupang_play": "Coupang Play", "tubi_tv": "Tubi",
 }
 
+DOMAIN_CONFIG = {
+    "/api/v3/movies": {
+        "domain": "current",
+        "content": ["current_movie_serving_v5", "media_serving_v8_expanded", "media_serving_v7_final"],
+        "availability": ["current_availability_serving_v5", "ott_availability_normalized_v2", "ott_availability_provider_links_v2"],
+        "prefix": "/movie/",
+    },
+    "/api/v3/hollywood": {
+        "domain": "hollywood",
+        "content": ["hollywood_movie_serving_v5", "hollywood_serving_v3", "hollywood_card_serving_v3"],
+        "availability": ["hollywood_availability_serving_v5", "hollywood_availability_v3", "hollywood_availability_serving_v1"],
+        "prefix": "/hollywood/",
+    },
+    "/api/v3/historical": {
+        "domain": "historical",
+        "content": ["historical_movie_serving_v5", "historical_serving_v1", "historical_serving_v2", "historical_card_serving_v1"],
+        "availability": ["historical_availability_serving_v5", "historical_availability_v2"],
+        "prefix": "/historical/",
+    },
+    "/api/v3/webseries": {
+        "domain": "webseries",
+        "content": ["webseries_series_serving_v5", "webseries_serving_v1", "webseries_card_serving_v1"],
+        "availability": ["webseries_availability_serving_v5", "webseries_availability_serving_v1", "webseries_availability_v1"],
+        "prefix": "/webseries/",
+    },
+}
 
-def normalize_provider(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    raw = raw.replace("-", "_")
-    raw = re.sub(r"\s+", " ", raw)
-    compact = raw.replace(" ", "_")
-    return PROVIDER_CANONICAL_ALIASES.get(raw) or PROVIDER_CANONICAL_ALIASES.get(compact) or compact
-
-
-def provider_keys_for(provider: str) -> List[str]:
-    provider = normalize_provider(provider)
-    keys = PROVIDER_KEY_GROUPS.get(provider, [provider])
-    out: List[str] = []
-    for key in keys:
-        key = normalize_provider(key) or key
-        if key and key not in out:
-            out.append(key)
-    return out
-
-
-def normalize_int(value: Any, default: int, minimum: int, maximum: int) -> int:
-    try:
-        n = int(value)
-    except Exception:
-        n = default
-    return max(minimum, min(maximum, n))
-
-
-def get_db_kind_and_connect():
-    database_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or ""
-    sqlite_path = os.environ.get("FLIXYFY_SQLITE_DB") or os.environ.get("SQLITE_DB_PATH") or ""
-
-    if database_url.startswith("postgres"):
-        try:
-            import psycopg2  # type: ignore
-            return "postgres", psycopg2.connect(database_url)
-        except Exception:
-            try:
-                import psycopg  # type: ignore
-                return "psycopg3", psycopg.connect(database_url)
-            except Exception as exc:
-                raise RuntimeError(f"postgres_connect_failed: {exc}") from exc
-
-    if sqlite_path:
-        return "sqlite", sqlite3.connect(sqlite_path)
-
-    local_default = os.path.join(os.getcwd(), "db", "flixyfy.db")
-    if os.path.exists(local_default):
-        return "sqlite", sqlite3.connect(local_default)
-
-    raise RuntimeError("no_database_url")
-
-
-def ph(kind: str) -> str:
-    return "?" if kind == "sqlite" else "%s"
+_SCHEMA_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_RESPONSE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+SCHEMA_TTL = 300
+RESPONSE_TTL = 60
 
 
 def qident(name: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_]", "", str(name or ""))
-    if not safe:
-        raise ValueError("unsafe_identifier")
-    return safe
+    return '"' + str(name).replace('"', '""') + '"'
 
 
-def fetch_all_objects(conn, kind: str) -> List[Dict[str, str]]:
-    cur = conn.cursor()
-    if kind == "sqlite":
-        rows = cur.execute(
-            "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name"
-        ).fetchall()
-        return [{"name": r[0], "type": r[1]} for r in rows]
-
-    cur.execute(
-        """
-        SELECT table_name, table_type
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        ORDER BY table_name
-        """
-    )
-    return [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
+def normalize_provider(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("+", " plus ").replace("_", " ").replace("-", " ")
+    raw = " ".join(raw.split())
+    if raw in PROVIDER_ALIASES:
+        return PROVIDER_ALIASES[raw]
+    underscored = raw.replace(" ", "_")
+    return PROVIDER_ALIASES.get(underscored, underscored or "all")
 
 
-def fetch_columns(conn, kind: str, table: str) -> List[str]:
-    cur = conn.cursor()
-    table = qident(table)
-    if kind == "sqlite":
-        rows = cur.execute(f"PRAGMA table_info({table})").fetchall()
-        return [r[1] for r in rows]
+def provider_aliases(provider: str) -> List[str]:
+    provider = normalize_provider(provider)
+    aliases = {provider}
+    for raw, canonical in PROVIDER_ALIASES.items():
+        if canonical == provider and raw:
+            aliases.add(raw)
+            aliases.add(raw.replace(" ", "_"))
+            aliases.add(raw.replace("_", " "))
+    return sorted(aliases)
 
+
+def conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL missing")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def table_columns(cur, table: str) -> List[str]:
+    now = time.time()
+    key = f"cols:{table}"
+    cached = _SCHEMA_CACHE.get(key)
+    if cached and cached[0] > now:
+        return list(cached[1].get("columns") or [])
     cur.execute(
         """
         SELECT column_name
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = %s
+        WHERE table_schema='public' AND table_name=%s
         ORDER BY ordinal_position
         """,
-        (table,),
+        [table],
     )
-    return [r[0] for r in cur.fetchall()]
+    cols = [r["column_name"] for r in cur.fetchall()]
+    _SCHEMA_CACHE[key] = (now + SCHEMA_TTL, {"columns": cols})
+    return cols
 
 
-def table_exists(objects: Sequence[Dict[str, str]], table: str) -> bool:
-    return any(obj["name"] == table for obj in objects)
+def first_existing_table(cur, names: Iterable[str]) -> Optional[Tuple[str, List[str]]]:
+    for table in names:
+        cols = table_columns(cur, table)
+        if cols:
+            return table, cols
+    return None
 
 
-def first_col(cols: Iterable[str], candidates: Sequence[str]) -> Optional[str]:
+def pick(cols: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
     s = set(cols)
     for c in candidates:
         if c in s:
@@ -223,452 +148,212 @@ def first_col(cols: Iterable[str], candidates: Sequence[str]) -> Optional[str]:
     return None
 
 
-def choose_content_table(objects: Sequence[Dict[str, str]], conn, kind: str, domain: str) -> Optional[str]:
-    explicit = {
-        "current": [
-            "current_movie_serving_v5",
-            "current_movies_serving_v5",
-            "current_serving_v5",
-            "current_movie_serving_v5_backend_compat",
-            "media_serving_v5",
-        ],
-        "hollywood": [
-            "hollywood_movie_serving_v5",
-            "hollywood_movies_serving_v5",
-            "hollywood_serving_v5",
-            "hollywood_card_serving_v5",
-            "hollywood_detail_serving_v5",
-        ],
-        "historical": [
-            "historical_movie_serving_v5",
-            "historical_movies_serving_v5",
-            "historical_serving_v5",
-            "historical_card_serving_v5",
-            "historical_detail_serving_v5",
-        ],
-        "webseries": [
-            "webseries_series_serving_v5",
-            "webseries_serving_v5",
-            "webseries_show_serving_v5",
-            "webseries_card_serving_v5",
-        ],
-    }.get(domain, [])
-
-    names = [obj["name"] for obj in objects]
-    for name in explicit:
-        if name in names:
-            cols = set(fetch_columns(conn, kind, name))
-            if cols.intersection({"slug", "content_slug", "movie_slug", "series_slug"}):
-                return name
-
-    scored: List[Tuple[int, str]] = []
-    hints = DOMAIN_CONTENT_HINTS.get(domain, (domain,))
-    for name in names:
-        low = name.lower()
-        if "serving_v5" not in low:
-            continue
-        if any(part in low for part in BAD_CONTENT_NAME_PARTS):
-            continue
-        if domain != "current" and domain not in low:
-            continue
-        cols = set(fetch_columns(conn, kind, name))
-        if not cols.intersection({"slug", "content_slug", "movie_slug", "series_slug"}):
-            continue
-        if not cols.intersection({"title", "name", "original_title"}):
-            continue
-        score = 0
-        for hint in hints:
-            if hint in low:
-                score += 5
-        if "movie" in low:
-            score += 3
-        if "card" in low:
-            score += 2
-        if "detail" in low:
-            score -= 1
-        scored.append((score, name))
-
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return scored[0][1] if scored else None
-
-
-def select_expr(alias: str, cols: Sequence[str], candidates: Sequence[str], out: str, default_sql: str = "NULL") -> str:
-    col = first_col(cols, candidates)
-    if col:
-        return f"{alias}.{qident(col)} AS {qident(out)}"
-    return f"{default_sql} AS {qident(out)}"
-
-
-def order_expr(alias: str, cols: Sequence[str]) -> str:
-    parts = []
-    if "popularity" in cols:
-        parts.append(f"COALESCE({alias}.popularity, 0) DESC")
-    if "quality_score" in cols:
-        parts.append(f"COALESCE({alias}.quality_score, 0) DESC")
-    if "vote_count" in cols:
-        parts.append(f"COALESCE({alias}.vote_count, 0) DESC")
-    if "release_year" in cols:
-        parts.append(f"COALESCE({alias}.release_year, 0) DESC")
-    elif "year" in cols:
-        parts.append(f"COALESCE({alias}.year, 0) DESC")
-    return ", ".join(parts) if parts else "1"
-
-
-def provider_condition_sql(kind: str, column_sql: str, provider: str) -> Tuple[str, List[Any]]:
-    keys = provider_keys_for(provider)
-    p = ph(kind)
-    placeholders = ", ".join([p] * len(keys))
-    return f"LOWER(COALESCE({column_sql}, '')) IN ({placeholders})", keys
-
-
-def build_items_from_content(conn, kind: str, domain: str, provider: str, page: int, limit: int, q: str = "") -> Dict[str, Any]:
-    objects = fetch_all_objects(conn, kind)
-    availability = DOMAIN_AVAILABILITY_TABLE[domain]
-    if not table_exists(objects, availability):
-        return {"items": [], "total": 0, "source": "availability_missing", "content_table": None}
-
-    content = choose_content_table(objects, conn, kind, domain)
-    if not content:
-        return build_items_from_availability(conn, kind, domain, provider, page, limit, q, reason="content_missing")
-
-    mcols = fetch_columns(conn, kind, content)
-    acols = fetch_columns(conn, kind, availability)
-    m_slug = first_col(mcols, ("slug", "content_slug", "movie_slug", "series_slug"))
-    a_slug = first_col(acols, ("content_slug", "slug", "movie_slug", "series_slug"))
-    a_provider = first_col(acols, ("provider_key", "normalized_provider_name", "provider_name", "provider_display_name"))
-    if not (m_slug and a_slug and a_provider):
-        return build_items_from_availability(conn, kind, domain, provider, page, limit, q, reason="missing_join_columns")
-
-    p = ph(kind)
-    provider_sql, provider_params = provider_condition_sql(kind, f"a.{qident(a_provider)}", provider)
-    exists_parts = [
-        f"a.{qident(a_slug)} = m.{qident(m_slug)}",
-        provider_sql,
+def build_join_condition(m_cols: List[str], a_cols: List[str]) -> str:
+    pairs = [
+        ("slug", "slug"), ("content_slug", "content_slug"), ("movie_slug", "movie_slug"), ("series_slug", "series_slug"),
+        ("slug", "content_slug"), ("slug", "movie_slug"), ("slug", "series_slug"),
+        ("tmdb_id", "tmdb_id"), ("imdb_id", "imdb_id"), ("id", "content_id"), ("content_id", "content_id"),
     ]
-    params: List[Any] = list(provider_params)
-    if "domain" in acols:
-        exists_parts.append(f"LOWER(COALESCE(a.domain,'')) = {p}")
-        params.append(domain)
-
-    where = [
-        f"EXISTS (SELECT 1 FROM {qident(availability)} a WHERE {' AND '.join(exists_parts)})"
-    ]
-    if q:
-        text_cols = [c for c in ("title", "original_title", "name", "slug") if c in mcols]
-        if text_cols:
-            where.append("(" + " OR ".join([f"LOWER(COALESCE(m.{qident(c)}, '')) LIKE {p}" for c in text_cols]) + ")")
-            params.extend([f"%{q.lower()}%"] * len(text_cols))
-
-    select_cols = [
-        select_expr("m", mcols, ("id",), "id", "NULL"),
-        select_expr("m", mcols, (m_slug,), "slug", "NULL"),
-        select_expr("m", mcols, ("title", "name", "original_title"), "title", "NULL"),
-        select_expr("m", mcols, ("original_title", "title", "name"), "original_title", "NULL"),
-        select_expr("m", mcols, ("release_year", "year"), "release_year", "NULL"),
-        select_expr("m", mcols, ("year", "release_year"), "year", "NULL"),
-        select_expr("m", mcols, ("poster_url", "poster_path", "poster"), "poster_url", "NULL"),
-        select_expr("m", mcols, ("backdrop_url", "backdrop_path"), "backdrop_url", "NULL"),
-        select_expr("m", mcols, ("primary_language", "language_name", "language"), "primary_language", "NULL"),
-        select_expr("m", mcols, ("language_slug",), "language_slug", "NULL"),
-        select_expr("m", mcols, ("rating", "vote_average"), "rating", "NULL"),
-        select_expr("m", mcols, ("popularity",), "popularity", "NULL"),
-        select_expr("m", mcols, ("vote_count",), "vote_count", "NULL"),
-        select_expr("m", mcols, ("tmdb_id",), "tmdb_id", "NULL"),
-        select_expr("m", mcols, ("imdb_id",), "imdb_id", "NULL"),
-        f"'{domain}' AS domain",
-        f"'{provider}' AS ott_primary_key",
-        f"'{provider_to_label(provider)}' AS ott_primary",
-        "1 AS ott_count",
-        "1 AS has_ott",
-        "0 AS has_free_ott",
-        "0 AS has_subscription_ott",
-        "0 AS has_buy_ott",
-        "0 AS has_rent_ott",
-        "0 AS is_free",
-    ]
-
-    where_sql = " AND ".join(where)
-    offset = (page - 1) * limit
-    cur = conn.cursor()
-    cur.execute(f"SELECT COUNT(*) FROM {qident(content)} m WHERE {where_sql}", tuple(params))
-    total = int(cur.fetchone()[0] or 0)
-    if total <= 0:
-        fallback = build_items_from_availability(conn, kind, domain, provider, page, limit, q, reason="zero_content_join")
-        fallback["attempted_content_table"] = content
-        return fallback
-
-    sql = (
-        f"SELECT {', '.join(select_cols)} "
-        f"FROM {qident(content)} m "
-        f"WHERE {where_sql} "
-        f"ORDER BY {order_expr('m', mcols)} "
-        f"LIMIT {p} OFFSET {p}"
-    )
-    cur.execute(sql, tuple(params + [limit, offset]))
-    cols = [d[0] for d in cur.description]
-    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-    return {
-        "items": [normalize_item(row, domain, provider) for row in rows],
-        "total": total,
-        "source": "content_exists_v5",
-        "content_table": content,
-        "availability_table": availability,
-    }
+    for mc, ac in pairs:
+        if mc in m_cols and ac in a_cols:
+            return f"CAST(a.{qident(ac)} AS TEXT)=CAST(m.{qident(mc)} AS TEXT)"
+    m_title = pick(m_cols, ["title", "name", "series_title", "original_title"])
+    a_title = pick(a_cols, ["title", "name", "content_title", "movie_title", "series_title"])
+    m_year = pick(m_cols, ["release_year", "year", "start_year"])
+    a_year = pick(a_cols, ["release_year", "year", "content_year", "movie_year", "start_year"])
+    if m_title and a_title and m_year and a_year:
+        return (
+            f"LOWER(TRIM(CAST(a.{qident(a_title)} AS TEXT)))=LOWER(TRIM(CAST(m.{qident(m_title)} AS TEXT))) "
+            f"AND CAST(a.{qident(a_year)} AS TEXT)=CAST(m.{qident(m_year)} AS TEXT)"
+        )
+    if m_title and a_title:
+        return f"LOWER(TRIM(CAST(a.{qident(a_title)} AS TEXT)))=LOWER(TRIM(CAST(m.{qident(m_title)} AS TEXT)))"
+    return "1=0"
 
 
-def build_items_from_availability(conn, kind: str, domain: str, provider: str, page: int, limit: int, q: str = "", reason: str = "availability_only") -> Dict[str, Any]:
-    objects = fetch_all_objects(conn, kind)
-    availability = DOMAIN_AVAILABILITY_TABLE[domain]
-    if not table_exists(objects, availability):
-        return {"items": [], "total": 0, "source": "availability_missing", "content_table": None}
+def provider_condition(a_cols: List[str], provider: str, params: List[Any]) -> str:
+    provider = normalize_provider(provider)
+    if provider in ("", "all"):
+        return "1=1"
+    aliases = provider_aliases(provider)
+    candidate_cols = ["provider_key", "provider", "provider_name", "provider_display_name", "ott_primary_key", "ott_primary", "source", "source_name"]
+    clauses = []
+    for col in candidate_cols:
+        if col in a_cols:
+            clauses.append(f"LOWER(COALESCE(CAST(a.{qident(col)} AS TEXT),'')) = ANY(%s)")
+            params.append(aliases)
+    if provider == "youtube":
+        for col in ["final_url", "watch_url", "youtube_url", "video_url", "url"]:
+            if col in a_cols:
+                clauses.append(f"LOWER(COALESCE(CAST(a.{qident(col)} AS TEXT),'')) LIKE %s")
+                params.append("%youtube%")
+    return "(" + " OR ".join(clauses) + ")" if clauses else "1=0"
 
-    acols = fetch_columns(conn, kind, availability)
-    a_slug = first_col(acols, ("content_slug", "slug", "movie_slug", "series_slug"))
-    a_provider = first_col(acols, ("provider_key", "normalized_provider_name", "provider_name", "provider_display_name"))
-    if not (a_slug and a_provider):
-        return {"items": [], "total": 0, "source": "availability_missing_key_columns", "content_table": None}
 
-    p = ph(kind)
-    provider_sql, provider_params = provider_condition_sql(kind, qident(a_provider), provider)
-    where = [provider_sql]
-    params: List[Any] = list(provider_params)
-    if "domain" in acols:
-        where.append(f"LOWER(COALESCE(domain,'')) = {p}")
-        params.append(domain)
-    if q:
-        text_cols = [c for c in ("title", "content_title", "movie_title", "provider_name", "provider_display_name", a_slug) if c in acols]
-        if text_cols:
-            where.append("(" + " OR ".join([f"LOWER(COALESCE({qident(c)}, '')) LIKE {p}" for c in text_cols]) + ")")
-            params.extend([f"%{q.lower()}%"] * len(text_cols))
+def availability_condition(a_cols: List[str], availability: str, params: List[Any]) -> str:
+    av = str(availability or "").strip().lower()
+    if av in ("", "all"):
+        return "1=1"
+    if av in ("youtube", "free"):
+        return provider_condition(a_cols, "youtube", params)
+    if av in ("ott", "available", "streaming"):
+        provider_cols = [c for c in ["provider_key", "provider", "provider_name", "provider_display_name"] if c in a_cols]
+        if provider_cols:
+            return "(" + " OR ".join([f"NULLIF(TRIM(CAST(a.{qident(c)} AS TEXT)),'') IS NOT NULL" for c in provider_cols]) + ")"
+    return "1=1"
 
-    title_col = first_col(acols, ("title", "content_title", "movie_title", "name", "provider_title"))
-    year_col = first_col(acols, ("release_year", "year"))
-    poster_col = first_col(acols, ("poster_url", "poster_path", "poster"))
-    backdrop_col = first_col(acols, ("backdrop_url", "backdrop_path"))
-    language_col = first_col(acols, ("primary_language", "language_name", "language"))
-    lang_slug_col = first_col(acols, ("language_slug",))
-    url_col = first_col(acols, ("final_url", "watch_url", "url", "deep_link", "provider_url"))
 
-    def min_expr(col: Optional[str], alias: str) -> str:
+def content_filters(m_cols: List[str], qp: Any, params: List[Any]) -> str:
+    clauses = []
+    query = str(qp.get("q", "") or "").strip()
+    if query:
+        title_cols = [c for c in ["title", "original_title", "name", "series_title"] if c in m_cols]
+        if title_cols:
+            clauses.append("(" + " OR ".join([f"m.{qident(c)} ILIKE %s" for c in title_cols]) + ")")
+            params.extend([f"%{query}%"] * len(title_cols))
+    year = str(qp.get("year", "") or "").strip()
+    if year:
+        col = pick(m_cols, ["release_year", "year", "start_year"])
         if col:
-            return f"MIN({qident(col)}) AS {qident(alias)}"
-        return f"NULL AS {qident(alias)}"
+            clauses.append(f"CAST(m.{qident(col)} AS TEXT)=%s")
+            params.append(year)
+    lang = str(qp.get("language", "") or "").strip()
+    if lang:
+        lang_norm = lang.lower().replace("_", "-")
+        lang_cols = [c for c in ["language_slug", "primary_language_slug", "primary_language", "language"] if c in m_cols]
+        if lang_cols:
+            clauses.append("(" + " OR ".join([f"LOWER(REPLACE(CAST(m.{qident(c)} AS TEXT),'_','-'))=%s" for c in lang_cols]) + ")")
+            params.extend([lang_norm] * len(lang_cols))
+    return " AND ".join(clauses) if clauses else "1=1"
 
-    select_cols = [
-        f"{qident(a_slug)} AS slug",
-        min_expr(title_col, "title"),
-        min_expr(title_col, "original_title"),
-        min_expr(year_col, "release_year"),
-        min_expr(year_col, "year"),
-        min_expr(poster_col, "poster_url"),
-        min_expr(backdrop_col, "backdrop_url"),
-        min_expr(language_col, "primary_language"),
-        min_expr(lang_slug_col, "language_slug"),
-        min_expr(url_col, "watch_url"),
-        f"'{domain}' AS domain",
-        f"'{provider}' AS ott_primary_key",
-        f"'{provider_to_label(provider)}' AS ott_primary",
-        "COUNT(*) AS ott_count",
-        "1 AS has_ott",
-        "0 AS has_free_ott",
-        "0 AS has_subscription_ott",
-        "0 AS has_buy_ott",
-        "0 AS has_rent_ott",
-        "0 AS is_free",
-    ]
-    where_sql = " AND ".join(where)
-    offset = (page - 1) * limit
-    cur = conn.cursor()
-    cur.execute(f"SELECT COUNT(DISTINCT {qident(a_slug)}) FROM {qident(availability)} WHERE {where_sql}", tuple(params))
-    total = int(cur.fetchone()[0] or 0)
 
-    if year_col:
-        order_sql = f"ORDER BY MAX(COALESCE({qident(year_col)}, 0)) DESC"
+def order_sql(m_cols: List[str], sort: str) -> str:
+    sort = str(sort or "popular").lower()
+    if sort == "latest":
+        cols = [c for c in ["release_date", "release_year", "year", "created_at"] if c in m_cols]
+    elif sort in ("rating", "top", "imdb"):
+        cols = [c for c in ["imdb_rating", "rating", "vote_average", "tmdb_rating", "flixyfy_score", "popularity"] if c in m_cols]
     else:
-        order_sql = f"ORDER BY {qident(a_slug)} ASC"
+        cols = [c for c in ["flixyfy_score", "popularity", "vote_count", "imdb_rating", "rating", "release_year", "year"] if c in m_cols]
+    return ", ".join([f"m.{qident(c)} DESC NULLS LAST" for c in cols]) if cols else "1"
 
-    sql = (
-        f"SELECT {', '.join(select_cols)} "
-        f"FROM {qident(availability)} "
-        f"WHERE {where_sql} "
-        f"GROUP BY {qident(a_slug)} "
-        f"{order_sql} "
-        f"LIMIT {p} OFFSET {p}"
-    )
-    cur.execute(sql, tuple(params + [limit, offset]))
-    cols = [d[0] for d in cur.description]
-    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+def enrich_items(rows: List[Dict[str, Any]], domain: str, prefix: str, provider: str) -> List[Dict[str, Any]]:
+    key = normalize_provider(provider)
+    label = PROVIDER_LABELS.get(key)
+    out = []
+    for row in rows:
+        item = dict(row)
+        slug = item.get("slug") or item.get("movie_slug") or item.get("series_slug") or item.get("content_slug")
+        if slug and not item.get("url_path"):
+            item["url_path"] = f"{prefix}{slug}"
+        if domain and not item.get("domain"):
+            item["domain"] = domain
+        if key and key != "all":
+            item.setdefault("ott_primary_key", key)
+            item.setdefault("ott_primary", label or key.replace("_", " ").title())
+            item.setdefault("has_ott", True)
+        out.append(item)
+    return out
+
+
+def cors_headers(request: Request) -> Dict[str, str]:
+    origin = request.headers.get("origin") or "https://flixyfy.com"
+    allowed = {
+        "https://flixyfy.com", "https://www.flixyfy.com", "https://flixyfy-web.vercel.app",
+        "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000",
+    }
+    if origin not in allowed:
+        origin = "https://flixyfy.com"
     return {
-        "items": [normalize_item(row, domain, provider) for row in rows],
-        "total": total,
-        "source": f"{reason}_v5",
-        "content_table": None,
-        "availability_table": availability,
-    }
-
-
-def normalize_item(row: Dict[str, Any], domain: str, provider: str) -> Dict[str, Any]:
-    slug = row.get("slug") or row.get("content_slug") or ""
-    title = row.get("title") or row.get("original_title") or str(slug).replace("-", " ").title()
-    year = row.get("release_year") or row.get("year")
-    item = dict(row)
-    item["slug"] = slug
-    item["title"] = title
-    item["original_title"] = item.get("original_title") or title
-    item["release_year"] = year
-    item["year"] = year
-    item["domain"] = domain
-    item["source_domain"] = domain
-    item["ott_primary_key"] = provider
-    item["ott_primary"] = provider_to_label(provider)
-    item["ott_count"] = int(item.get("ott_count") or 1)
-    item["has_ott"] = 1
-    provider_row = {
-        "provider_key": provider,
-        "provider_name": provider_to_label(provider),
-        "provider_display_name": provider_to_label(provider),
-    }
-    if item.get("watch_url"):
-        provider_row["url"] = item.get("watch_url")
-        provider_row["final_url"] = item.get("watch_url")
-    item["availability"] = [provider_row]
-    item["watch_providers"] = item["availability"]
-    if domain == "hollywood":
-        item["movie_url"] = f"/hollywood/{slug}"
-    elif domain == "historical":
-        item["movie_url"] = f"/historical/{slug}"
-    elif domain == "webseries":
-        item["movie_url"] = f"/webseries/{slug}"
-    else:
-        item["movie_url"] = f"/movie/{slug}"
-    return item
-
-
-def provider_to_label(provider: str) -> str:
-    labels = {
-        "youtube": "YouTube",
-        "prime_video": "Prime Video",
-        "amazon_prime_video": "Prime Video",
-        "amazon_video": "Amazon Video",
-        "netflix": "Netflix",
-        "jiohotstar": "JioHotstar",
-        "zee5": "ZEE5",
-        "sonyliv": "SonyLIV",
-        "aha": "Aha",
-        "sun_nxt": "Sun NXT",
-        "apple_tv": "Apple TV",
-        "apple_tv_store": "Apple TV",
-        "google_tv": "Google TV",
-        "mx_player": "MX Player",
-        "shemaroome": "ShemarooMe",
-    }
-    return labels.get(provider, provider.replace("_", " ").title())
-
-
-def domain_from_path(path: str) -> Optional[str]:
-    if path == "/api/v3/movies":
-        return "current"
-    if path == "/api/v3/hollywood":
-        return "hollywood"
-    if path == "/api/v3/historical":
-        return "historical"
-    if path == "/api/v3/webseries":
-        return "webseries"
-    if path == "/api/v3/home":
-        return "current"
-    if path == "/api/v3/search":
-        return "current"
-    return None
-
-
-def home_payload(items: List[Dict[str, Any]], provider: str, total: int) -> Dict[str, Any]:
-    latest = sorted(items, key=lambda x: int(x.get("release_year") or 0), reverse=True)
-    return {
-        "trending": items[:12],
-        "latest": latest[:12],
-        "free": items[:12] if provider == "youtube" else [],
-        "hindi": [x for x in items if str(x.get("language_slug") or "").lower() in ("hi", "hindi")][:12],
-        "telugu": [x for x in items if str(x.get("language_slug") or "").lower() in ("te", "telugu")][:12],
-        "tamil": [x for x in items if str(x.get("language_slug") or "").lower() in ("ta", "tamil")][:12],
-        "sections": [
-            {
-                "key": "provider",
-                "title": f"{provider_to_label(provider)} - Popular Movies",
-                "items": items[:24],
-                "total": total,
-            }
-        ],
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Methods": "*",
+        "Vary": "Origin",
+        "X-Flixyfy-Provider-Filter": "fast-v1",
     }
 
 
 class ProviderFilterV5Middleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        provider = normalize_provider(
-            request.query_params.get("provider") or request.query_params.get("provider_key") or ""
-        )
-        if not provider:
+        if request.method == "OPTIONS":
+            return JSONResponse({"ok": True}, headers=cors_headers(request))
+        if request.method != "GET":
             return await call_next(request)
-
-        domain = domain_from_path(request.url.path)
-        if not domain:
+        path = request.url.path.rstrip("/")
+        config = DOMAIN_CONFIG.get(path)
+        if not config:
             return await call_next(request)
-
-        page = normalize_int(request.query_params.get("page"), 1, 1, 10000)
-        limit = normalize_int(request.query_params.get("limit"), 24, 1, 100)
-        q = str(request.query_params.get("q") or request.query_params.get("query") or "").strip()
-
+        qp = request.query_params
+        provider = normalize_provider(qp.get("provider") or qp.get("provider_key") or "")
+        availability = str(qp.get("availability") or "").strip().lower()
+        if provider in ("", "all") and availability in ("", "all"):
+            return await call_next(request)
+        cache_key = hashlib.sha256(f"{path}?{request.url.query}".encode("utf-8")).hexdigest()
+        now = time.time()
+        cached = _RESPONSE_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return JSONResponse(cached[1], headers={**cors_headers(request), "X-Flixyfy-Cache": "HIT"})
         try:
-            kind, conn = get_db_kind_and_connect()
-            try:
-                result = build_items_from_content(conn, kind, domain, provider, page, limit, q)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            data = self._query(config, qp, provider, availability)
+            _RESPONSE_CACHE[cache_key] = (now + RESPONSE_TTL, data)
+            return JSONResponse(data, headers={**cors_headers(request), "X-Flixyfy-Cache": "MISS"})
+        except Exception as exc:
+            response = await call_next(request)
+            response.headers.setdefault("X-Flixyfy-Provider-Filter-Fallback", type(exc).__name__)
+            return response
 
-            items = result["items"]
-            total = int(result["total"] or 0)
-            pages = max(1, int(math.ceil(total / float(limit)))) if limit else 1
-
-            if request.url.path == "/api/v3/home":
-                return JSONResponse(home_payload(items, provider, total))
-
-            if request.url.path == "/api/v3/search":
-                return JSONResponse(
-                    {
-                        "q": q,
-                        "query": q,
-                        "items": items,
-                        "count": len(items),
-                        "total": total,
-                        "page": page,
-                        "limit": limit,
-                        "pages": pages,
-                        "provider": provider,
-                        "source": result.get("source"),
-                    }
+    def _query(self, config: Dict[str, Any], qp: Any, provider: str, availability: str) -> Dict[str, Any]:
+        page = max(1, int(qp.get("page") or 1))
+        limit = max(1, min(100, int(qp.get("limit") or 24)))
+        offset = (page - 1) * limit
+        with conn() as c:
+            with c.cursor(cursor_factory=RealDictCursor) as cur:
+                content_pick = first_existing_table(cur, config["content"])
+                availability_pick = first_existing_table(cur, config["availability"])
+                if not content_pick or not availability_pick:
+                    raise RuntimeError("v5 content/availability table missing")
+                content_table, m_cols = content_pick
+                availability_table, a_cols = availability_pick
+                join = build_join_condition(m_cols, a_cols)
+                exists_params: List[Any] = []
+                provider_sql = provider_condition(a_cols, provider, exists_params)
+                availability_sql = availability_condition(a_cols, availability, exists_params)
+                exists_sql = (
+                    f"EXISTS (SELECT 1 FROM public.{qident(availability_table)} a "
+                    f"WHERE {join} AND {provider_sql} AND {availability_sql})"
                 )
+                where_params: List[Any] = []
+                content_sql = content_filters(m_cols, qp, where_params)
+                where_sql = f"WHERE {content_sql} AND {exists_sql}"
+                final_params = where_params + exists_params
+                cur.execute(f"SELECT COUNT(*) AS total FROM public.{qident(content_table)} m {where_sql}", final_params)
+                total = int((cur.fetchone() or {}).get("total") or 0)
+                cur.execute(
+                    f"""
+                    SELECT m.*
+                    FROM public.{qident(content_table)} m
+                    {where_sql}
+                    ORDER BY {order_sql(m_cols, qp.get("sort") or "popular")}
+                    LIMIT %s OFFSET %s
+                    """,
+                    final_params + [limit, offset],
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        return {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "items": enrich_items(rows, config["domain"], config["prefix"], provider),
+            "source": "provider_filter_v5_middleware_fast_v1",
+            "domain": config["domain"],
+            "provider": provider,
+            "availability": availability or "",
+        }
 
-            return JSONResponse(
-                {
-                    "domain": domain,
-                    "source_domain": domain,
-                    "items": items,
-                    "total": total,
-                    "page": page,
-                    "limit": limit,
-                    "pages": pages,
-                    "provider": provider,
-                    "source": result.get("source"),
-                }
-            )
-        except Exception:
-            return await call_next(request)
-
-
-def install_provider_filter_v5_middleware(app) -> None:
-    if getattr(app.state, "flixyfy_provider_filter_v5_installed", False):
-        return
-    app.add_middleware(ProviderFilterV5Middleware)
-    app.state.flixyfy_provider_filter_v5_installed = True
+# Backward compatibility for older main_v3.py import/call path.
+# main_v3.py may import install_provider_filter_v5_middleware from older builds.
+# The middleware is already installed directly before CORS by the V1 fix.
+def install_provider_filter_v5_middleware(app):
+    return app
