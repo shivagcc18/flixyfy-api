@@ -1348,21 +1348,58 @@ def search_modern(
     provider: Optional[str] = None,
     availability: Optional[str] = None,
     sort: str = "popular",
+    _table_name: Optional[str] = None,
+    _allow_fallback: bool = True,
 ):
-    table_name = MODERN_SEARCH_TABLE if table_exists(MODERN_SEARCH_TABLE) else MODERN_TABLE
+    table_name = _table_name or (MODERN_SEARCH_TABLE if table_exists(MODERN_SEARCH_TABLE) else MODERN_TABLE)
 
     if not table_exists(table_name):
         return 0, []
 
+    cols = table_columns(table_name)
     where = []
     params = []
 
     if query:
-        where.append(
-            "(LOWER(title) LIKE LOWER(%s) "
-            "OR LOWER(COALESCE(original_title, '')) LIKE LOWER(%s))"
-        )
-        params.extend([f"{query}%", f"{query}%"])
+        compact_query = re.sub(r"[^a-z0-9]+", "", query.lower())
+        search_clauses = []
+
+        for col in ("title", "original_title", "wiki_title", "slug"):
+            if col not in cols:
+                continue
+            expr = f"CAST({qident(col)} AS TEXT)"
+            if compact_query:
+                search_clauses.append(
+                    "("
+                    f"LOWER({expr}) LIKE LOWER(%s) "
+                    "OR "
+                    f"regexp_replace(LOWER({expr}), '[^a-z0-9]+', '', 'g') LIKE %s"
+                    ")"
+                )
+                params.extend([f"%{query}%", f"%{compact_query}%"])
+            else:
+                search_clauses.append(f"LOWER({expr}) LIKE LOWER(%s)")
+                params.append(f"%{query}%")
+
+        for col in ("aliases_json", "aliases", "alternate_titles", "aka", "search_text"):
+            if col not in cols:
+                continue
+            expr = f"CAST({qident(col)} AS TEXT)"
+            if compact_query:
+                search_clauses.append(
+                    "("
+                    f"LOWER({expr}) LIKE LOWER(%s) "
+                    "OR "
+                    f"regexp_replace(LOWER({expr}), '[^a-z0-9]+', '', 'g') LIKE %s"
+                    ")"
+                )
+                params.extend([f"%{query}%", f"%{compact_query}%"])
+            else:
+                search_clauses.append(f"LOWER({expr}) LIKE LOWER(%s)")
+                params.append(f"%{query}%")
+
+        if search_clauses:
+            where.append("(" + " OR ".join(search_clauses) + ")")
 
     if language:
         where.append("language_slug = %s")
@@ -1395,13 +1432,27 @@ def search_modern(
             order_sql = """
                 CASE
                     WHEN LOWER(title) = LOWER(%s) THEN 1
-                    WHEN LOWER(title) LIKE LOWER(%s) THEN 2
+                    WHEN regexp_replace(LOWER(CAST(title AS TEXT)), '[^a-z0-9]+', '', 'g') = %s THEN 2
                     WHEN LOWER(COALESCE(original_title, '')) = LOWER(%s) THEN 3
-                    WHEN LOWER(COALESCE(original_title, '')) LIKE LOWER(%s) THEN 4
-                    ELSE 5
+                    WHEN regexp_replace(LOWER(COALESCE(CAST(original_title AS TEXT), '')), '[^a-z0-9]+', '', 'g') = %s THEN 4
+                    WHEN LOWER(title) LIKE LOWER(%s) THEN 5
+                    WHEN LOWER(COALESCE(original_title, '')) LIKE LOWER(%s) THEN 6
+                    WHEN regexp_replace(LOWER(CAST(title AS TEXT)), '[^a-z0-9]+', '', 'g') LIKE %s THEN 7
+                    WHEN regexp_replace(LOWER(COALESCE(CAST(original_title AS TEXT), '')), '[^a-z0-9]+', '', 'g') LIKE %s THEN 8
+                    ELSE 9
                 END,
             """
-            order_params = [query, f"{query}%", query, f"{query}%"]
+            compact_query = re.sub(r"[^a-z0-9]+", "", query.lower())
+            order_params = [
+                query,
+                compact_query,
+                query,
+                compact_query,
+                f"{query}%",
+                f"{query}%",
+                f"{compact_query}%",
+                f"{compact_query}%",
+            ]
         else:
             order_sql = ""
 
@@ -1467,6 +1518,25 @@ def search_modern(
             items.append(modern_card(row))
     finally:
         conn.close()
+
+    if (
+        query
+        and _allow_fallback
+        and total == 0
+        and table_name != MODERN_TABLE
+        and table_exists(MODERN_TABLE)
+    ):
+        return search_modern(
+            query=query,
+            limit=limit,
+            language=language,
+            year=year,
+            provider=provider,
+            availability=availability,
+            sort=sort,
+            _table_name=MODERN_TABLE,
+            _allow_fallback=False,
+        )
 
     return total, items
 
