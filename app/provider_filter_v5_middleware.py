@@ -1,9 +1,9 @@
-# FLIXYFY_UI_FILTERS_FAST_RESPONSE_FIX_V1
-# Fast v5 provider-filter middleware. No DB mutation. No DDL. SELECT-only.
+# FLIXYFY_UI_DOMAIN_FILTERS_FINAL_FIX_V2
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -20,260 +20,238 @@ except Exception:
     pass
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+SCHEMA_TTL_SECONDS = 300
+RESPONSE_TTL_SECONDS = 60
+_SCHEMA_CACHE: Dict[str, Tuple[float, Any]] = {}
+_RESPONSE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 PROVIDER_ALIASES = {
-    "": "all", "all": "all", "all_provider": "all", "all providers": "all",
+    "": "all", "all": "all", "all_provider": "all", "all providers": "all", "all_providers": "all",
     "youtube": "youtube", "yt": "youtube", "you tube": "youtube",
-    "netflix": "netflix",
-    "prime": "prime_video", "prime video": "prime_video", "primevideo": "prime_video", "prime_video": "prime_video",
-    "amazon prime": "prime_video", "amazon prime video": "prime_video", "amazon_prime_video": "prime_video",
-    "amazon_prime_video_with_ads": "prime_video",
-    "jiohotstar": "jiohotstar", "jio hotstar": "jiohotstar", "hotstar": "jiohotstar", "disney hotstar": "jiohotstar",
-    "zee5": "zee5", "zee 5": "zee5", "sonyliv": "sonyliv", "sony liv": "sonyliv", "aha": "aha",
+    "netflix": "netflix", "netflix standard with ads": "netflix", "netflix basic with ads": "netflix",
+    "prime": "prime_video", "prime video": "prime_video", "primevideo": "prime_video", "prime_video": "prime_video", "amazon prime": "prime_video", "amazon prime video": "prime_video", "amazon_prime_video": "prime_video", "amazon_prime_video_with_ads": "prime_video", "prime video with ads": "prime_video",
+    "jiohotstar": "jiohotstar", "jio hotstar": "jiohotstar", "hotstar": "jiohotstar", "disney hotstar": "jiohotstar", "disney+ hotstar": "jiohotstar",
+    "zee5": "zee5", "zee 5": "zee5",
+    "sonyliv": "sonyliv", "sony liv": "sonyliv",
+    "aha": "aha",
     "sunnxt": "sun_nxt", "sun nxt": "sun_nxt", "sun_nxt": "sun_nxt",
     "etvwin": "etv_win", "etv win": "etv_win", "etv_win": "etv_win",
-    "mxplayer": "mx_player", "mx player": "mx_player", "mx_player": "mx_player",
-    "shemaroome": "shemaroome", "shemaroo me": "shemaroome", "eros now": "eros_now", "eros_now": "eros_now",
-    "apple tv": "apple_tv_store", "apple_tv": "apple_tv_store", "apple tv store": "apple_tv_store", "apple_tv_store": "apple_tv_store",
-    "amazon video": "amazon_video", "amazon_video": "amazon_video", "google tv": "google_tv", "google_tv": "google_tv",
-    "disney+": "disney_plus", "disney_plus": "disney_plus", "hulu": "hulu", "max": "max", "viki": "viki",
-    "rakuten viki": "viki", "kocowa": "kocowa", "tving": "tving", "wavve": "wavve", "watcha": "watcha",
-    "coupang play": "coupang_play", "coupang_play": "coupang_play", "tubi": "tubi_tv", "tubi tv": "tubi_tv", "tubi_tv": "tubi_tv",
+    "mxplayer": "mx_player", "mx player": "mx_player", "mx_player": "mx_player", "amazon mx player": "mx_player", "amazon_mx_player": "mx_player",
+    "shemaroome": "shemaroome", "shemaroo me": "shemaroome",
+    "eros now": "eros_now", "eros_now": "eros_now",
+    "apple tv": "apple_tv_store", "apple_tv": "apple_tv_store", "apple tv store": "apple_tv_store", "apple_tv_store": "apple_tv_store", "itunes": "apple_tv_store",
+    "amazon video": "amazon_video", "amazon_video": "amazon_video",
+    "google tv": "google_tv", "google_tv": "google_tv", "google play": "google_tv",
+    "disney+": "disney_plus", "disney plus": "disney_plus", "disney_plus": "disney_plus",
+    "hulu": "hulu", "max": "max", "hbo max": "max", "hbo_max": "max", "plex": "plex",
+    "viki": "viki", "rakuten viki": "viki", "kocowa": "kocowa", "tving": "tving", "wavve": "wavve", "watcha": "watcha", "coupang play": "coupang_play", "coupang_play": "coupang_play", "tubi": "tubi_tv", "tubi tv": "tubi_tv", "tubi_tv": "tubi_tv",
 }
 
 PROVIDER_LABELS = {
-    "youtube": "YouTube", "netflix": "Netflix", "prime_video": "Prime Video", "jiohotstar": "JioHotstar",
-    "zee5": "ZEE5", "sonyliv": "SonyLIV", "aha": "Aha", "sun_nxt": "Sun NXT", "etv_win": "ETV Win",
-    "mx_player": "MX Player", "apple_tv_store": "Apple TV", "amazon_video": "Amazon Video", "google_tv": "Google TV",
-    "disney_plus": "Disney+", "hulu": "Hulu", "max": "Max", "viki": "Rakuten Viki", "kocowa": "Kocowa",
-    "tving": "TVING", "wavve": "Wavve", "watcha": "Watcha", "coupang_play": "Coupang Play", "tubi_tv": "Tubi",
+    "youtube": "YouTube", "netflix": "Netflix", "prime_video": "Prime Video", "jiohotstar": "JioHotstar", "zee5": "ZEE5", "sonyliv": "SonyLIV", "aha": "Aha", "sun_nxt": "Sun NXT", "etv_win": "ETV Win", "mx_player": "MX Player", "shemaroome": "ShemarooMe", "eros_now": "Eros Now", "apple_tv_store": "Apple TV", "amazon_video": "Amazon Video", "google_tv": "Google TV", "disney_plus": "Disney+", "hulu": "Hulu", "max": "Max", "plex": "Plex", "viki": "Rakuten Viki", "kocowa": "Kocowa", "tving": "TVING", "wavve": "Wavve", "watcha": "Watcha", "coupang_play": "Coupang Play", "tubi_tv": "Tubi"
 }
 
-DOMAIN_CONFIG = {
-    "/api/v3/movies": {
-        "domain": "current",
-        "content": ["current_movie_serving_v5", "media_serving_v8_expanded", "media_serving_v7_final"],
-        "availability": ["current_availability_serving_v5", "ott_availability_normalized_v2", "ott_availability_provider_links_v2"],
-        "prefix": "/movie/",
-    },
-    "/api/v3/hollywood": {
-        "domain": "hollywood",
-        "content": ["hollywood_movie_serving_v5", "hollywood_serving_v3", "hollywood_card_serving_v3"],
-        "availability": ["hollywood_availability_serving_v5", "hollywood_availability_v3", "hollywood_availability_serving_v1"],
-        "prefix": "/hollywood/",
-    },
-    "/api/v3/historical": {
-        "domain": "historical",
-        "content": ["historical_movie_serving_v5", "historical_serving_v1", "historical_serving_v2", "historical_card_serving_v1"],
-        "availability": ["historical_availability_serving_v5", "historical_availability_v2"],
-        "prefix": "/historical/",
-    },
-    "/api/v3/webseries": {
-        "domain": "webseries",
-        "content": ["webseries_series_serving_v5", "webseries_serving_v1", "webseries_card_serving_v1"],
-        "availability": ["webseries_availability_serving_v5", "webseries_availability_serving_v1", "webseries_availability_v1"],
-        "prefix": "/webseries/",
-    },
+COMMON_AVAILABILITY = ["provider_availability_serving_v2", "provider_availability_serving_v1"]
+DOMAIN_CONFIG_BY_PATH = {
+    "/api/v3/movies": {"domain": "current", "label": "Indian Movies", "prefix": "/movie/", "content": ["current_movie_serving_v5_backend_compat", "current_movie_serving_v5", "media_serving_v8_expanded", "media_serving_v7_final"], "availability": ["current_availability_serving_v5", "ott_availability_normalized_v2", "ott_availability_normalized_v1"] + COMMON_AVAILABILITY},
+    "/api/v3/indian": {"domain": "current", "label": "Indian Movies", "prefix": "/movie/", "content": ["current_movie_serving_v5_backend_compat", "current_movie_serving_v5", "media_serving_v8_expanded", "media_serving_v7_final"], "availability": ["current_availability_serving_v5", "ott_availability_normalized_v2", "ott_availability_normalized_v1"] + COMMON_AVAILABILITY},
+    "/api/v3/hollywood": {"domain": "hollywood", "label": "Global Movies", "prefix": "/hollywood/", "content": ["hollywood_movie_serving_v5", "hollywood_card_serving_v3", "hollywood_serving_v3", "hollywood_movie_serving_v1"], "availability": ["hollywood_availability_serving_v5", "hollywood_availability_serving_v3", "hollywood_availability_serving_v1"] + COMMON_AVAILABILITY},
+    "/api/v3/global": {"domain": "hollywood", "label": "Global Movies", "prefix": "/hollywood/", "content": ["hollywood_movie_serving_v5", "hollywood_card_serving_v3", "hollywood_serving_v3", "hollywood_movie_serving_v1"], "availability": ["hollywood_availability_serving_v5", "hollywood_availability_serving_v3", "hollywood_availability_serving_v1"] + COMMON_AVAILABILITY},
+    "/api/v3/historical": {"domain": "historical", "label": "Historical Movies", "prefix": "/historical/", "content": ["historical_movie_serving_v5", "historical_card_serving_v1", "historical_serving_v2", "historical_serving_v1"], "availability": ["historical_availability_serving_v5", "historical_availability_serving_v2", "historical_availability_v2"] + COMMON_AVAILABILITY},
+    "/api/v3/webseries": {"domain": "webseries", "label": "Webseries", "prefix": "/webseries/", "content": ["webseries_series_serving_v5", "webseries_serving_v5", "webseries_card_serving_v1", "webseries_serving_v1"], "availability": ["webseries_availability_serving_v5", "webseries_availability_serving_v2", "webseries_availability_serving_v1", "webseries_availability_v1"] + COMMON_AVAILABILITY},
+    "/api/v3/web-series": {"domain": "webseries", "label": "Webseries", "prefix": "/webseries/", "content": ["webseries_series_serving_v5", "webseries_serving_v5", "webseries_card_serving_v1", "webseries_serving_v1"], "availability": ["webseries_availability_serving_v5", "webseries_availability_serving_v2", "webseries_availability_serving_v1", "webseries_availability_v1"] + COMMON_AVAILABILITY},
+    "/api/v3/series": {"domain": "webseries", "label": "Webseries", "prefix": "/webseries/", "content": ["webseries_series_serving_v5", "webseries_serving_v5", "webseries_card_serving_v1", "webseries_serving_v1"], "availability": ["webseries_availability_serving_v5", "webseries_availability_serving_v2", "webseries_availability_serving_v1", "webseries_availability_v1"] + COMMON_AVAILABILITY},
 }
 
-_SCHEMA_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_RESPONSE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-SCHEMA_TTL = 300
-RESPONSE_TTL = 60
-
-
-def qident(name: str) -> str:
-    return '"' + str(name).replace('"', '""') + '"'
-
+def qident(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
 
 def normalize_provider(value: Any) -> str:
-    raw = str(value or "").strip().lower().replace("+", " plus ").replace("_", " ").replace("-", " ")
-    raw = " ".join(raw.split())
+    raw = str(value or "").strip().lower().replace("+", " plus ")
+    raw = re.sub(r"[_\-]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
     if raw in PROVIDER_ALIASES:
         return PROVIDER_ALIASES[raw]
     underscored = raw.replace(" ", "_")
     return PROVIDER_ALIASES.get(underscored, underscored or "all")
 
-
 def provider_aliases(provider: str) -> List[str]:
-    provider = normalize_provider(provider)
-    aliases = {provider}
-    for raw, canonical in PROVIDER_ALIASES.items():
-        if canonical == provider and raw:
+    canonical = normalize_provider(provider)
+    aliases = {canonical, canonical.replace("_", " ")}
+    for raw, mapped in PROVIDER_ALIASES.items():
+        if mapped == canonical and raw:
             aliases.add(raw)
-            aliases.add(raw.replace(" ", "_"))
             aliases.add(raw.replace("_", " "))
-    return sorted(aliases)
+            aliases.add(raw.replace(" ", "_"))
+    return sorted(a.lower() for a in aliases if a)
 
+def provider_needles(provider: str) -> List[str]:
+    canonical = normalize_provider(provider)
+    base = set(provider_aliases(canonical))
+    broad = {
+        "netflix": ["netflix"], "prime_video": ["prime", "amazon prime", "amazon_prime"], "jiohotstar": ["hotstar", "jiohotstar"], "zee5": ["zee5", "zee 5"], "sonyliv": ["sony", "sonyliv", "sony liv"], "youtube": ["youtube", "youtu.be"], "sun_nxt": ["sun nxt", "sunnxt"], "etv_win": ["etv win", "etvwin"], "mx_player": ["mx player", "mxplayer"], "apple_tv_store": ["apple", "itunes"], "amazon_video": ["amazon video"], "google_tv": ["google", "google tv"], "disney_plus": ["disney"], "max": ["max", "hbo"], "viki": ["viki"], "kocowa": ["kocowa"], "tving": ["tving"], "wavve": ["wavve"], "watcha": ["watcha"], "coupang_play": ["coupang"], "tubi_tv": ["tubi"],
+    }
+    for item in broad.get(canonical, []):
+        base.add(item)
+    return sorted(base)
 
-def conn():
+def connect_db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL missing")
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-
-def table_columns(cur, table: str) -> List[str]:
-    now = time.time()
-    key = f"cols:{table}"
-    cached = _SCHEMA_CACHE.get(key)
-    if cached and cached[0] > now:
-        return list(cached[1].get("columns") or [])
-    cur.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name=%s
-        ORDER BY ordinal_position
-        """,
-        [table],
-    )
-    cols = [r["column_name"] for r in cur.fetchall()]
-    _SCHEMA_CACHE[key] = (now + SCHEMA_TTL, {"columns": cols})
-    return cols
-
-
-def first_existing_table(cur, names: Iterable[str]) -> Optional[Tuple[str, List[str]]]:
-    for table in names:
-        cols = table_columns(cur, table)
-        if cols:
-            return table, cols
+def cached(key: str):
+    item = _SCHEMA_CACHE.get(key)
+    if item and item[0] > time.time():
+        return item[1]
     return None
 
+def set_cached(key: str, value: Any):
+    _SCHEMA_CACHE[key] = (time.time() + SCHEMA_TTL_SECONDS, value)
+    return value
+
+def table_columns(cur, table: str) -> List[str]:
+    key = f"cols:{table}"
+    hit = cached(key)
+    if hit is not None:
+        return hit
+    cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s ORDER BY ordinal_position", [table])
+    return set_cached(key, [r["column_name"] for r in cur.fetchall()])
+
+def first_table(cur, names: Iterable[str]) -> Optional[Tuple[str, List[str]]]:
+    for name in names:
+        cols = table_columns(cur, name)
+        if cols:
+            return name, cols
+    return None
 
 def pick(cols: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
-    s = set(cols)
+    present = set(cols)
     for c in candidates:
-        if c in s:
+        if c in present:
             return c
     return None
 
+def expr(alias: str, col: str) -> str:
+    return f"LOWER(COALESCE(CAST({alias}.{qident(col)} AS TEXT),''))"
 
-def build_join_condition(m_cols: List[str], a_cols: List[str]) -> str:
-    pairs = [
-        ("slug", "slug"), ("content_slug", "content_slug"), ("movie_slug", "movie_slug"), ("series_slug", "series_slug"),
-        ("slug", "content_slug"), ("slug", "movie_slug"), ("slug", "series_slug"),
-        ("tmdb_id", "tmdb_id"), ("imdb_id", "imdb_id"), ("id", "content_id"), ("content_id", "content_id"),
-    ]
-    for mc, ac in pairs:
-        if mc in m_cols and ac in a_cols:
-            return f"CAST(a.{qident(ac)} AS TEXT)=CAST(m.{qident(mc)} AS TEXT)"
-    m_title = pick(m_cols, ["title", "name", "series_title", "original_title"])
-    a_title = pick(a_cols, ["title", "name", "content_title", "movie_title", "series_title"])
-    m_year = pick(m_cols, ["release_year", "year", "start_year"])
-    a_year = pick(a_cols, ["release_year", "year", "content_year", "movie_year", "start_year"])
+def norm_expr(alias: str, col: str) -> str:
+    return f"LOWER(regexp_replace(COALESCE(CAST({alias}.{qident(col)} AS TEXT),''), '[^a-zA-Z0-9]+', '_', 'g'))"
+
+def domain_guard(a_cols: List[str], domain: str) -> str:
+    for col in ["domain", "content_domain", "media_domain", "source_domain"]:
+        if col in a_cols:
+            values = {"current": ["current", "indian", "movie", "movies"], "hollywood": ["hollywood", "global", "global_movie", "global_movies"], "historical": ["historical", "historical_movie", "historical_movies"], "webseries": ["webseries", "web_series", "series", "tv"]}.get(domain, [domain])
+            quoted = ",".join("'" + v.replace("'", "''") + "'" for v in values)
+            return f" AND LOWER(CAST(a.{qident(col)} AS TEXT)) IN ({quoted})"
+    return ""
+
+def build_join(m_cols: List[str], a_cols: List[str], domain: str) -> str:
+    for m_col, a_col in [("slug", "slug"), ("slug", "content_slug"), ("slug", "movie_slug"), ("slug", "series_slug"), ("content_slug", "content_slug"), ("movie_slug", "movie_slug"), ("series_slug", "series_slug"), ("tmdb_id", "tmdb_id"), ("imdb_id", "imdb_id"), ("id", "content_id"), ("content_id", "content_id"), ("tmdb_id", "content_tmdb_id"), ("imdb_id", "content_imdb_id")]:
+        if m_col in m_cols and a_col in a_cols:
+            return f"NULLIF(CAST(m.{qident(m_col)} AS TEXT),'') IS NOT NULL AND CAST(a.{qident(a_col)} AS TEXT)=CAST(m.{qident(m_col)} AS TEXT){domain_guard(a_cols, domain)}"
+    m_title = pick(m_cols, ["title", "name", "series_title", "original_title", "movie_title"])
+    a_title = pick(a_cols, ["title", "name", "content_title", "movie_title", "series_title", "original_title"])
+    m_year = pick(m_cols, ["release_year", "year", "start_year", "first_air_year"])
+    a_year = pick(a_cols, ["release_year", "year", "content_year", "movie_year", "start_year", "first_air_year"])
     if m_title and a_title and m_year and a_year:
-        return (
-            f"LOWER(TRIM(CAST(a.{qident(a_title)} AS TEXT)))=LOWER(TRIM(CAST(m.{qident(m_title)} AS TEXT))) "
-            f"AND CAST(a.{qident(a_year)} AS TEXT)=CAST(m.{qident(m_year)} AS TEXT)"
-        )
+        return f"LOWER(TRIM(CAST(a.{qident(a_title)} AS TEXT)))=LOWER(TRIM(CAST(m.{qident(m_title)} AS TEXT))) AND CAST(a.{qident(a_year)} AS TEXT)=CAST(m.{qident(m_year)} AS TEXT){domain_guard(a_cols, domain)}"
     if m_title and a_title:
-        return f"LOWER(TRIM(CAST(a.{qident(a_title)} AS TEXT)))=LOWER(TRIM(CAST(m.{qident(m_title)} AS TEXT)))"
+        return f"LOWER(TRIM(CAST(a.{qident(a_title)} AS TEXT)))=LOWER(TRIM(CAST(m.{qident(m_title)} AS TEXT))){domain_guard(a_cols, domain)}"
     return "1=0"
 
-
 def provider_condition(a_cols: List[str], provider: str, params: List[Any]) -> str:
-    provider = normalize_provider(provider)
-    if provider in ("", "all"):
+    canonical = normalize_provider(provider)
+    if canonical in ("", "all"):
         return "1=1"
-    aliases = provider_aliases(provider)
-    candidate_cols = ["provider_key", "provider", "provider_name", "provider_display_name", "ott_primary_key", "ott_primary", "source", "source_name"]
-    clauses = []
-    for col in candidate_cols:
-        if col in a_cols:
-            clauses.append(f"LOWER(COALESCE(CAST(a.{qident(col)} AS TEXT),'')) = ANY(%s)")
-            params.append(aliases)
-    if provider == "youtube":
-        for col in ["final_url", "watch_url", "youtube_url", "video_url", "url"]:
+    aliases = provider_aliases(canonical)
+    needles = provider_needles(canonical)
+    cols = ["provider_key", "provider", "provider_name", "provider_display_name", "provider_label", "ott_primary_key", "ott_primary", "platform", "platform_name", "source", "source_name", "watch_provider", "watch_provider_name", "provider_slug", "provider_code"]
+    clauses: List[str] = []
+    for col in cols:
+        if col not in a_cols:
+            continue
+        clauses.append(f"{expr('a', col)} = ANY(%s)")
+        params.append(aliases)
+        clauses.append(f"{norm_expr('a', col)} = ANY(%s)")
+        params.append([a.replace(" ", "_") for a in aliases])
+        for needle in needles:
+            clauses.append(f"{expr('a', col)} LIKE %s")
+            params.append("%" + needle.replace("_", " ") + "%")
+            clauses.append(f"{norm_expr('a', col)} LIKE %s")
+            params.append("%" + re.sub(r"[^a-z0-9]+", "_", needle.lower()).strip("_") + "%")
+    if canonical == "youtube":
+        for col in ["final_url", "watch_url", "youtube_url", "video_url", "url", "deep_link"]:
             if col in a_cols:
-                clauses.append(f"LOWER(COALESCE(CAST(a.{qident(col)} AS TEXT),'')) LIKE %s")
+                clauses.append(f"{expr('a', col)} LIKE %s")
                 params.append("%youtube%")
+                clauses.append(f"{expr('a', col)} LIKE %s")
+                params.append("%youtu.be%")
     return "(" + " OR ".join(clauses) + ")" if clauses else "1=0"
 
-
 def availability_condition(a_cols: List[str], availability: str, params: List[Any]) -> str:
-    av = str(availability or "").strip().lower()
-    if av in ("", "all"):
+    value = str(availability or "").strip().lower()
+    if value in ("", "all", "all_titles"):
         return "1=1"
-    if av in ("youtube", "free"):
+    if value in ("free", "youtube"):
         return provider_condition(a_cols, "youtube", params)
-    if av in ("ott", "available", "streaming"):
-        provider_cols = [c for c in ["provider_key", "provider", "provider_name", "provider_display_name"] if c in a_cols]
-        if provider_cols:
-            return "(" + " OR ".join([f"NULLIF(TRIM(CAST(a.{qident(c)} AS TEXT)),'') IS NOT NULL" for c in provider_cols]) + ")"
+    if value in ("ott", "streaming", "available", "true", "1"):
+        cols = [c for c in ["provider_key", "provider", "provider_name", "provider_display_name", "platform"] if c in a_cols]
+        if cols:
+            return "(" + " OR ".join([f"NULLIF(TRIM(CAST(a.{qident(c)} AS TEXT)),'') IS NOT NULL" for c in cols]) + ")"
     return "1=1"
 
-
-def content_filters(m_cols: List[str], qp: Any, params: List[Any]) -> str:
-    clauses = []
-    query = str(qp.get("q", "") or "").strip()
-    if query:
-        title_cols = [c for c in ["title", "original_title", "name", "series_title"] if c in m_cols]
-        if title_cols:
-            clauses.append("(" + " OR ".join([f"m.{qident(c)} ILIKE %s" for c in title_cols]) + ")")
-            params.extend([f"%{query}%"] * len(title_cols))
-    year = str(qp.get("year", "") or "").strip()
+def content_filter(m_cols: List[str], qp: Any, params: List[Any]) -> str:
+    clauses: List[str] = []
+    q = str(qp.get("q") or "").strip()
+    if q:
+        cols = [c for c in ["title", "name", "series_title", "original_title", "movie_title"] if c in m_cols]
+        if cols:
+            clauses.append("(" + " OR ".join([f"m.{qident(c)} ILIKE %s" for c in cols]) + ")")
+            params.extend(["%" + q + "%"] * len(cols))
+    year = str(qp.get("year") or "").strip()
     if year:
-        col = pick(m_cols, ["release_year", "year", "start_year"])
+        col = pick(m_cols, ["release_year", "year", "start_year", "first_air_year"])
         if col:
             clauses.append(f"CAST(m.{qident(col)} AS TEXT)=%s")
             params.append(year)
-    lang = str(qp.get("language", "") or "").strip()
+    lang = str(qp.get("language") or qp.get("language_slug") or "").strip().lower().replace("_", "-")
     if lang:
-        lang_norm = lang.lower().replace("_", "-")
-        lang_cols = [c for c in ["language_slug", "primary_language_slug", "primary_language", "language"] if c in m_cols]
-        if lang_cols:
-            clauses.append("(" + " OR ".join([f"LOWER(REPLACE(CAST(m.{qident(c)} AS TEXT),'_','-'))=%s" for c in lang_cols]) + ")")
-            params.extend([lang_norm] * len(lang_cols))
+        cols = [c for c in ["language_slug", "primary_language_slug", "primary_language", "language", "original_language"] if c in m_cols]
+        if cols:
+            clauses.append("(" + " OR ".join([f"LOWER(REPLACE(CAST(m.{qident(c)} AS TEXT),'_','-'))=%s" for c in cols]) + ")")
+            params.extend([lang] * len(cols))
     return " AND ".join(clauses) if clauses else "1=1"
 
-
 def order_sql(m_cols: List[str], sort: str) -> str:
-    sort = str(sort or "popular").lower()
-    if sort == "latest":
-        cols = [c for c in ["release_date", "release_year", "year", "created_at"] if c in m_cols]
-    elif sort in ("rating", "top", "imdb"):
-        cols = [c for c in ["imdb_rating", "rating", "vote_average", "tmdb_rating", "flixyfy_score", "popularity"] if c in m_cols]
-    else:
-        cols = [c for c in ["flixyfy_score", "popularity", "vote_count", "imdb_rating", "rating", "release_year", "year"] if c in m_cols]
+    value = str(sort or "popular").strip().lower()
+    candidates = ["release_date", "release_year", "year", "start_year", "created_at"] if value == "latest" else ["imdb_rating", "rating", "vote_average", "tmdb_rating", "flixyfy_score", "popularity"] if value in ("rating", "top", "imdb") else ["flixyfy_score", "popularity", "vote_count", "imdb_rating", "rating", "release_year", "year", "start_year"]
+    cols = [c for c in candidates if c in m_cols]
     return ", ".join([f"m.{qident(c)} DESC NULLS LAST" for c in cols]) if cols else "1"
 
-
-def enrich_items(rows: List[Dict[str, Any]], domain: str, prefix: str, provider: str) -> List[Dict[str, Any]]:
-    key = normalize_provider(provider)
-    label = PROVIDER_LABELS.get(key)
+def enrich(rows: List[Dict[str, Any]], config: Dict[str, Any], provider: str) -> List[Dict[str, Any]]:
+    canonical = normalize_provider(provider)
+    label = PROVIDER_LABELS.get(canonical)
     out = []
     for row in rows:
         item = dict(row)
-        slug = item.get("slug") or item.get("movie_slug") or item.get("series_slug") or item.get("content_slug")
+        slug = item.get("slug") or item.get("content_slug") or item.get("movie_slug") or item.get("series_slug")
         if slug and not item.get("url_path"):
-            item["url_path"] = f"{prefix}{slug}"
-        if domain and not item.get("domain"):
-            item["domain"] = domain
-        if key and key != "all":
-            item.setdefault("ott_primary_key", key)
-            item.setdefault("ott_primary", label or key.replace("_", " ").title())
-            item.setdefault("has_ott", True)
+            item["url_path"] = f"{config['prefix']}{slug}"
+        item.setdefault("domain", config["domain"])
+        if canonical and canonical != "all":
+            item["ott_primary_key"] = canonical
+            item["ott_primary"] = label or canonical.replace("_", " ").title()
+            item["has_ott"] = True
         out.append(item)
     return out
 
-
 def cors_headers(request: Request) -> Dict[str, str]:
     origin = request.headers.get("origin") or "https://flixyfy.com"
-    allowed = {
-        "https://flixyfy.com", "https://www.flixyfy.com", "https://flixyfy-web.vercel.app",
-        "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000",
-    }
+    allowed = {"https://flixyfy.com", "https://www.flixyfy.com", "https://flixyfy-web.vercel.app", "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"}
     if origin not in allowed:
         origin = "https://flixyfy.com"
-    return {
-        "Access-Control-Allow-Origin": origin,
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Allow-Methods": "*",
-        "Vary": "Origin",
-        "X-Flixyfy-Provider-Filter": "fast-v1",
-    }
-
+    return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "*", "Vary": "Origin", "X-Flixyfy-Provider-Filter": "fast-v2"}
 
 class ProviderFilterV5Middleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -282,78 +260,51 @@ class ProviderFilterV5Middleware(BaseHTTPMiddleware):
         if request.method != "GET":
             return await call_next(request)
         path = request.url.path.rstrip("/")
-        config = DOMAIN_CONFIG.get(path)
+        config = DOMAIN_CONFIG_BY_PATH.get(path)
         if not config:
             return await call_next(request)
-        qp = request.query_params
-        provider = normalize_provider(qp.get("provider") or qp.get("provider_key") or "")
-        availability = str(qp.get("availability") or "").strip().lower()
-        if provider in ("", "all") and availability in ("", "all"):
+        provider = normalize_provider(request.query_params.get("provider") or request.query_params.get("provider_key") or "")
+        availability = str(request.query_params.get("availability") or request.query_params.get("has_ott") or "").strip().lower()
+        if provider in ("", "all") and availability in ("", "all", "all_titles"):
             return await call_next(request)
-        cache_key = hashlib.sha256(f"{path}?{request.url.query}".encode("utf-8")).hexdigest()
-        now = time.time()
-        cached = _RESPONSE_CACHE.get(cache_key)
-        if cached and cached[0] > now:
-            return JSONResponse(cached[1], headers={**cors_headers(request), "X-Flixyfy-Cache": "HIT"})
+        key = hashlib.sha256((path + "?" + request.url.query).encode("utf-8")).hexdigest()
+        item = _RESPONSE_CACHE.get(key)
+        if item and item[0] > time.time():
+            return JSONResponse(item[1], headers={**cors_headers(request), "X-Flixyfy-Cache": "HIT"})
         try:
-            data = self._query(config, qp, provider, availability)
-            _RESPONSE_CACHE[cache_key] = (now + RESPONSE_TTL, data)
-            return JSONResponse(data, headers={**cors_headers(request), "X-Flixyfy-Cache": "MISS"})
+            payload = self.query_payload(config, request.query_params, provider, availability)
+            _RESPONSE_CACHE[key] = (time.time() + RESPONSE_TTL_SECONDS, payload)
+            return JSONResponse(payload, headers={**cors_headers(request), "X-Flixyfy-Cache": "MISS"})
         except Exception as exc:
             response = await call_next(request)
             response.headers.setdefault("X-Flixyfy-Provider-Filter-Fallback", type(exc).__name__)
             return response
 
-    def _query(self, config: Dict[str, Any], qp: Any, provider: str, availability: str) -> Dict[str, Any]:
+    def query_payload(self, config: Dict[str, Any], qp: Any, provider: str, availability: str) -> Dict[str, Any]:
         page = max(1, int(qp.get("page") or 1))
         limit = max(1, min(100, int(qp.get("limit") or 24)))
         offset = (page - 1) * limit
-        with conn() as c:
-            with c.cursor(cursor_factory=RealDictCursor) as cur:
-                content_pick = first_existing_table(cur, config["content"])
-                availability_pick = first_existing_table(cur, config["availability"])
+        with connect_db() as db:
+            with db.cursor(cursor_factory=RealDictCursor) as cur:
+                content_pick = first_table(cur, config["content"])
+                availability_pick = first_table(cur, config["availability"])
                 if not content_pick or not availability_pick:
-                    raise RuntimeError("v5 content/availability table missing")
+                    raise RuntimeError("missing content/availability table")
                 content_table, m_cols = content_pick
                 availability_table, a_cols = availability_pick
-                join = build_join_condition(m_cols, a_cols)
+                join_sql = build_join(m_cols, a_cols, config["domain"])
+                content_params: List[Any] = []
+                content_sql = content_filter(m_cols, qp, content_params)
                 exists_params: List[Any] = []
                 provider_sql = provider_condition(a_cols, provider, exists_params)
-                availability_sql = availability_condition(a_cols, availability, exists_params)
-                exists_sql = (
-                    f"EXISTS (SELECT 1 FROM public.{qident(availability_table)} a "
-                    f"WHERE {join} AND {provider_sql} AND {availability_sql})"
-                )
-                where_params: List[Any] = []
-                content_sql = content_filters(m_cols, qp, where_params)
-                where_sql = f"WHERE {content_sql} AND {exists_sql}"
-                final_params = where_params + exists_params
-                cur.execute(f"SELECT COUNT(*) AS total FROM public.{qident(content_table)} m {where_sql}", final_params)
+                avail_sql = availability_condition(a_cols, availability, exists_params)
+                where_sql = f"WHERE {content_sql} AND EXISTS (SELECT 1 FROM public.{qident(availability_table)} a WHERE {join_sql} AND {provider_sql} AND {avail_sql})"
+                full_params = content_params + exists_params
+                cur.execute(f"SELECT COUNT(*) AS total FROM public.{qident(content_table)} m {where_sql}", full_params)
                 total = int((cur.fetchone() or {}).get("total") or 0)
-                cur.execute(
-                    f"""
-                    SELECT m.*
-                    FROM public.{qident(content_table)} m
-                    {where_sql}
-                    ORDER BY {order_sql(m_cols, qp.get("sort") or "popular")}
-                    LIMIT %s OFFSET %s
-                    """,
-                    final_params + [limit, offset],
-                )
+                cur.execute(f"SELECT m.* FROM public.{qident(content_table)} m {where_sql} ORDER BY {order_sql(m_cols, qp.get('sort') or 'popular')} LIMIT %s OFFSET %s", full_params + [limit, offset])
                 rows = [dict(r) for r in cur.fetchall()]
-        return {
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "items": enrich_items(rows, config["domain"], config["prefix"], provider),
-            "source": "provider_filter_v5_middleware_fast_v1",
-            "domain": config["domain"],
-            "provider": provider,
-            "availability": availability or "",
-        }
+        return {"page": page, "limit": limit, "total": total, "items": enrich(rows, config, provider), "domain": config["domain"], "label": config["label"], "provider": normalize_provider(provider), "availability": availability, "source": "provider_filter_v5_middleware_fast_v2"}
 
-# Backward compatibility for older main_v3.py import/call path.
-# main_v3.py may import install_provider_filter_v5_middleware from older builds.
-# The middleware is already installed directly before CORS by the V1 fix.
 def install_provider_filter_v5_middleware(app):
     return app
