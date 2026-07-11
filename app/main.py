@@ -21,7 +21,14 @@ Canonical production serving rules:
         public.youtube_link_from_provider_v2 is the YouTube compatibility view.
 """
 
-from app.main_v3 import app
+try:
+    from app.main_v3 import app
+except Exception:
+    import traceback
+
+    print("FLIXYFY_IMPORT_MAIN_V3_FAILED")
+    traceback.print_exc()
+    raise
 
 __all__ = ["app"]
 # FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_INSTALL_START
