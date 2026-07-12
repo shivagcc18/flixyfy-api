@@ -26,5 +26,4 @@ drop_*_v*.py
 load_*_v*.py
 rebuild_*_v*.py
 add_*_indexes.py
-main.py
 railway.json
