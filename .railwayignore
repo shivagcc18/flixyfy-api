@@ -1,0 +1,14 @@
+.git/
+.codex_runtime_deps/
+_flixyfy_backups/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.log
+.env
+.env.local
+backups/
+reports/

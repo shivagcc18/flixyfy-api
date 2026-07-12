@@ -1,5 +1,7 @@
 .env
 __pycache__/
+.codex_runtime_deps/
+_flixyfy_backups/
 *.pyc
 *.db
 *.sqlite
