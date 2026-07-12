@@ -1133,72 +1133,195 @@ def has_direct_provider_url(rows: List[Dict[str, Any]]) -> bool:
 
 
 PROVIDER_LINK_TABLES = ("ott_availability_provider_links_v5", "ott_availability_provider_links_v2")
+DOMAIN_PROVIDER_TABLES = {
+    "hollywood": (
+        "hollywood_availability_serving_v5",
+        "hollywood_availability_serving_v3",
+        "hollywood_availability_serving_v2",
+        "hollywood_availability_serving_v1",
+        "provider_availability_serving_v2",
+        "provider_availability_serving_v1",
+    ),
+    "historical": (
+        "historical_availability_serving_v5",
+        "historical_availability_serving_v3",
+        "historical_availability_serving_v2",
+        "historical_availability_v2",
+        "provider_availability_serving_v2",
+        "provider_availability_serving_v1",
+    ),
+    "current": (
+        "current_availability_serving_v5",
+        "provider_availability_serving_v2",
+        "provider_availability_serving_v1",
+        "ott_availability_normalized_v2",
+        "ott_availability_normalized_v1",
+    ),
+}
 
 
 def provider_links_availability(tmdb_id, domain: str) -> List[Dict[str, Any]]:
-    table_name = next((name for name in PROVIDER_LINK_TABLES if table_exists(name)), None)
-    if tmdb_id is None or not table_name:
+    if tmdb_id is None:
         return []
 
     conn = get_conn()
     cur = conn.cursor()
 
     try:
-        cur.execute(
-            """
-            SELECT
-                provider_key,
-                provider_display_name,
-                provider_category,
-                provider_type,
-                region,
-                provider_deep_link,
-                provider_search_url,
-                provider_homepage_url,
-                tmdb_watch_url,
-                final_url,
-                final_url_source,
-                button_label,
-                priority
-            FROM public.{qident(table_name)}
-            WHERE CAST(tmdb_id AS TEXT) = CAST(%s AS TEXT)
-            ORDER BY priority NULLS LAST, provider_display_name
-            LIMIT 80
-            """,
-            (tmdb_id,),
-        )
+        for table_name in PROVIDER_LINK_TABLES:
+            if not table_exists(table_name):
+                continue
 
-        rows = []
-        for row in cur.fetchall():
-            direct_url = (
-                row.get("provider_deep_link")
-                or (None if is_bad_watch_url(row.get("final_url")) else row.get("final_url"))
-                or row.get("provider_search_url")
-                or row.get("provider_homepage_url")
-            )
-            provider_name = row.get("provider_display_name")
-            rows.append(
-                {
-                    "domain": domain,
-                    "provider_key": row.get("provider_key") or normalize_provider_key(provider_name),
-                    "provider_display_name": provider_name,
-                    "provider_category": row.get("provider_category"),
-                    "provider_type": row.get("provider_type") or row.get("provider_category"),
-                    "region": row.get("region"),
-                    "deep_link": row.get("provider_deep_link"),
-                    "provider_deep_link": row.get("provider_deep_link"),
-                    "provider_search_url": row.get("provider_search_url"),
-                    "provider_homepage_url": row.get("provider_homepage_url"),
-                    "tmdb_watch_url": row.get("tmdb_watch_url"),
-                    "final_url": direct_url,
-                    "final_url_source": row.get("final_url_source"),
-                    "button_label": row.get("button_label") or (f"Watch on {provider_name}" if provider_name else "Watch"),
-                    "priority": row.get("priority"),
-                    "source_table": table_name,
-                }
+            cur.execute(
+                f"""
+                SELECT
+                    provider_key,
+                    provider_display_name,
+                    provider_category,
+                    provider_type,
+                    region,
+                    provider_deep_link,
+                    provider_search_url,
+                    provider_homepage_url,
+                    tmdb_watch_url,
+                    final_url,
+                    final_url_source,
+                    button_label,
+                    priority
+                FROM public.{qident(table_name)}
+                WHERE CAST(tmdb_id AS TEXT) = CAST(%s AS TEXT)
+                ORDER BY priority NULLS LAST, provider_display_name
+                LIMIT 80
+                """,
+                (tmdb_id,),
             )
 
-        return [row for row in rows if row.get("provider_key") or row.get("provider_display_name")]
+            rows = []
+            for row in cur.fetchall():
+                direct_url = (
+                    row.get("provider_deep_link")
+                    or (None if is_bad_watch_url(row.get("final_url")) else row.get("final_url"))
+                    or row.get("provider_search_url")
+                    or row.get("provider_homepage_url")
+                )
+                provider_name = row.get("provider_display_name")
+                rows.append(
+                    {
+                        "domain": domain,
+                        "provider_key": row.get("provider_key") or normalize_provider_key(provider_name),
+                        "provider_display_name": provider_name,
+                        "provider_category": row.get("provider_category"),
+                        "provider_type": row.get("provider_type") or row.get("provider_category"),
+                        "region": row.get("region"),
+                        "deep_link": row.get("provider_deep_link"),
+                        "provider_deep_link": row.get("provider_deep_link"),
+                        "provider_search_url": row.get("provider_search_url"),
+                        "provider_homepage_url": row.get("provider_homepage_url"),
+                        "tmdb_watch_url": row.get("tmdb_watch_url"),
+                        "final_url": direct_url,
+                        "final_url_source": row.get("final_url_source"),
+                        "button_label": row.get("button_label") or (f"Watch on {provider_name}" if provider_name else "Watch"),
+                        "priority": row.get("priority"),
+                        "source_table": table_name,
+                    }
+                )
+
+            rows = [row for row in rows if row.get("provider_key") or row.get("provider_display_name")]
+            if rows:
+                return rows
+
+        return []
+    finally:
+        conn.close()
+
+
+def domain_values(domain: str) -> List[str]:
+    return {
+        "current": ["current", "indian", "movie", "movies"],
+        "hollywood": ["hollywood", "global", "global_movie", "global_movies"],
+        "historical": ["historical", "historical_movie", "historical_movies"],
+        "webseries": ["webseries", "web_series", "series", "tv"],
+    }.get(domain, [domain])
+
+
+def generic_provider_availability(row: Dict[str, Any], domain: str) -> List[Dict[str, Any]]:
+    tables = DOMAIN_PROVIDER_TABLES.get(domain, ())
+    if not tables:
+        return []
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        for table_name in tables:
+            if not table_exists(table_name):
+                continue
+
+            cols = table_columns(table_name)
+            where = []
+            params = []
+
+            for col in ("tmdb_id", "content_tmdb_id", "movie_tmdb_id"):
+                if row.get("tmdb_id") is not None and col in cols:
+                    where.append(f"CAST({qident(col)} AS TEXT) = CAST(%s AS TEXT)")
+                    params.append(str(row.get("tmdb_id")))
+
+            for col in ("imdb_id", "content_imdb_id", "movie_imdb_id"):
+                if row.get("imdb_id") and col in cols:
+                    where.append(f"CAST({qident(col)} AS TEXT) = CAST(%s AS TEXT)")
+                    params.append(str(row.get("imdb_id")))
+
+            for col in ("slug", "content_slug", "movie_slug"):
+                if row.get("slug") and col in cols:
+                    where.append(f"{qident(col)} = %s")
+                    params.append(row.get("slug"))
+
+            title_col = next((col for col in ("title", "name", "content_title", "movie_title", "original_title") if col in cols), None)
+            year_col = next((col for col in ("release_year", "year", "content_year", "movie_year") if col in cols), None)
+            if title_col and row.get("title"):
+                if year_col and row.get("release_year"):
+                    where.append(f"(LOWER(TRIM(CAST({qident(title_col)} AS TEXT))) = LOWER(TRIM(%s)) AND CAST({qident(year_col)} AS TEXT) = CAST(%s AS TEXT))")
+                    params.extend([row.get("title"), str(row.get("release_year"))])
+                else:
+                    where.append(f"LOWER(TRIM(CAST({qident(title_col)} AS TEXT))) = LOWER(TRIM(%s))")
+                    params.append(row.get("title"))
+
+            if not where:
+                continue
+
+            domain_col = next((col for col in ("domain", "content_domain", "media_domain", "source_domain", "content_type", "media_type") if col in cols), None)
+            domain_sql = ""
+            if domain_col:
+                values = domain_values(domain)
+                placeholders = ",".join(["%s"] * len(values))
+                domain_sql = f" AND LOWER(CAST({qident(domain_col)} AS TEXT)) IN ({placeholders})"
+                params.extend(values)
+
+            cur.execute(
+                f"""
+                SELECT *
+                FROM public.{qident(table_name)}
+                WHERE ({" OR ".join(f"({w})" for w in where)}){domain_sql}
+                LIMIT 100
+                """,
+                params,
+            )
+
+            rows = normalize_availability([dict(r) for r in cur.fetchall()], domain)
+            rows = [
+                item
+                for item in rows
+                if item.get("provider_key")
+                or item.get("provider_display_name")
+                or item.get("final_url")
+                or item.get("provider_deep_link")
+            ]
+            if rows:
+                for item in rows:
+                    item.setdefault("source_table", table_name)
+                return rows
+
+        return []
     finally:
         conn.close()
 
@@ -1221,6 +1344,9 @@ def domain_detail(row: Dict[str, Any], domain: str):
 
     if provider_link_rows and not has_direct_provider_url(availability):
         availability = provider_link_rows
+
+    if not availability:
+        availability = generic_provider_availability(row, domain)
 
     # Domain detail pages can miss provider rows when the domain-specific
     # availability table lags the normalized v2 OTT serving table.
