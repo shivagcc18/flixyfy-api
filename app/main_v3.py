@@ -132,6 +132,22 @@ def normalize_provider_key(value):
     return (value or "").strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def is_bad_watch_url(url):
+    value = str(url or "").strip().lower()
+    return not value or "themoviedb.org/" in value or "justwatch.com/" in value
+
+
+def provider_fallback_url(provider_key=None, provider_name=None, title=None):
+    key = normalize_provider_key(provider_key or provider_name)
+
+    if title:
+        search_template = PROVIDER_SEARCH.get(key)
+        if search_template:
+            return search_template.format(q=quote_plus(str(title)))
+
+    return PROVIDER_HOME.get(key)
+
+
 def movie_card(row):
     slug = row.get("slug")
 
@@ -240,6 +256,8 @@ def normalize_ott_v2_row(row):
         homepage_url = PROVIDER_HOME.get(provider_key)
 
     final_url = row.get("final_url") or row.get("deep_link") or homepage_url
+    if is_bad_watch_url(final_url):
+        final_url = provider_fallback_url(provider_key, provider_name) or homepage_url
 
     return {
         "provider_key": provider_key,
@@ -333,8 +351,7 @@ def load_ott_provider_links_fallback(tmdb_id):
 
 
 def _flixyfy_compat_is_bad_watch_url(url):
-    value = str(url or "").strip().lower()
-    return not value or "themoviedb.org/" in value or "justwatch.com/" in value
+    return is_bad_watch_url(url)
 
 
 def _flixyfy_compat_has_direct_provider_url(items):
@@ -1982,6 +1999,7 @@ def _flixyfy_compat_normalize_availability_row(row, table_name):
         row,
         ["deep_link", "final_url", "watch_url", "url", "provider_url", "web_url", "youtube_url"],
     )
+    title = _flixyfy_compat_first(row, ["title", "movie_title", "content_title", "name"])
     category = _flixyfy_compat_first(
         row,
         ["provider_category", "provider_type", "monetization_type", "type"],
@@ -1995,6 +2013,9 @@ def _flixyfy_compat_normalize_availability_row(row, table_name):
         or category_l in {"free", "free_with_ads", "ads"}
         or "youtube" in provider_l
     )
+
+    if is_bad_watch_url(url):
+        url = provider_fallback_url(provider_key, provider_name, title=title)
 
     return {
         "provider_key": provider_key,
@@ -2455,6 +2476,16 @@ def load_ott_links(tmdb_id=None, slug=None, **kwargs):
     seen = set()
 
     for item in load_ott_provider_links_fallback(tmdb_id):
+        if _flixyfy_compat_is_bad_watch_url(item.get("final_url")):
+            fallback_url = provider_fallback_url(
+                item.get("provider_key"),
+                item.get("provider_display_name") or item.get("provider_name"),
+            )
+            item["final_url"] = fallback_url
+            item["deep_link"] = fallback_url
+            item["watch_url"] = fallback_url
+            item["url"] = fallback_url
+
         provider_key = str(item.get("provider_key") or item.get("provider_name") or "").lower().strip()
         url = str(item.get("final_url") or item.get("deep_link") or item.get("watch_url") or item.get("url") or "").strip()
         key = (provider_key, url)
