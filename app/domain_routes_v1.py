@@ -1632,24 +1632,25 @@ def search_modern(
     finally:
         conn.close()
 
-    if (
-        query
-        and _allow_fallback
-        and total == 0
-        and table_name != MODERN_TABLE
-        and table_exists(MODERN_TABLE)
-    ):
-        return search_modern(
-            query=query,
-            limit=limit,
-            language=language,
-            year=year,
-            provider=provider,
-            availability=availability,
-            sort=sort,
-            _table_name=MODERN_TABLE,
-            _allow_fallback=False,
-        )
+    if query and _allow_fallback and total == 0:
+        for fallback_table in (MODERN_TABLE, "current_movie_serving_v5_backend_compat", "current_movie_serving_v5"):
+            if fallback_table == table_name or not table_exists(fallback_table):
+                continue
+
+            fallback_total, fallback_items = search_modern(
+                query=query,
+                limit=limit,
+                language=language,
+                year=year,
+                provider=provider,
+                availability=availability,
+                sort=sort,
+                _table_name=fallback_table,
+                _allow_fallback=False,
+            )
+
+            if fallback_total > 0 or fallback_items:
+                return fallback_total, fallback_items
 
     return total, items
 
