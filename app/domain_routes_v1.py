@@ -1053,6 +1053,10 @@ def normalize_availability(rows: List[Dict[str, Any]], domain: str):
             ],
         )
 
+        if is_bad_watch_url(final_url):
+            item.setdefault("tmdb_watch_url", final_url)
+            final_url = None
+
         if not final_url and provider_key:
             title = item.get("title") or item.get("movie_title") or ""
             search_template = PROVIDER_SEARCH.get(provider_key)
