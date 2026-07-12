@@ -23,7 +23,7 @@ def env_nonempty(name: str, default: str) -> str:
 
 
 MODERN_TABLE = env_nonempty("SERVING_TABLE", "current_movie_serving_v5_backend_compat")
-MODERN_SEARCH_TABLE = env_nonempty("MODERN_SEARCH_TABLE", MODERN_TABLE)
+MODERN_SEARCH_TABLE = env_nonempty("MODERN_SEARCH_TABLE", "current_movie_serving_v5_backend_compat")
 
 WEBSERIES_SEARCH_TABLE = env_nonempty("WEBSERIES_SEARCH_TABLE", "webseries_series_serving_v5")
 WEBSERIES_CARD_TABLE = env_nonempty("WEBSERIES_CARD_TABLE", WEBSERIES_SEARCH_TABLE)
