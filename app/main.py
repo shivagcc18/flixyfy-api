@@ -1,42 +1,814 @@
-﻿# FILE: C:\Users\USER\Desktop\flixyfy-deploy\flixyfy-api\app\main.py
-r"""
-FLIXYFY production FastAPI entrypoint.
+from __future__ import annotations
+import os
+import re
+import time
+from contextlib import asynccontextmanager
+from typing import Any, Literal
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
-Railway starts:
-    uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+DATABASE_URL = os.environ["DATABASE_URL"]
+MOVIE_TABLES = {
+    "current": "current_movie_api_v1",
+    "historical": "historical_movie_serving_v5",
+    "hollywood": "hollywood_movie_serving_v5",
+    "webseries": "webseries_series_serving_v5",
+}
+SEARCH_TABLES = {
+    "current": "current_search_serving_v5",
+    "historical": "historical_search_serving_v5",
+    "hollywood": "hollywood_search_serving_v5",
+    "webseries": "webseries_search_serving_v5",
+}
+PERSON_TABLES = {
+    "current": "current_person_serving_v5",
+    "historical": "historical_person_serving_v5",
+    "hollywood": "hollywood_person_serving_v5",
+    "webseries": "webseries_person_serving_v5",
+}
+DOMAIN_VALUES = {
+    "current": ("current", "indian", "movie", "movies"),
+    "historical": ("historical",),
+    "hollywood": ("hollywood",),
+    "webseries": ("webseries", "series"),
+}
+# FLIXYFY_FRESH_API_POOL_STALE_CONNECTION_RESILIENCE_V1
+# Validate an idle pooled connection before handing it to an API request.
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=10,
+    timeout=15,
+    max_lifetime=300,
+    check=ConnectionPool.check_connection,
+    kwargs={"row_factory": dict_row},
+    open=False,
+)
 
-The production app object currently lives in app.main_v3.
+def qi(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
-Do not create parallel FastAPI app entrypoints.
-Do not place test, audit, repair, sync, or verification scripts in flixyfy-deploy.
-Those belong under:
-    C:\Users\USER\Desktop\ott_project\data_factory
+def all_rows(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    with pool.connection() as conn:
+        return list(conn.execute(sql, params).fetchall())
 
-Canonical production serving rules:
-    - Person pages:
-        public.person_page_serving_v1
+def one_row(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+    with pool.connection() as conn:
+        return conn.execute(sql, params).fetchone()
 
-    - YouTube full-movie links:
-        public.domain_availability_serving_v5 is canonical.
-        public.youtube_link_from_provider_v2 is the YouTube compatibility view.
-"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    pool.open()
+    pool.wait()
+    try:
+        yield
+    finally:
+        pool.close()
 
-try:
-    from app.main_v3 import app
-except Exception:
-    import traceback
+app = FastAPI(title="FLIXYFY Fresh Lean API", version="1.0.0", lifespan=lifespan)
 
-    print("FLIXYFY_IMPORT_MAIN_V3_FAILED")
-    traceback.print_exc()
-    raise
+DEFAULT_CORS_ORIGINS = (
+    "https://www.flixyfy.com",
+    "https://flixyfy.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:18081",
+    "http://localhost:18081",
+)
 
-__all__ = ["app"]
-# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_INSTALL_START
-# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_AUDIT_APPLY_V3
-# Provider-filtered list requests use existing domain availability_serving_v5 tables only.
-try:
-    from app.provider_filter_v5_middleware import install_provider_filter_v5_middleware
-    install_provider_filter_v5_middleware(app)
-except Exception as exc:
-    print(f"FLIXYFY provider filter v5 middleware disabled: {exc}")
-# FLIXYFY_BACKEND_PROVIDER_FILTERS_V5_INSTALL_END
+
+def _configured_cors_origins() -> list[str]:
+    configured = [
+        x.strip()
+        for x in os.getenv("CORS_ORIGINS", ",".join(DEFAULT_CORS_ORIGINS)).split(",")
+        if x.strip()
+    ]
+    return sorted(set(configured).union(DEFAULT_CORS_ORIGINS))
+
+
+CORS_ORIGINS = _configured_cors_origins()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+GET_CACHE_TTL_SECONDS = int(os.getenv("FLIXYFY_GET_CACHE_TTL_SECONDS", "45"))
+_GET_CACHE: dict[str, tuple[float, int, dict[str, str], bytes]] = {}
+
+
+def _cacheable_get_path(path: str) -> bool:
+    return path.startswith("/api/v4/") and not any(
+        blocked in path.lower() for blocked in ("/admin", "/login", "/auth")
+    )
+
+
+def _cors_headers_for_request(request: Request) -> dict[str, str]:
+    origin = request.headers.get("origin")
+    if origin in CORS_ORIGINS:
+        return {"access-control-allow-origin": origin, "vary": "Origin"}
+    return {}
+
+
+@app.middleware("http")
+async def _flixyfy_v4_get_cache(request: Request, call_next):
+    if (
+        request.method != "GET"
+        or not _cacheable_get_path(request.url.path)
+        or GET_CACHE_TTL_SECONDS <= 0
+    ):
+        return await call_next(request)
+
+    key = f"{request.url.path}?{request.url.query}"
+    now = time.monotonic()
+    cached = _GET_CACHE.get(key)
+    if cached and cached[0] > now:
+        _, status_code, headers, body = cached
+        merged_headers = dict(headers)
+        merged_headers.update(_cors_headers_for_request(request))
+        return Response(content=body, status_code=status_code, headers=merged_headers)
+
+    response = await call_next(request)
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    headers = dict(response.headers)
+    if 200 <= response.status_code < 300:
+        headers.pop("access-control-allow-origin", None)
+        headers.pop("access-control-allow-credentials", None)
+        _GET_CACHE[key] = (now + GET_CACHE_TTL_SECONDS, response.status_code, headers, body)
+
+    response_headers = dict(headers)
+    response_headers.update(_cors_headers_for_request(request))
+    return Response(content=body, status_code=response.status_code, headers=response_headers)
+
+@app.get("/api/v1/health")
+def health():
+    row = one_row("SELECT current_database() AS database_name, now() AS checked_at")
+    return {"status": "ok", "database_connected": True, **(row or {})}
+
+@app.get("/api/v1/content")
+def content(
+    domain: Literal["current", "historical", "hollywood", "webseries"] = "current",
+    provider: str | None = None,
+    language: str | None = None,
+    year: int | None = None,
+    limit: int = Query(24, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    table = MOVIE_TABLES[domain]
+    where = []
+    params: list[Any] = []
+    if language:
+        where.append('"language_slug"=%s')
+        params.append(language)
+    if year:
+        where.append('"release_year"=%s')
+        params.append(year)
+    if provider:
+        if domain == "current" and provider.lower() == "youtube":
+            where.append('COALESCE("has_youtube",false)=true')
+        else:
+            domains = DOMAIN_VALUES[domain]
+            placeholders = ",".join(["%s"] * len(domains))
+            where.append(
+                'EXISTS (SELECT 1 FROM public."provider_availability_serving_v2" a '
+                f'WHERE a."content_slug"={qi(table)}."slug" '
+                f'AND LOWER(COALESCE(a."domain",\'\')) IN ({placeholders}) '
+                'AND LOWER(COALESCE(a."provider_key",\'\'))=%s)'
+            )
+            params.extend([x.lower() for x in domains])
+            params.append(provider.lower())
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    total = one_row(
+        f"SELECT COUNT(*)::bigint AS total FROM public.{qi(table)}{clause}",
+        tuple(params),
+    )
+    items = all_rows(
+        f"SELECT * FROM public.{qi(table)}{clause} "
+        'ORDER BY "popularity" DESC NULLS LAST, "release_year" DESC NULLS LAST '
+        "LIMIT %s OFFSET %s",
+        tuple(params + [limit, offset]),
+    )
+    return {
+        "domain": domain,
+        "provider": provider,
+        "total": int(total["total"]) if total else 0,
+        "items": items,
+    }
+
+@app.get("/api/v1/content/{domain}/{slug}")
+def detail(
+    domain: Literal["current", "historical", "hollywood", "webseries"],
+    slug: str,
+):
+    table = MOVIE_TABLES[domain]
+    item = one_row(
+        f'SELECT * FROM public.{qi(table)} WHERE "slug"=%s LIMIT 1',
+        (slug,),
+    )
+    if not item:
+        raise HTTPException(404, "Content not found")
+    domains = DOMAIN_VALUES[domain]
+    placeholders = ",".join(["%s"] * len(domains))
+    availability = all_rows(
+        'SELECT * FROM public."provider_availability_serving_v2" '
+        f'WHERE LOWER(COALESCE("domain",\'\')) IN ({placeholders}) '
+        'AND "content_slug"=%s ORDER BY "source_priority", "provider_key"',
+        tuple([x.lower() for x in domains] + [slug]),
+    )
+    return {"domain": domain, "item": item, "availability": availability}
+
+@app.get("/api/v1/search")
+def search(
+    q: str = Query(..., min_length=1, max_length=120),
+    domain: Literal["all", "current", "historical", "hollywood", "webseries"] = "all",
+    limit: int = Query(30, ge=1, le=100),
+):
+    domains = list(SEARCH_TABLES) if domain == "all" else [domain]
+    results = []
+    for key in domains:
+        table = SEARCH_TABLES[key]
+        results.extend(
+            all_rows(
+                f'SELECT *, %s::text AS "_domain" FROM public.{qi(table)} '
+                'WHERE COALESCE("search_text",\'\') ILIKE %s '
+                'OR COALESCE("title",\'\') ILIKE %s '
+                'ORDER BY "rank_score" DESC NULLS LAST LIMIT %s',
+                (key, f"%{q}%", f"%{q}%", max(limit, 5)),
+            )
+        )
+    results.sort(key=lambda x: float(x.get("rank_score") or 0), reverse=True)
+    return {"query": q, "domain": domain, "total": len(results[:limit]), "items": results[:limit]}
+
+@app.get("/api/v1/person/{domain}/{person_slug}")
+def person(
+    domain: Literal["current", "historical", "hollywood", "webseries"],
+    person_slug: str,
+):
+    table = PERSON_TABLES[domain]
+    row = one_row(
+        f'SELECT * FROM public.{qi(table)} WHERE "person_slug"=%s LIMIT 1',
+        (person_slug,),
+    )
+    if not row:
+        raise HTTPException(404, "Person not found")
+    return {"domain": domain, "person": row}
+
+@app.get("/api/v1/providers")
+def providers(
+    domain: Literal["current", "historical", "hollywood", "webseries"] = "current",
+):
+    domains = DOMAIN_VALUES[domain]
+    placeholders = ",".join(["%s"] * len(domains))
+    items = all_rows(
+        'SELECT LOWER("provider_key") AS provider_key, '
+        'MIN("provider_name") AS provider_name, COUNT(*)::bigint AS row_count, '
+        'COUNT(DISTINCT "content_slug")::bigint AS content_count '
+        'FROM public."provider_availability_serving_v2" '
+        f'WHERE LOWER(COALESCE("domain",\'\')) IN ({placeholders}) '
+        'GROUP BY LOWER("provider_key") ORDER BY content_count DESC, provider_key',
+        tuple(x.lower() for x in domains),
+    )
+    return {"domain": domain, "items": items}
+
+# FLIXYFY_FRESH_API_V4_BRIDGE_FOR_REAL_FRONTEND_V1
+# Fresh-stack V4 bridge for the copied real frontend.
+# Keeps /api/v1 intact. Adds /api/v4 endpoints so the fresh UI does not depend on legacy /api/v3 route names.
+
+def _v4_norm_domain(value: str | None) -> str:
+    v = (value or "current").strip().lower()
+    aliases = {
+        "movie": "current",
+        "movies": "current",
+        "indian": "current",
+        "current_movies": "current",
+        "historical_movies": "historical",
+        "global": "hollywood",
+        "global_movies": "hollywood",
+        "series": "webseries",
+        "web_series": "webseries",
+    }
+    if v in {"current", "historical", "hollywood", "webseries"}:
+        return v
+    return aliases.get(v, "current")
+
+def _v4_norm_provider(value: str | None) -> str | None:
+    v = (value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "": "",
+        "all": "",
+        "all_provider": "",
+        "all_providers": "",
+        "all provider": "",
+        "all providers": "",
+        "prime": "prime_video",
+        "prime video": "prime_video",
+        "primevideo": "prime_video",
+        "amazon prime": "prime_video",
+        "amazon prime video": "prime_video",
+        "youtube": "youtube",
+        "netflix": "netflix",
+    }
+    return aliases.get(v, v.replace(" ", "_")) or None
+
+def _v4_limit(limit: int | None, default: int = 24, cap: int = 100) -> int:
+    try:
+        value = int(limit or default)
+    except Exception:
+        value = default
+    if value < 1:
+        value = default
+    return min(value, cap)
+
+def _v4_offset(page: int | None, limit: int | None) -> int:
+    p = int(page or 1)
+    l = _v4_limit(limit)
+    if p < 1:
+        p = 1
+    return (p - 1) * l
+
+def _v4_qi(name: str) -> str:
+    q = globals().get("qi")
+    if callable(q):
+        return q(name)
+    return '"' + str(name).replace('"', '""') + '"'
+
+def _v4_rows(sql: str, params: list | tuple = ()) -> list[dict]:
+    many = globals().get("many_rows")
+    if callable(many):
+        return list(many(sql, list(params)) or [])
+    pool_obj = globals().get("pool")
+    if pool_obj is None:
+        raise RuntimeError("database pool is unavailable")
+    with pool_obj.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, list(params))
+            data = cur.fetchall()
+            return [dict(x) for x in (data or [])]
+
+def _v4_one(sql: str, params: list | tuple = ()) -> dict | None:
+    one = globals().get("one_row")
+    if callable(one):
+        row = one(sql, list(params))
+        return dict(row) if row else None
+    rows = _v4_rows(sql, params)
+    return rows[0] if rows else None
+
+def _v4_movie_table(domain: str) -> str:
+    domain = _v4_norm_domain(domain)
+    mapping = globals().get("MOVIE_TABLES") or {}
+    if isinstance(mapping, dict) and domain in mapping:
+        return mapping[domain]
+    return {
+        "current": "current_movie_serving_v5",
+        "historical": "historical_movie_serving_v5",
+        "hollywood": "hollywood_movie_serving_v5",
+        "webseries": "webseries_series_serving_v5",
+    }[domain]
+
+def _v4_person_table(domain: str) -> str:
+    domain = _v4_norm_domain(domain)
+    mapping = globals().get("PERSON_TABLES") or {}
+    if isinstance(mapping, dict) and domain in mapping:
+        return mapping[domain]
+    return {
+        "current": "current_person_serving_v5",
+        "historical": "historical_person_serving_v5",
+        "hollywood": "hollywood_person_serving_v5",
+        "webseries": "webseries_person_serving_v5",
+    }[domain]
+
+def _v4_domain_values(domain: str) -> list[str]:
+    domain = _v4_norm_domain(domain)
+    mapping = globals().get("DOMAIN_VALUES") or {}
+    if isinstance(mapping, dict) and domain in mapping:
+        return list(mapping[domain])
+    return {
+        "current": ["current", "movie", "movies", "indian"],
+        "historical": ["historical"],
+        "hollywood": ["hollywood", "global"],
+        "webseries": ["webseries", "series"],
+    }[domain]
+
+def _v4_items_payload(raw, page: int = 1, limit: int = 24, domain: str | None = None) -> dict:
+    out = dict(raw or {}) if isinstance(raw, dict) else {"items": list(raw or [])}
+    items = list(out.get("items") or out.get("results") or out.get("movies") or out.get("data") or [])
+    out["items"] = items
+    out.setdefault("results", items)
+    out.setdefault("movies", items)
+    out.setdefault("data", items)
+    out.setdefault("total", len(items))
+    out["page"] = int(page or 1)
+    out["limit"] = int(limit or len(items) or 24)
+    if domain is not None:
+        out.setdefault("domain", domain)
+    return out
+
+CARD_FIELDS = (
+    "id", "tmdb_id", "imdb_id", "domain", "source_domain", "slug", "movie_slug",
+    "title", "name", "original_title", "release_year", "year", "first_air_year",
+    "poster_url", "poster_path", "poster", "image_url", "image", "thumbnail",
+    "backdrop_url", "backdrop_path", "primary_language", "language", "language_slug",
+    "language_name", "primary_language_slug", "primary_language_name", "rating",
+    "vote_average", "popularity", "quality_score", "ott_primary", "ott_primary_key",
+    "provider", "provider_key", "provider_name", "has_youtube", "has_ott",
+    "is_free", "type", "content_type", "entity_type",
+)
+
+
+def _v4_slim_card_item(item: dict) -> dict:
+    if not isinstance(item, dict):
+        return item
+    slim = {key: item.get(key) for key in CARD_FIELDS if key in item and item.get(key) is not None}
+    if "domain" not in slim:
+        source_domain = item.get("source_domain") or item.get("_domain")
+        if source_domain:
+            slim["domain"] = source_domain
+    return slim or item
+
+
+def _v4_slim_card_payload(payload: dict) -> dict:
+    out = dict(payload or {})
+    items = [_v4_slim_card_item(item) for item in list(out.get("items") or [])]
+    out["items"] = items
+    out["results"] = items
+    out["movies"] = items
+    out["data"] = items
+    return out
+def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None) -> dict:
+    domain = _v4_norm_domain(domain)
+    provider = _v4_norm_provider(provider)
+    limit = _v4_limit(limit)
+    offset = _v4_offset(page, limit)
+
+    content_fn = globals().get("content")
+    if callable(content_fn):
+        raw = content_fn(domain=domain, provider=provider, language=language, year=year, limit=limit, offset=offset)
+        return _v4_slim_card_payload(_v4_items_payload(raw, page=page, limit=limit, domain=domain))
+
+    table = _v4_movie_table(domain)
+    where = []
+    params = []
+
+    if language:
+        where.append('LOWER(COALESCE("language_slug", \'\')) = %s')
+        params.append(str(language).lower())
+
+    if year:
+        where.append('"release_year" = %s')
+        params.append(int(year))
+
+    if provider:
+        domains = _v4_domain_values(domain)
+        placeholders = ",".join(["%s"] * len(domains))
+        where.append(
+            'EXISTS (SELECT 1 FROM public."provider_availability_serving_v2" a '
+            f'WHERE a."content_slug"={_v4_qi(table)}."slug" '
+            f'AND LOWER(COALESCE(a."domain", \'\')) IN ({placeholders}) '
+            'AND LOWER(COALESCE(a."provider_key", \'\'))=%s)'
+        )
+        params.extend([x.lower() for x in domains])
+        params.append(str(provider).lower())
+
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    total = _v4_one(f'SELECT COUNT(*) AS total FROM public.{_v4_qi(table)}{clause}', params) or {"total": 0}
+    rows = _v4_rows(
+        f'SELECT * FROM public.{_v4_qi(table)}{clause} '
+        'ORDER BY COALESCE("release_year", 0) DESC, COALESCE("popularity", 0) DESC, COALESCE("title", \'\') '
+        'LIMIT %s OFFSET %s',
+        params + [limit, offset],
+    )
+    return _v4_slim_card_payload(_v4_items_payload({"total": int(total.get("total") or 0), "items": rows}, page=page, limit=limit, domain=domain))
+
+def _v4_search_payload(q: str | None = None, page: int = 1, limit: int = 24, domain: str | None = None, type: str | None = None, region: str | None = None, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None) -> dict:
+    q = (q or "").strip()
+    limit = _v4_limit(limit)
+    provider = _v4_norm_provider(provider)
+
+    search_fn = globals().get("search")
+    if callable(search_fn) and q:
+        mapped_domain = "all"
+        if domain:
+            mapped_domain = _v4_norm_domain(domain)
+        elif region and str(region).lower() == "global":
+            mapped_domain = "hollywood"
+
+        raw = search_fn(q=q, domain=mapped_domain, limit=limit)
+        out = _v4_items_payload(raw, page=page, limit=limit, domain=mapped_domain)
+        out["query"] = q
+        out["type"] = type or "all"
+        out["region"] = region or "all"
+        return out
+
+    desired = (type or "").strip().lower()
+    if desired in {"webseries", "series"}:
+        return _v4_content_payload("webseries", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+    if region and str(region).lower() == "global":
+        return _v4_content_payload("hollywood", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+    return _v4_content_payload(domain or "current", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+
+def _v4_provider_rows(slug: str, domain: str) -> list[dict]:
+    domains = _v4_domain_values(domain)
+    placeholders = ",".join(["%s"] * len(domains))
+    try:
+        return _v4_rows(
+            f'SELECT * FROM public."provider_availability_serving_v2" '
+            f'WHERE "content_slug"=%s AND LOWER(COALESCE("domain", \'\')) IN ({placeholders}) '
+            f'ORDER BY COALESCE("provider_key", \'\'), COALESCE("provider_name", \'\') '
+            f'LIMIT 100',
+            [slug] + [x.lower() for x in domains],
+        )
+    except Exception:
+        return []
+
+def _v4_detail_payload(domain: str, slug: str) -> dict:
+    domain = _v4_norm_domain(domain)
+    table = _v4_movie_table(domain)
+    row = _v4_one(f'SELECT * FROM public.{_v4_qi(table)} WHERE "slug"=%s LIMIT 1', [slug])
+    if not row:
+        raise HTTPException(status_code=404, detail="Not Found")
+    availability = _v4_provider_rows(slug, domain)
+    row["availability"] = availability
+    row["ott_all"] = availability
+    row["watch_providers"] = availability
+    row["providers"] = availability
+    return row
+
+def _v4_slugify(value: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower())
+    return text.strip("-") or "person"
+
+
+def _v4_clean_person_candidate(value: str) -> str:
+    text = re.sub(r"\b(19|20)\d{2}\b", " ", str(value or ""))
+    text = re.sub(r"[\[\]{}()\"']", " ", text)
+    text = re.sub(r"\b(current|historical|hollywood|webseries|movie|movies|classic|indian)\b", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" ,-;/")
+    if not text or any(ch.isdigit() for ch in text):
+        return ""
+    lower = text.lower()
+    stop = {"hindi", "telugu", "tamil", "kannada", "malayalam", "bengali", "marathi", "punjabi", "gujarati", "odia", "assamese", "language", "unknown"}
+    if lower in stop:
+        return ""
+    words = [w for w in text.split() if w]
+    if len(words) < 1 or len(words) > 5:
+        return ""
+    if len(text) < 3 or len(text) > 64:
+        return ""
+    return " ".join(part[:1].upper() + part[1:] for part in words)
+
+
+def _v4_people_candidates_from_search_row(row: dict) -> list[str]:
+    text = str(row.get("search_text") or "")
+    if not text:
+        return []
+
+    lower = text.lower()
+    tail = text
+    for marker in (row.get("language_name"), row.get("language_slug")):
+        marker_text = str(marker or "").strip().lower()
+        if not marker_text:
+            continue
+        idx = lower.rfind(marker_text)
+        if idx >= 0:
+            tail = text[idx + len(marker_text):]
+            break
+
+    title = str(row.get("title") or "").strip()
+    if title and tail == text:
+        tail = re.sub(re.escape(title), " ", tail, count=1, flags=re.I)
+
+    parts = re.split(r",|;|\||\band\b|&", tail, flags=re.I)
+    return [candidate for candidate in (_v4_clean_person_candidate(part) for part in parts) if candidate]
+
+
+def _v4_language_aliases(language: str | None) -> list[str]:
+    value = str(language or "").strip().lower()
+    aliases = {
+        "hi": ["hi", "hindi"],
+        "hindi": ["hi", "hindi"],
+        "te": ["te", "telugu"],
+        "telugu": ["te", "telugu"],
+        "ta": ["ta", "tamil"],
+        "tamil": ["ta", "tamil"],
+        "kn": ["kn", "kannada"],
+        "kannada": ["kn", "kannada"],
+        "ml": ["ml", "malayalam"],
+        "malayalam": ["ml", "malayalam"],
+    }
+    return aliases.get(value, [value] if value else [])
+
+
+def _v4_people_from_search_payload(domain: str = "historical", page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None) -> dict:
+    domain = _v4_norm_domain(domain)
+    limit = _v4_limit(limit, default=24, cap=100)
+    page = max(int(page or 1), 1)
+    table = (globals().get("SEARCH_TABLES") or {}).get(domain)
+    if not table:
+        return _v4_items_payload({"total": 0, "items": []}, page=page, limit=limit, domain=domain)
+
+    where = ['COALESCE("search_text", \'\') <> \'\'']
+    params = []
+    aliases = _v4_language_aliases(language)
+    if aliases:
+        placeholders = ",".join(["%s"] * len(aliases))
+        where.append(f'(LOWER(COALESCE("language_slug", \'\')) IN ({placeholders}) OR LOWER(COALESCE("language_name", \'\')) IN ({placeholders}))')
+        params.extend(aliases)
+        params.extend(aliases)
+
+    query = str(q or "").strip().lower()
+    if query:
+        where.append('LOWER(COALESCE("search_text", \'\')) LIKE %s')
+        params.append(f"%{query}%")
+
+    clause = " WHERE " + " AND ".join(where)
+    scan_limit = max(800, min(5000, limit * 120))
+    rows = _v4_rows(
+        f'SELECT "title", "slug", "search_text", "language_slug", "language_name", "release_year" '
+        f'FROM public.{_v4_qi(table)}{clause} '
+        'ORDER BY COALESCE("rank_score", 0) DESC, COALESCE("release_year", 0) DESC LIMIT %s',
+        params + [scan_limit],
+    )
+
+    people: dict[str, dict] = {}
+    for row in rows:
+        row_language = str(row.get("language_slug") or row.get("language_name") or "").strip().lower()
+        row_language_name = row.get("language_name") or row.get("language_slug") or ""
+        for name in _v4_people_candidates_from_search_row(row):
+            if query and query not in name.lower():
+                continue
+            slug = _v4_slugify(name)
+            key = f"{row_language}:{slug}"
+            item = people.setdefault(
+                key,
+                {
+                    "domain": "person",
+                    "source_domain": "person",
+                    "person_name": name,
+                    "display_name": name,
+                    "title": name,
+                    "person_slug": slug,
+                    "slug": slug,
+                    "primary_language_slug": row_language,
+                    "primary_language_name": row_language_name,
+                    "language_slug": row_language,
+                    "language_name": row_language_name,
+                    "primary_role": "film person",
+                    "movie_count": 0,
+                    "primary_language_movie_count": 0,
+                    "career_attached_movie_count": 0,
+                    "youtube_movie_count": 0,
+                    "poster_url": "",
+                },
+            )
+            item["movie_count"] += 1
+            item["primary_language_movie_count"] += 1
+            item["career_attached_movie_count"] += 1
+
+    min_count = int(min_movies or 1)
+    items = [item for item in people.values() if int(item.get("movie_count") or 0) >= min_count]
+    items.sort(key=lambda item: (int(item.get("movie_count") or 0), str(item.get("person_name") or "")), reverse=True)
+    total = len(items)
+    start = (page - 1) * limit
+    return _v4_items_payload({"total": total, "items": items[start:start + limit]}, page=page, limit=limit, domain=domain)
+
+
+def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None) -> dict:
+    domain = _v4_norm_domain(domain)
+    limit = _v4_limit(limit)
+    offset = _v4_offset(page, limit)
+    table = _v4_person_table(domain)
+    where = []
+    params = []
+
+    if q:
+        like = "%" + str(q).lower() + "%"
+        where.append('(LOWER(COALESCE("person_name", \'\')) LIKE %s OR LOWER(COALESCE("name", \'\')) LIKE %s OR LOWER(COALESCE("person_slug", \'\')) LIKE %s)')
+        params.extend([like, like, like])
+
+    aliases = _v4_language_aliases(language)
+    if aliases:
+        placeholders = ",".join(["%s"] * len(aliases))
+        where.append(f'(LOWER(COALESCE("primary_language_slug", "language_slug", \'\')) IN ({placeholders}) OR LOWER(COALESCE("primary_language_name", "language_name", \'\')) IN ({placeholders}))')
+        params.extend(aliases)
+        params.extend(aliases)
+
+    if min_movies:
+        where.append('COALESCE("total_movie_count", "movie_count", 0) >= %s')
+        params.append(int(min_movies))
+
+    clause = " WHERE " + " AND ".join(where) if where else ""
+
+    try:
+        total = _v4_one(f'SELECT COUNT(*) AS total FROM public.{_v4_qi(table)}{clause}', params) or {"total": 0}
+        rows = _v4_rows(
+            f'SELECT * FROM public.{_v4_qi(table)}{clause} '
+            'ORDER BY COALESCE("total_movie_count", "movie_count", 0) DESC, COALESCE("person_name", "name", \'\') '
+            'LIMIT %s OFFSET %s',
+            params + [limit, offset],
+        )
+    except Exception:
+        total = {"total": 0}
+        rows = []
+
+    payload = _v4_items_payload({"total": int(total.get("total") or 0), "items": rows}, page=page, limit=limit, domain=domain)
+    if payload.get("items"):
+        return payload
+    return _v4_people_from_search_payload(domain=domain, page=page, limit=limit, q=q, language=language, min_movies=min_movies)
+@app.get("/api/v4/health")
+def _flixyfy_v4_health():
+    return health()
+
+@app.get("/api/v4/providers")
+def _flixyfy_v4_providers():
+    fn = globals().get("providers")
+    if callable(fn):
+        return fn()
+    return {"items": []}
+
+@app.get("/api/v4/home")
+def _flixyfy_v4_home(limit: int = 24):
+    l = _v4_limit(limit)
+    current = _v4_content_payload("current", page=1, limit=l)
+    historical = _v4_content_payload("historical", page=1, limit=l)
+    hollywood = _v4_content_payload("hollywood", page=1, limit=l)
+    webseries = _v4_content_payload("webseries", page=1, limit=l)
+    return {
+        "status": "ok",
+        "current": current,
+        "movies": current.get("items", []),
+        "popular_movies": current.get("items", []),
+        "latest_movies": current.get("items", []),
+        "indian_movies": current,
+        "historical": historical,
+        "hollywood": hollywood,
+        "webseries": webseries,
+    }
+
+@app.get("/api/v4/movies")
+def _flixyfy_v4_movies(page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None):
+    return _v4_content_payload("current", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+
+@app.get("/api/v4/current")
+def _flixyfy_v4_current(page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None):
+    return _v4_content_payload("current", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+
+@app.get("/api/v4/historical")
+def _flixyfy_v4_historical(page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None):
+    return _v4_content_payload("historical", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+
+@app.get("/api/v4/hollywood")
+def _flixyfy_v4_hollywood(page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None):
+    return _v4_content_payload("hollywood", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+
+@app.get("/api/v4/webseries")
+def _flixyfy_v4_webseries(page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None):
+    return _v4_content_payload("webseries", page=page, limit=limit, provider=provider, language=language, year=year, sort=sort)
+
+@app.get("/api/v4/search")
+def _flixyfy_v4_search(q: str | None = None, page: int = 1, limit: int = 24, domain: str | None = None, type: str | None = None, region: str | None = None, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None):
+    return _v4_search_payload(q=q, page=page, limit=limit, domain=domain, type=type, region=region, provider=provider, language=language, year=year, sort=sort)
+
+@app.get("/api/v4/global-search")
+def _flixyfy_v4_global_search(q: str | None = None, page: int = 1, limit: int = 24, type: str | None = None, region: str | None = None, domain: str | None = None, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None):
+    return _v4_search_payload(q=q, page=page, limit=limit, domain=domain, type=type, region=region, provider=provider, language=language, year=year, sort=sort)
+
+@app.get("/api/v4/search-suggestions")
+def _flixyfy_v4_search_suggestions(q: str | None = None, limit: int = 10):
+    payload = _v4_search_payload(q=q, page=1, limit=limit)
+    items = payload.get("items", [])
+    suggestions = []
+    for item in items[: _v4_limit(limit, default=10)]:
+        title = item.get("title") or item.get("name") or item.get("person_name")
+        if title:
+            clone = dict(item)
+            clone["title"] = title
+            suggestions.append(clone)
+    return {"query": q or "", "suggestions": suggestions, "items": suggestions, "total": len(suggestions)}
+
+@app.get("/api/v4/historical/people")
+def _flixyfy_v4_historical_people(page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None):
+    return _v4_people_payload("historical", page=page, limit=limit, q=q, language=language, min_movies=min_movies)
+
+@app.get("/api/v4/people")
+def _flixyfy_v4_people(page: int = 1, limit: int = 24, q: str | None = None, domain: str | None = None, language: str | None = None, min_movies: int | None = None):
+    return _v4_people_payload(domain or "current", page=page, limit=limit, q=q, language=language, min_movies=min_movies)
+
+@app.get("/api/v4/language/{language_slug}")
+def _flixyfy_v4_language(language_slug: str, page: int = 1, limit: int = 24, sort: str | None = None):
+    return _v4_content_payload("current", page=page, limit=limit, language=language_slug, sort=sort)
+
+@app.get("/api/v4/{domain}/{slug}")
+def _flixyfy_v4_detail(domain: str, slug: str):
+    return _v4_detail_payload(domain, slug)
+
+# FLIXYFY canonical provider and exact search middleware V1
+from app.fresh_canonical_provider_search_middleware_v1 import install_fresh_canonical_provider_search_middleware_v1
+install_fresh_canonical_provider_search_middleware_v1(app)
