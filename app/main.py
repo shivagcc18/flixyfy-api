@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import os
 import re
 import time
@@ -422,6 +422,45 @@ CARD_FIELDS = (
     "is_free", "type", "content_type", "entity_type",
 )
 
+PERSON_CARD_FIELDS = (
+    "id", "person_slug", "slug", "person_name", "display_name", "name", "title",
+    "primary_language_slug", "primary_language_name", "language_slug", "language_name",
+    "primary_role", "known_for_department", "total_movie_count", "movie_count",
+    "primary_language_movie_count", "career_attached_movie_count", "youtube_movie_count",
+    "poster_url", "profile_url", "image_url", "image", "thumbnail",
+)
+
+_V4_TABLE_COLUMN_CACHE = {}
+
+def _v4_table_columns(table: str) -> set[str]:
+    cached = _V4_TABLE_COLUMN_CACHE.get(table)
+    if cached is not None:
+        return cached
+    try:
+        rows = _v4_rows(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
+            ["public", table],
+        )
+        columns = {str(row.get("column_name") or "") for row in rows}
+    except Exception:
+        columns = set()
+    _V4_TABLE_COLUMN_CACHE[table] = columns
+    return columns
+
+def _v4_select_columns_sql(table: str, fields: tuple[str, ...]) -> str:
+    columns = _v4_table_columns(table)
+    selected = [field for field in fields if field in columns]
+    if not selected:
+        return "*"
+    table_ref = _v4_qi(table)
+    return ", ".join(f"{table_ref}.{_v4_qi(field)}" for field in selected)
+
+def _v4_card_select_sql(table: str) -> str:
+    return _v4_select_columns_sql(table, CARD_FIELDS)
+
+def _v4_person_select_sql(table: str) -> str:
+    return _v4_select_columns_sql(table, PERSON_CARD_FIELDS)
+
 
 def _v4_slim_card_item(item: dict) -> dict:
     if not isinstance(item, dict):
@@ -448,10 +487,6 @@ def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24,
     limit = _v4_limit(limit)
     offset = _v4_offset(page, limit)
 
-    content_fn = globals().get("content")
-    if callable(content_fn):
-        raw = content_fn(domain=domain, provider=provider, language=language, year=year, limit=limit, offset=offset)
-        return _v4_slim_card_payload(_v4_items_payload(raw, page=page, limit=limit, domain=domain))
 
     table = _v4_movie_table(domain)
     where = []
@@ -480,7 +515,7 @@ def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24,
     clause = " WHERE " + " AND ".join(where) if where else ""
     total = _v4_one(f'SELECT COUNT(*) AS total FROM public.{_v4_qi(table)}{clause}', params) or {"total": 0}
     rows = _v4_rows(
-        f'SELECT * FROM public.{_v4_qi(table)}{clause} '
+        f'SELECT {_v4_card_select_sql(table)} FROM public.{_v4_qi(table)}{clause} '
         'ORDER BY COALESCE("release_year", 0) DESC, COALESCE("popularity", 0) DESC, COALESCE("title", \'\') '
         'LIMIT %s OFFSET %s',
         params + [limit, offset],
@@ -709,7 +744,7 @@ def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 2
     try:
         total = _v4_one(f'SELECT COUNT(*) AS total FROM public.{_v4_qi(table)}{clause}', params) or {"total": 0}
         rows = _v4_rows(
-            f'SELECT * FROM public.{_v4_qi(table)}{clause} '
+            f'SELECT {_v4_person_select_sql(table)} FROM public.{_v4_qi(table)}{clause} '
             'ORDER BY COALESCE("total_movie_count", "movie_count", 0) DESC, COALESCE("person_name", "name", \'\') '
             'LIMIT %s OFFSET %s',
             params + [limit, offset],
@@ -733,19 +768,30 @@ def _flixyfy_v4_providers():
         return fn()
     return {"items": []}
 
+def _v4_home_section(payload: dict) -> dict:
+    payload = dict(payload or {})
+    items = list(payload.get("items") or payload.get("movies") or payload.get("results") or payload.get("data") or [])
+    return {
+        "domain": payload.get("domain"),
+        "total": int(payload.get("total") or len(items) or 0),
+        "page": int(payload.get("page") or 1),
+        "limit": int(payload.get("limit") or len(items) or 0),
+        "items": items,
+    }
+
 @app.get("/api/v4/home")
-def _flixyfy_v4_home(limit: int = 24):
-    l = _v4_limit(limit)
-    current = _v4_content_payload("current", page=1, limit=l)
-    historical = _v4_content_payload("historical", page=1, limit=l)
-    hollywood = _v4_content_payload("hollywood", page=1, limit=l)
-    webseries = _v4_content_payload("webseries", page=1, limit=l)
+def _flixyfy_v4_home(limit: int = 12):
+    l = _v4_limit(limit, default=12, cap=24)
+    current = _v4_home_section(_v4_content_payload("current", page=1, limit=l))
+    historical = _v4_home_section(_v4_content_payload("historical", page=1, limit=l))
+    hollywood = _v4_home_section(_v4_content_payload("hollywood", page=1, limit=l))
+    webseries = _v4_home_section(_v4_content_payload("webseries", page=1, limit=l))
+    current_items = current.get("items", [])
     return {
         "status": "ok",
         "current": current,
-        "movies": current.get("items", []),
-        "popular_movies": current.get("items", []),
-        "latest_movies": current.get("items", []),
+        "movies": current_items,
+        "popular_movies": current_items,
         "indian_movies": current,
         "historical": historical,
         "hollywood": hollywood,
