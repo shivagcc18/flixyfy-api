@@ -14,7 +14,7 @@ MOVIE_TABLES = {
     "current": "current_movie_api_v1",
     "historical": "historical_movie_serving_v5",
     "hollywood": "hollywood_movie_serving_v5",
-    "webseries": "webseries_series_serving_v5",
+    "webseries": "webseries_active_launch_serving_v5",
 }
 SEARCH_TABLES = {
     "current": "current_search_serving_v5",
@@ -178,7 +178,7 @@ def content(
             domains = DOMAIN_VALUES[domain]
             placeholders = ",".join(["%s"] * len(domains))
             where.append(
-                'EXISTS (SELECT 1 FROM public."provider_availability_serving_v2" a '
+                'EXISTS (SELECT 1 FROM public."provider_availability_serving_v5" a '
                 f'WHERE a."content_slug"={qi(table)}."slug" '
                 f'AND LOWER(COALESCE(a."domain",\'\')) IN ({placeholders}) '
                 'AND LOWER(COALESCE(a."provider_key",\'\'))=%s)'
@@ -218,7 +218,7 @@ def detail(
     domains = DOMAIN_VALUES[domain]
     placeholders = ",".join(["%s"] * len(domains))
     availability = all_rows(
-        'SELECT * FROM public."provider_availability_serving_v2" '
+        'SELECT * FROM public."provider_availability_serving_v5" '
         f'WHERE LOWER(COALESCE("domain",\'\')) IN ({placeholders}) '
         'AND "content_slug"=%s ORDER BY "source_priority", "provider_key"',
         tuple([x.lower() for x in domains] + [slug]),
@@ -271,7 +271,7 @@ def providers(
         'SELECT LOWER("provider_key") AS provider_key, '
         'MIN("provider_name") AS provider_name, COUNT(*)::bigint AS row_count, '
         'COUNT(DISTINCT "content_slug")::bigint AS content_count '
-        'FROM public."provider_availability_serving_v2" '
+        'FROM public."provider_availability_serving_v5" '
         f'WHERE LOWER(COALESCE("domain",\'\')) IN ({placeholders}) '
         'GROUP BY LOWER("provider_key") ORDER BY content_count DESC, provider_key',
         tuple(x.lower() for x in domains),
@@ -370,7 +370,7 @@ def _v4_movie_table(domain: str) -> str:
         "current": "current_movie_serving_v5",
         "historical": "historical_movie_serving_v5",
         "hollywood": "hollywood_movie_serving_v5",
-        "webseries": "webseries_series_serving_v5",
+        "webseries": "webseries_active_launch_serving_v5",
     }[domain]
 
 def _v4_person_table(domain: str) -> str:
@@ -504,7 +504,7 @@ def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24,
         domains = _v4_domain_values(domain)
         placeholders = ",".join(["%s"] * len(domains))
         where.append(
-            'EXISTS (SELECT 1 FROM public."provider_availability_serving_v2" a '
+            'EXISTS (SELECT 1 FROM public."provider_availability_serving_v5" a '
             f'WHERE a."content_slug"={_v4_qi(table)}."slug" '
             f'AND LOWER(COALESCE(a."domain", \'\')) IN ({placeholders}) '
             'AND LOWER(COALESCE(a."provider_key", \'\'))=%s)'
@@ -554,7 +554,7 @@ def _v4_provider_rows(slug: str, domain: str) -> list[dict]:
     placeholders = ",".join(["%s"] * len(domains))
     try:
         return _v4_rows(
-            f'SELECT * FROM public."provider_availability_serving_v2" '
+            f'SELECT * FROM public."provider_availability_serving_v5" '
             f'WHERE "content_slug"=%s AND LOWER(COALESCE("domain", \'\')) IN ({placeholders}) '
             f'ORDER BY COALESCE("provider_key", \'\'), COALESCE("provider_name", \'\') '
             f'LIMIT 100',
