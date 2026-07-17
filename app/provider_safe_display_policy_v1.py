@@ -4,7 +4,6 @@ import re
 from urllib.parse import quote_plus, unquote, urlparse
 
 PROVIDER_DISPLAY_POLICY_VERSION = "FLIXYFY_PROVIDER_TRUST_SAFE_DISPLAY_POLICY_V1_TRUTH_FIREWALL"
-POLICY_VERSION = PROVIDER_DISPLAY_POLICY_VERSION
 
 AGGREGATOR_HOSTS = ("themoviedb.org", "tmdb.org", "justwatch.com")
 
