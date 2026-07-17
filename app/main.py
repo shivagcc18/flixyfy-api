@@ -509,6 +509,20 @@ _V4_PROVIDER_CORRECTION_OVERLAYS = {
         "search_url": "https://www.hotstar.com/in/search?q=Thaai%20Kizhavi",
         "source": "provider_correction_overlay_v1",
         "confidence": "HIGH_USER_REPORTED_PUBLIC_SOURCE_CONFIRMED",
+    },
+    "karuppu-2026": {
+        "title": "Karuppu",
+        "provider_key": "prime_video",
+        "provider_name": "Prime Video",
+        "provider_display_name": "Prime Video",
+        "provider_type": "flatrate",
+        "monetization_type": "subscription",
+        "availability_type": "ott",
+        "availability_status": "available",
+        "homepage_url": "https://www.primevideo.com/",
+        "search_url": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase=Karuppu",
+        "source": "provider_correction_overlay_v1",
+        "confidence": "HIGH_USER_REPORTED_WRONG_PROVIDER_PUBLIC_SOURCE_CONFIRMED",
     }
 }
 
