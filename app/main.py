@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import os
 import json
 import re
@@ -9,6 +9,11 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from app.provider_safe_display_policy_v1 import (
+    POLICY_VERSION as PROVIDER_DISPLAY_POLICY_VERSION,
+    apply_provider_safe_display_policy,
+    apply_provider_safe_display_policy_to_item,
+)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 MOVIE_TABLES = {
@@ -420,7 +425,11 @@ CARD_FIELDS = (
     "language_name", "primary_language_slug", "primary_language_name", "rating",
     "vote_average", "popularity", "quality_score", "ott_primary", "ott_primary_key",
     "provider", "provider_key", "provider_name", "has_youtube", "has_ott",
-    "is_free", "type", "content_type", "entity_type",
+    "provider_trust_label", "provider_display_action", "provider_display_rank",
+    "provider_is_public_safe", "provider_public_label", "provider_display_reason",
+    "provider_display_primary_key", "provider_display_primary_name",
+    "provider_display_primary_label", "provider_public_count", "provider_hidden_count",
+    "provider_policy_version", "is_free", "type", "content_type", "entity_type",
 )
 
 PERSON_CARD_FIELDS = (
@@ -676,7 +685,10 @@ def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24,
         'LIMIT %s OFFSET %s',
         params + [limit, offset],
     )
-    rows = [_v4_apply_provider_correction_card(row) for row in rows]
+    rows = [
+        apply_provider_safe_display_policy_to_item(_v4_apply_provider_correction_card(row))
+        for row in rows
+    ]
     return _v4_slim_card_payload(_v4_items_payload({"total": int(total.get("total") or 0), "items": rows}, page=page, limit=limit, domain=domain))
 
 def _v4_search_payload(q: str | None = None, page: int = 1, limit: int = 24, domain: str | None = None, type: str | None = None, region: str | None = None, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None) -> dict:
@@ -694,7 +706,12 @@ def _v4_search_payload(q: str | None = None, page: int = 1, limit: int = 24, dom
 
         raw = search_fn(q=q, domain=mapped_domain, limit=limit)
         out = _v4_items_payload(raw, page=page, limit=limit, domain=mapped_domain)
-        out["items"] = [_v4_apply_provider_correction_search_item(item) for item in list(out.get("items") or [])]
+        out["items"] = [
+            apply_provider_safe_display_policy_to_item(
+                _v4_apply_provider_correction_search_item(item)
+            )
+            for item in list(out.get("items") or [])
+        ]
         out["results"] = out["items"]
         out["movies"] = out["items"]
         out["data"] = out["items"]
@@ -752,10 +769,20 @@ def _v4_detail_payload(domain: str, slug: str) -> dict:
         raise HTTPException(status_code=404, detail="Not Found")
     availability = _v4_provider_rows(slug, domain)
     availability = _v4_apply_provider_correction_rows(slug, availability)
+    availability, hidden_provider_rows = apply_provider_safe_display_policy(availability)
     row["availability"] = availability
     row["ott_all"] = availability
     row["watch_providers"] = availability
     row["providers"] = availability
+    row["provider_hidden_rows"] = hidden_provider_rows
+    row["provider_public_count"] = len(availability)
+    row["provider_hidden_count"] = len(hidden_provider_rows)
+    row["provider_policy_version"] = PROVIDER_DISPLAY_POLICY_VERSION
+    if availability:
+        display_primary = availability[0]
+        row["provider_display_primary_key"] = display_primary.get("provider_key")
+        row["provider_display_primary_name"] = display_primary.get("provider_display_name") or display_primary.get("provider_name")
+        row["provider_display_primary_label"] = display_primary.get("provider_public_label")
     correction = _v4_provider_correction(slug)
     if correction:
         row.update(
