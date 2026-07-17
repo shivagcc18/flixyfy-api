@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 import os
+import json
 import re
 import time
 from contextlib import asynccontextmanager
@@ -481,6 +482,152 @@ def _v4_slim_card_payload(payload: dict) -> dict:
     out["movies"] = items
     out["data"] = items
     return out
+
+# FLIXYFY_SINGLE_TITLE_PROVIDER_CORRECTION_THAI_KIZHAVI_JIOHOTSTAR_V1
+# API-only trust correction. This remains intentionally outside provider_v5 and
+# does not mutate Neon unless a separately approved data migration is added.
+_V4_PROVIDER_CORRECTION_OVERLAYS = {
+    "thaai-kizhavi-2026": {
+        "title": "Thaai Kizhavi",
+        "provider_key": "jiohotstar",
+        "provider_name": "JioHotstar",
+        "provider_display_name": "JioHotstar",
+        "provider_type": "flatrate",
+        "monetization_type": "subscription",
+        "availability_type": "ott",
+        "availability_status": "available",
+        "homepage_url": "https://www.hotstar.com/in/",
+        "search_url": "https://www.hotstar.com/in/search?q=Thaai%20Kizhavi",
+        "source": "provider_correction_overlay_v1",
+        "confidence": "HIGH_USER_REPORTED_PUBLIC_SOURCE_CONFIRMED",
+    }
+}
+
+
+def _v4_provider_correction(slug: str | None) -> dict | None:
+    return _V4_PROVIDER_CORRECTION_OVERLAYS.get(str(slug or "").strip().lower())
+
+
+def _v4_provider_key(row: dict) -> str:
+    return str(
+        row.get("provider_key")
+        or row.get("provider_name")
+        or row.get("provider_display_name")
+        or ""
+    ).strip().lower().replace(" ", "_")
+
+
+def _v4_overlay_provider_row(slug: str, correction: dict) -> dict:
+    homepage_url = correction["homepage_url"]
+    return {
+        "domain": "current",
+        "content_slug": slug,
+        "content_type": "movie",
+        "title": correction["title"],
+        "provider_key": correction["provider_key"],
+        "provider_name": correction["provider_name"],
+        "provider_display_name": correction["provider_display_name"],
+        "provider_type": correction["provider_type"],
+        "monetization_type": correction["monetization_type"],
+        "availability_type": correction["availability_type"],
+        "availability_status": correction["availability_status"],
+        "final_url": homepage_url,
+        "deep_link": homepage_url,
+        "search_url": correction["search_url"],
+        "homepage_url": homepage_url,
+        "is_youtube": False,
+        "is_ott": True,
+        "source": correction["source"],
+        "confidence": correction["confidence"],
+        "overlay_status": "primary",
+    }
+
+
+def _v4_apply_provider_correction_rows(slug: str, rows: list[dict]) -> list[dict]:
+    correction = _v4_provider_correction(slug)
+    if not correction:
+        return rows
+
+    normalized = [dict(row) for row in rows if isinstance(row, dict)]
+    existing = []
+    for row in normalized:
+        if _v4_provider_key(row) == correction["provider_key"]:
+            continue
+        row["overlay_status"] = "demoted"
+        row["overlay_reason"] = correction["source"]
+        existing.append(row)
+    return [_v4_overlay_provider_row(slug, correction)] + existing
+
+
+def _v4_apply_provider_correction_card(item: dict) -> dict:
+    if not isinstance(item, dict):
+        return item
+    correction = _v4_provider_correction(item.get("slug") or item.get("movie_slug"))
+    if not correction:
+        return item
+    out = dict(item)
+    out.update(
+        {
+            "provider": correction["provider_name"],
+            "provider_key": correction["provider_key"],
+            "provider_name": correction["provider_name"],
+            "provider_display_name": correction["provider_display_name"],
+            "ott_primary": correction["provider_name"],
+            "ott_primary_key": correction["provider_key"],
+            "has_ott": True,
+            "has_subscription_ott": True,
+            "availability_status": correction["availability_status"],
+            "provider_correction_source": correction["source"],
+            "provider_correction_confidence": correction["confidence"],
+        }
+    )
+    return out
+
+
+def _v4_apply_provider_correction_search_item(item: dict) -> dict:
+    if not isinstance(item, dict):
+        return item
+    slug = item.get("slug") or item.get("movie_slug")
+    correction = _v4_provider_correction(slug)
+    if not correction:
+        return item
+
+    out = _v4_apply_provider_correction_card(item)
+    overlay_row = _v4_overlay_provider_row(str(slug), correction)
+    for field in ("provider_summary", "availability_json", "ott_all"):
+        raw = out.get(field)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = []
+        if not isinstance(raw, list):
+            raw = []
+        if field == "provider_summary":
+            summary_row = {
+                "provider_key": overlay_row["provider_key"],
+                "provider_name": overlay_row["provider_name"],
+                "provider_display_name": overlay_row["provider_display_name"],
+                "provider_type": overlay_row["provider_type"],
+                "monetization_type": overlay_row["monetization_type"],
+                "availability_type": overlay_row["availability_type"],
+                "availability_status": overlay_row["availability_status"],
+                "ott_count": 1,
+            }
+            raw = [summary_row] + [
+                x for x in raw
+                if isinstance(x, dict) and _v4_provider_key(x) != correction["provider_key"]
+            ]
+        else:
+            raw = _v4_apply_provider_correction_rows(str(slug), raw)
+        out[field] = json.dumps(raw, ensure_ascii=False)
+    provider_rows = json.loads(out.get("availability_json") or "[]")
+    provider_row_count = len(provider_rows) if isinstance(provider_rows, list) else 1
+    out["provider_count"] = max(int(out.get("provider_count") or 0), provider_row_count, 1)
+    out["availability_count"] = max(int(out.get("availability_count") or 0), provider_row_count, 1)
+    return out
+
+
 def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None) -> dict:
     domain = _v4_norm_domain(domain)
     provider = _v4_norm_provider(provider)
@@ -503,14 +650,23 @@ def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24,
     if provider:
         domains = _v4_domain_values(domain)
         placeholders = ",".join(["%s"] * len(domains))
+        overlay_slugs = [
+            slug
+            for slug, correction in _V4_PROVIDER_CORRECTION_OVERLAYS.items()
+            if domain == "current" and correction["provider_key"] == provider
+        ]
+        overlay_clause = ""
+        if overlay_slugs:
+            overlay_clause = f' OR {_v4_qi(table)}."slug" IN ({",".join(["%s"] * len(overlay_slugs))})'
         where.append(
-            'EXISTS (SELECT 1 FROM public."provider_availability_serving_v5" a '
+            '(EXISTS (SELECT 1 FROM public."provider_availability_serving_v5" a '
             f'WHERE a."content_slug"={_v4_qi(table)}."slug" '
             f'AND LOWER(COALESCE(a."domain", \'\')) IN ({placeholders}) '
-            'AND LOWER(COALESCE(a."provider_key", \'\'))=%s)'
+            'AND LOWER(COALESCE(a."provider_key", \'\'))=%s)' + overlay_clause + ')'
         )
         params.extend([x.lower() for x in domains])
         params.append(str(provider).lower())
+        params.extend(overlay_slugs)
 
     clause = " WHERE " + " AND ".join(where) if where else ""
     total = _v4_one(f'SELECT COUNT(*) AS total FROM public.{_v4_qi(table)}{clause}', params) or {"total": 0}
@@ -520,6 +676,7 @@ def _v4_content_payload(domain: str = "current", page: int = 1, limit: int = 24,
         'LIMIT %s OFFSET %s',
         params + [limit, offset],
     )
+    rows = [_v4_apply_provider_correction_card(row) for row in rows]
     return _v4_slim_card_payload(_v4_items_payload({"total": int(total.get("total") or 0), "items": rows}, page=page, limit=limit, domain=domain))
 
 def _v4_search_payload(q: str | None = None, page: int = 1, limit: int = 24, domain: str | None = None, type: str | None = None, region: str | None = None, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None) -> dict:
@@ -537,6 +694,10 @@ def _v4_search_payload(q: str | None = None, page: int = 1, limit: int = 24, dom
 
         raw = search_fn(q=q, domain=mapped_domain, limit=limit)
         out = _v4_items_payload(raw, page=page, limit=limit, domain=mapped_domain)
+        out["items"] = [_v4_apply_provider_correction_search_item(item) for item in list(out.get("items") or [])]
+        out["results"] = out["items"]
+        out["movies"] = out["items"]
+        out["data"] = out["items"]
         canonical = _v4_people_canonical_for_query_v2(q)
         if canonical and page == 1:
             try:
@@ -590,10 +751,26 @@ def _v4_detail_payload(domain: str, slug: str) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="Not Found")
     availability = _v4_provider_rows(slug, domain)
+    availability = _v4_apply_provider_correction_rows(slug, availability)
     row["availability"] = availability
     row["ott_all"] = availability
     row["watch_providers"] = availability
     row["providers"] = availability
+    correction = _v4_provider_correction(slug)
+    if correction:
+        row.update(
+            {
+                "ott_primary": correction["provider_name"],
+                "ott_primary_key": correction["provider_key"],
+                "provider_count": len(availability),
+                "availability_count": len(availability),
+                "has_ott": True,
+                "has_subscription_ott": True,
+                "availability_status": correction["availability_status"],
+                "provider_correction_source": correction["source"],
+                "provider_correction_confidence": correction["confidence"],
+            }
+        )
     return row
 
 def _v4_slugify(value: str) -> str:
