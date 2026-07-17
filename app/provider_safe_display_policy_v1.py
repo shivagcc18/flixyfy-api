@@ -1,249 +1,437 @@
-"""Trust-safe provider display shaping for the fresh v4 API.
+﻿from __future__ import annotations
 
-This module is deliberately response-only. It never changes provider data or
-chooses a replacement provider; it classifies the URL/provider evidence that
-is already present in a response and hides unsafe rows from public arrays.
-"""
-
-from __future__ import annotations
-
-import json
 import re
-from urllib.parse import parse_qs, urlparse
-from typing import Any
+from urllib.parse import quote_plus, unquote, urlparse
 
+PROVIDER_DISPLAY_POLICY_VERSION = "FLIXYFY_PROVIDER_TRUST_SAFE_DISPLAY_POLICY_V1_TRUTH_FIREWALL"
 
-POLICY_VERSION = "FLIXYFY_PROVIDER_TRUST_SAFE_DISPLAY_POLICY_V1"
+AGGREGATOR_HOSTS = ("themoviedb.org", "tmdb.org", "justwatch.com")
 
-_HOSTS = {
-    "netflix": ("netflix.com",),
-    "primevideo": ("primevideo.com", "amazon.com", "amazonvideo.com"),
-    "amazon": ("primevideo.com", "amazon.com", "amazonvideo.com"),
-    "jiohotstar": ("jiohotstar.com", "hotstar.com", "jiostar.com"),
-    "hotstar": ("jiohotstar.com", "hotstar.com", "jiostar.com"),
-    "youtube": ("youtube.com", "youtu.be", "googlevideo.com"),
-    "zee5": ("zee5.com",),
-    "sonyliv": ("sonyliv.com",),
-    "sunnxt": ("sunnxt.com",),
-    "mxplayer": ("mxplayer.in", "mxplayer.com"),
-    "aha": ("aha.video", "ahatamil.com"),
-    "disneyplus": ("disneyplus.com",),
-    "hulu": ("hulu.com",),
-    "max": ("max.com", "hbomax.com"),
-    "paramount": ("paramountplus.com",),
-    "peacock": ("peacocktv.com",),
-    "mubi": ("mubi.com",),
-    "apple": ("tv.apple.com",),
-    "google": ("play.google.com",),
-    "tubi": ("tubitv.com", "tubi.tv"),
-    "hoichoi": ("hoichoi.tv",),
-    "manorama": ("manoramamax.com",),
+PROVIDER_HOME = {
+    "netflix": "https://www.netflix.com/in/",
+    "prime_video": "https://www.primevideo.com/",
+    "amazon_prime_video": "https://www.primevideo.com/",
+    "amazon_video": "https://www.primevideo.com/",
+    "jiohotstar": "https://www.hotstar.com/in/",
+    "hotstar": "https://www.hotstar.com/in/",
+    "zee5": "https://www.zee5.com/",
+    "sonyliv": "https://www.sonyliv.com/",
+    "sony_liv": "https://www.sonyliv.com/",
+    "sun_nxt": "https://www.sunnxt.com/",
+    "sunnxt": "https://www.sunnxt.com/",
+    "aha": "https://www.aha.video/",
+    "shemaroome": "https://www.shemaroome.com/",
+    "youtube": "https://www.youtube.com/",
+    "vi_movies_and_tv": "https://www.myvi.in/vi-movies-and-tv",
+    "mxplayer": "https://www.mxplayer.in/",
+    "mx_player": "https://www.mxplayer.in/",
+    "googleplay": "https://play.google.com/store/movies",
+    "google_tv": "https://play.google.com/store/movies",
+    "apple_tv_store": "https://tv.apple.com/",
+    "appletvstore": "https://tv.apple.com/",
 }
 
-_SEARCH_MARKERS = ("/search", "/find", "?q=", "&q=", "query=", "searchterm=")
-_HOME_PATHS = {"", "/", "/home", "/in", "/us", "/gb"}
+PROVIDER_SEARCH = {
+    "netflix": "https://www.netflix.com/search?q={q}",
+    "prime_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "amazon_prime_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "amazon_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "jiohotstar": "https://www.hotstar.com/in/search?q={q}",
+    "hotstar": "https://www.hotstar.com/in/search?q={q}",
+    "zee5": "https://www.zee5.com/search?q={q}",
+    "sonyliv": "https://www.sonyliv.com/search?q={q}",
+    "sony_liv": "https://www.sonyliv.com/search?q={q}",
+    "sun_nxt": "https://www.sunnxt.com/search?q={q}",
+    "sunnxt": "https://www.sunnxt.com/search?q={q}",
+    "aha": "https://www.aha.video/search?q={q}",
+    "shemaroome": "https://www.shemaroome.com/search?q={q}",
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "vi_movies_and_tv": "https://www.myvi.in/vi-movies-and-tv/search?q={q}",
+    "mxplayer": "https://www.mxplayer.in/search/{q}",
+    "mx_player": "https://www.mxplayer.in/search/{q}",
+    "googleplay": "https://play.google.com/store/search?q={q}&c=movies",
+    "google_tv": "https://play.google.com/store/search?q={q}&c=movies",
+    "apple_tv_store": "https://tv.apple.com/search?term={q}",
+    "appletvstore": "https://tv.apple.com/search?term={q}",
+}
+
+PROVIDER_HOSTS = {
+    "netflix": ("netflix.com",),
+    "prime_video": ("primevideo.com", "amazon.com", "amazonvideo.com"),
+    "amazon_prime_video": ("primevideo.com", "amazon.com", "amazonvideo.com"),
+    "amazon_video": ("primevideo.com", "amazon.com", "amazonvideo.com"),
+    "jiohotstar": ("hotstar.com", "jiohotstar.com", "jiostar.com"),
+    "hotstar": ("hotstar.com", "jiohotstar.com", "jiostar.com"),
+    "zee5": ("zee5.com",),
+    "sonyliv": ("sonyliv.com",),
+    "sony_liv": ("sonyliv.com",),
+    "sun_nxt": ("sunnxt.com",),
+    "sunnxt": ("sunnxt.com",),
+    "aha": ("aha.video", "ahatamil.com"),
+    "shemaroome": ("shemaroome.com",),
+    "youtube": ("youtube.com", "youtu.be"),
+    "vi_movies_and_tv": ("myvi.in",),
+    "mxplayer": ("mxplayer.in", "mxplayer.com"),
+    "mx_player": ("mxplayer.in", "mxplayer.com"),
+    "googleplay": ("play.google.com",),
+    "google_tv": ("play.google.com",),
+    "apple_tv_store": ("tv.apple.com", "itunes.apple.com"),
+    "appletvstore": ("tv.apple.com", "itunes.apple.com"),
+}
+
+PROVIDER_LABELS = {
+    "netflix": "Netflix",
+    "prime_video": "Prime Video",
+    "amazon_prime_video": "Prime Video",
+    "amazon_video": "Amazon Video",
+    "jiohotstar": "JioHotstar",
+    "hotstar": "JioHotstar",
+    "zee5": "ZEE5",
+    "sonyliv": "SonyLIV",
+    "sony_liv": "SonyLIV",
+    "sun_nxt": "Sun NXT",
+    "sunnxt": "Sun NXT",
+    "aha": "Aha",
+    "shemaroome": "ShemarooMe",
+    "youtube": "YouTube",
+    "vi_movies_and_tv": "VI Movies and TV",
+    "mxplayer": "MX Player",
+    "mx_player": "MX Player",
+    "googleplay": "Google Play",
+    "google_tv": "Google TV",
+    "apple_tv_store": "Apple TV",
+    "appletvstore": "Apple TV",
+}
+
+TITLE_STOP = {
+    "movie", "movies", "watch", "online", "stream", "streaming", "rent", "buy",
+    "india", "in", "title", "details", "detail", "video", "videos", "search",
+    "results", "ref", "phrase", "play", "store", "tv", "www", "com"
+}
+
+# API-only correction seeds. No Neon mutation.
+PROVIDER_TRUTH_OVERLAYS = {
+    "thaai-kizhavi-2026": {
+        "title": "Thaai Kizhavi",
+        "provider_key": "jiohotstar",
+        "provider_name": "JioHotstar",
+        "provider_display_name": "JioHotstar",
+        "provider_type": "flatrate",
+        "monetization_type": "subscription",
+        "availability_type": "ott",
+        "availability_status": "available",
+        "homepage_url": "https://www.hotstar.com/in/",
+        "search_url": "https://www.hotstar.com/in/search?q=Thaai%20Kizhavi",
+        "source": "provider_truth_firewall_overlay_v1",
+        "confidence": "PRESERVE_EXISTING_THAI_KIZHAVI_JIOHOTSTAR_CORRECTION",
+    },
+    "karuppu-2026": {
+        "provider_key": "prime_video",
+        "provider_name": "Prime Video",
+        "provider_display_name": "Prime Video",
+        "provider_type": "flatrate",
+        "monetization_type": "subscription",
+        "availability_type": "ott",
+        "availability_status": "available",
+        "homepage_url": "https://www.primevideo.com/",
+        "search_url": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase=Karuppu",
+        "source": "provider_truth_firewall_overlay_v1",
+        "confidence": "USER_REPORTED_WRONG_PROVIDER_FIREWALL_SEED",
+    }
+}
 
 
-def _text(value: Any) -> str:
-    return "" if value is None else str(value).strip()
+def _clean_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
 
 
-def _key(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", _text(value).lower())
-
-
-def _first(row: dict[str, Any], *names: str) -> str:
-    for name in names:
-        value = _text(row.get(name))
-        if value:
-            return value
-    return ""
-
-
-def _host(url: str) -> str:
+def _host(url: object) -> str:
     try:
-        return (urlparse(url).hostname or "").lower().removeprefix("www.")
+        return urlparse(str(url or "")).netloc.lower().replace("www.", "")
     except Exception:
         return ""
 
 
-def _host_match(provider_key: str, host: str) -> bool | None:
-    if not provider_key or not host:
-        return None
-    compact = _key(provider_key)
-    for family, hosts in _HOSTS.items():
-        if family in compact or compact in family:
-            return any(host == allowed or host.endswith("." + allowed) for allowed in hosts)
-    return None
+def _norm_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
-def _youtube_video_id(row: dict[str, Any]) -> str:
-    explicit = _first(row, "youtube_video_id", "video_id", "provider_video_id")
-    if explicit:
-        return explicit
-    for value in (_first(row, "final_url"), _first(row, "deep_link"), _first(row, "youtube_url"), _first(row, "watch_url")):
-        try:
-            parsed = urlparse(value)
-            host = (parsed.hostname or "").lower()
-            if host.endswith("youtu.be"):
-                return parsed.path.strip("/").split("/")[0]
-            if "youtube.com" in host:
-                if parsed.path == "/watch":
-                    return parse_qs(parsed.query).get("v", [""])[0]
-                for prefix in ("/shorts/", "/embed/", "/live/"):
-                    if parsed.path.startswith(prefix):
-                        return parsed.path[len(prefix):].split("/")[0]
-        except Exception:
-            continue
+def _tokens(value: object) -> set[str]:
+    return {t for t in _norm_text(value).split() if len(t) >= 3 and t not in TITLE_STOP}
+
+
+def _url_tokens(url: object) -> set[str]:
+    try:
+        parsed = urlparse(str(url or ""))
+    except Exception:
+        return set()
+    text = f"{parsed.netloc} {unquote(parsed.path or '')} {parsed.query}"
+    text = re.sub(r"\d+", " ", text)
+    return _tokens(text)
+
+
+def _title_url_mismatch(title: object, url: object) -> bool:
+    title_set = _tokens(title)
+    url_set = _url_tokens(url)
+    if not title_set or not url_set:
+        return False
+    return not bool(title_set.intersection(url_set))
+
+
+def _is_aggregator_url(url: object) -> bool:
+    h = _host(url)
+    return any(host in h for host in AGGREGATOR_HOSTS)
+
+
+def _is_search_url(url: object) -> bool:
+    u = str(url or "").lower()
+    return any(x in u for x in ("/search", "search?", "results?search_query", "phrase=", "q=", "term="))
+
+
+def _is_youtube_watch(url: object) -> bool:
+    u = str(url or "").lower()
+    return "youtube.com/watch" in u or "youtu.be/" in u
+
+
+def _provider_key(row: dict) -> str:
+    return _clean_key(
+        row.get("provider_key")
+        or row.get("provider")
+        or row.get("provider_slug")
+        or row.get("normalized_provider")
+        or row.get("provider_name")
+        or row.get("provider_display_name")
+        or ""
+    )
+
+
+def _provider_name(row: dict, key: str) -> str:
+    raw = (
+        row.get("provider_display_name")
+        or row.get("provider_name")
+        or row.get("provider")
+        or row.get("name")
+        or ""
+    )
+    return str(raw or PROVIDER_LABELS.get(key) or key.replace("_", " ").title()).strip()
+
+
+def _first_url(row: dict, names: tuple[str, ...]) -> str:
+    for name in names:
+        value = row.get(name)
+        if value and str(value).strip():
+            return str(value).strip()
     return ""
 
 
-def classify_provider_display(row: dict[str, Any]) -> dict[str, Any]:
-    """Return additive policy fields for one provider row."""
+def _build_search_url(provider_key: str, title: str) -> str:
+    template = PROVIDER_SEARCH.get(provider_key)
+    return template.format(q=quote_plus(title or "")) if template else ""
 
-    provider_key = _first(row, "provider_key", "provider", "platform")
-    provider_name = _first(row, "provider_display_name", "provider_name", "provider", "platform_name") or provider_key
-    final_url = _first(row, "final_url")
-    deep_link = _first(row, "deep_link", "provider_deep_link", "watch_url")
-    search_url = _first(row, "search_url", "provider_search_url")
-    homepage_url = _first(row, "homepage_url", "provider_homepage_url")
-    key_blob = f"{provider_key} {provider_name}".lower()
-    youtube = "youtube" in key_blob or "youtu.be" in final_url.lower() or "youtube.com" in final_url.lower() or "youtube.com" in deep_link.lower()
-    video_id = _youtube_video_id(row) if youtube else ""
-    host = _host(final_url or deep_link or search_url or homepage_url)
-    match = _host_match(provider_key, host)
-    path_query = ((urlparse(final_url or deep_link).path or "") + "?" + (urlparse(final_url or deep_link).query or "")).lower()
 
-    unsafe_reason = ""
-    if not provider_key:
-        label, action, rank, public_safe = "UNKNOWN_PROVIDER", "HIDE", 99, False
-        unsafe_reason = "provider_key_missing"
-    elif youtube and not video_id:
-        label, action, rank, public_safe = "YOUTUBE_WITHOUT_VIDEO_ID", "HIDE", 99, False
-        unsafe_reason = "youtube_video_id_or_watch_url_missing"
-    elif not (final_url or deep_link or search_url or homepage_url):
-        label, action, rank, public_safe = "EMPTY_URL", "HIDE", 99, False
-        unsafe_reason = "no_public_url"
-    elif match is False:
-        label, action, rank, public_safe = "HOST_PROVIDER_MISMATCH", "HIDE", 99, False
-        unsafe_reason = f"host_not_allowed:{host}"
-    elif final_url or deep_link:
-        if youtube:
-            label, action, rank, public_safe = "YOUTUBE_DIRECT", "WATCH", 2, True
-        elif any(marker in path_query for marker in _SEARCH_MARKERS):
-            label, action, rank, public_safe = "PROVIDER_SEARCH_FALLBACK", "SEARCH", 5, True
-        elif (urlparse(final_url or deep_link).path or "").rstrip("/").lower() in _HOME_PATHS:
-            if search_url:
-                label, action, rank, public_safe = "PROVIDER_SEARCH_FALLBACK", "SEARCH", 5, True
-            else:
-                label, action, rank, public_safe = "PROVIDER_HOMEPAGE_FALLBACK", "OPEN_PROVIDER", 6, True
+def _build_homepage_url(provider_key: str) -> str:
+    return PROVIDER_HOME.get(provider_key, "")
+
+
+def _host_matches_provider(provider_key: str, url: str) -> bool:
+    if not url:
+        return False
+    expected = PROVIDER_HOSTS.get(provider_key)
+    if not expected:
+        return False
+    h = _host(url)
+    return any(x in h for x in expected)
+
+
+def _sanitize_provider(row: dict, title: str = "", content_slug: str = "") -> dict | None:
+    src = dict(row or {})
+    key = _provider_key(src)
+    name = _provider_name(src, key)
+
+    final_url = _first_url(src, ("final_url", "watch_url", "deep_link", "deeplink", "url", "web_url", "link", "href"))
+    search_url = _first_url(src, ("search_url", "provider_search_url")) or _build_search_url(key, title)
+    homepage_url = _first_url(src, ("homepage_url", "provider_homepage_url")) or _build_homepage_url(key)
+
+    if not key:
+        return None
+
+    # YouTube is strict.
+    if key == "youtube":
+        video_id = src.get("video_id") or src.get("youtube_video_id") or ""
+        if final_url and (_is_youtube_watch(final_url) or video_id):
+            src.update(
+                provider_key=key,
+                provider_display_name=name,
+                final_url=final_url,
+                provider_trust_label="YOUTUBE_DIRECT",
+                provider_display_action="watch",
+                provider_display_rank=0,
+                provider_is_public_safe=True,
+                provider_public_label="Watch on YouTube",
+                provider_display_reason="youtube_valid_watch_url",
+                provider_policy_version=PROVIDER_DISPLAY_POLICY_VERSION,
+            )
+            return src
+        return None
+
+    # If final URL is aggregator, it is never direct watch.
+    if final_url and _is_aggregator_url(final_url):
+        if _title_url_mismatch(title, final_url):
+            # Example: Karuppu row pointing to Dhuandhaar TMDB URL.
+            return None
+
+        final_url = ""
+
+    # If final URL host does not match provider, do not use as direct watch.
+    if final_url and not _host_matches_provider(key, final_url):
+        final_url = ""
+
+    # Direct deeplink only when host is provider host and not a search page.
+    if final_url and _host_matches_provider(key, final_url) and not _is_search_url(final_url):
+        src.update(
+            provider_key=key,
+            provider_display_name=name,
+            final_url=final_url,
+            provider_trust_label="DIRECT_DEEPLINK",
+            provider_display_action="watch",
+            provider_display_rank=1,
+            provider_is_public_safe=True,
+            provider_public_label=f"Watch on {name}",
+            provider_display_reason="provider_host_direct_deeplink",
+            provider_policy_version=PROVIDER_DISPLAY_POLICY_VERSION,
+        )
+        return src
+
+    # Search fallback is accepted as product-safe navigation.
+    if search_url:
+        src.update(
+            provider_key=key,
+            provider_display_name=name,
+            final_url=search_url,
+            search_url=search_url,
+            provider_trust_label="PROVIDER_SEARCH_FALLBACK",
+            provider_display_action="search",
+            provider_display_rank=5,
+            provider_is_public_safe=True,
+            provider_public_label=f"Search on {name}",
+            provider_display_reason="provider_search_fallback",
+            provider_policy_version=PROVIDER_DISPLAY_POLICY_VERSION,
+        )
+        return src
+
+    # Homepage fallback is accepted as product-safe navigation.
+    if homepage_url:
+        src.update(
+            provider_key=key,
+            provider_display_name=name,
+            final_url=homepage_url,
+            homepage_url=homepage_url,
+            provider_trust_label="PROVIDER_HOMEPAGE_FALLBACK",
+            provider_display_action="open",
+            provider_display_rank=9,
+            provider_is_public_safe=True,
+            provider_public_label=f"Open {name}",
+            provider_display_reason="provider_homepage_fallback",
+            provider_policy_version=PROVIDER_DISPLAY_POLICY_VERSION,
+        )
+        return src
+
+    return None
+
+
+def _provider_list_from_item(item: dict) -> list:
+    for key in ("providers", "availability", "ott_all", "watch_providers"):
+        value = item.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _apply_overlay_to_item(item: dict) -> dict:
+    slug = str(item.get("slug") or item.get("content_slug") or "").strip().lower()
+    overlay = PROVIDER_TRUTH_OVERLAYS.get(slug)
+    if not overlay:
+        return item
+
+    title = str(item.get("title") or overlay.get("title") or "").strip()
+    row = _sanitize_provider(dict(overlay), title=title, content_slug=slug)
+    if not row:
+        return item
+
+    item["providers"] = [row]
+    item["availability"] = [row]
+    item["ott_all"] = [row]
+    item["watch_providers"] = [row]
+    item["ott_primary"] = row.get("provider_display_name") or row.get("provider_name")
+    item["ott_primary_key"] = row.get("provider_key")
+    item["provider_display_primary_key"] = row.get("provider_key")
+    item["provider_display_primary_name"] = row.get("provider_display_name") or row.get("provider_name")
+    item["provider_display_primary_label"] = row.get("provider_public_label")
+    item["provider_public_count"] = 1
+    item["provider_hidden_count"] = 0
+    item["provider_policy_version"] = PROVIDER_DISPLAY_POLICY_VERSION
+    item["provider_correction_source"] = overlay.get("source")
+    return item
+
+
+def apply_provider_safe_display_policy(providers, title: str = "", content_slug: str = "", *args, **kwargs):
+    if isinstance(providers, dict):
+        return apply_provider_safe_display_policy_to_item(providers, *args, **kwargs)
+
+    out = []
+    hidden = 0
+    for row in providers or []:
+        clean = _sanitize_provider(row, title=title, content_slug=content_slug)
+        if clean:
+            out.append(clean)
         else:
-            label, action, rank, public_safe = "DIRECT_DEEPLINK", "WATCH", 1, True
-    elif search_url:
-        label, action, rank, public_safe = "PROVIDER_SEARCH_FALLBACK", "SEARCH", 5, True
-    else:
-        label, action, rank, public_safe = "PROVIDER_HOMEPAGE_FALLBACK", "OPEN_PROVIDER", 6, True
+            hidden += 1
 
-    if label == "YOUTUBE_DIRECT":
-        public_label = "Watch on YouTube"
-    elif label == "DIRECT_DEEPLINK":
-        public_label = f"Watch on {provider_name}" if provider_name else "Watch on Provider"
-    elif label == "PROVIDER_SEARCH_FALLBACK":
-        public_label = f"Search on {provider_name}" if provider_name else "Search on Provider"
-    elif label == "PROVIDER_HOMEPAGE_FALLBACK":
-        public_label = f"Open {provider_name}" if provider_name else "Open Provider"
-    else:
-        public_label = None
-
-    return {
-        "provider_trust_label": label,
-        "provider_display_action": action,
-        "provider_display_rank": rank,
-        "provider_is_public_safe": public_safe,
-        "provider_public_label": public_label,
-        "provider_display_reason": unsafe_reason or label.lower(),
-        "provider_video_id": video_id or None,
-        "provider_policy_version": POLICY_VERSION,
-    }
+    out.sort(key=lambda r: int(r.get("provider_display_rank") or 99))
+    return out
 
 
-def apply_provider_safe_display_policy(rows: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Classify, sort, and split public-safe versus hidden provider rows."""
-
-    public: list[dict[str, Any]] = []
-    hidden: list[dict[str, Any]] = []
-    for raw in rows or []:
-        if not isinstance(raw, dict):
-            continue
-        row = dict(raw)
-        row.update(classify_provider_display(row))
-        if row["provider_is_public_safe"]:
-            public.append(row)
-        else:
-            hidden.append(row)
-
-    def sort_key(row: dict[str, Any]) -> tuple[int, int, str]:
-        # Preserve an explicitly approved API overlay as the displayed primary
-        # while keeping its honest Open Provider label/rank.
-        overlay_first = 0 if row.get("overlay_status") == "primary" else 1
-        return overlay_first, int(row.get("provider_display_rank") or 99), _text(row.get("provider_display_name") or row.get("provider_name"))
-
-    public.sort(key=sort_key)
-    return public, hidden
-
-
-def _parse_rows(value: Any) -> tuple[list[dict[str, Any]], bool]:
-    if isinstance(value, list):
-        return [dict(item) for item in value if isinstance(item, dict)], False
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return [dict(item) for item in parsed if isinstance(item, dict)], True
-        except (TypeError, ValueError):
-            pass
-    return [], isinstance(value, str)
-
-
-def apply_provider_safe_display_policy_to_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Apply policy to a v4 card/search item when provider rows are present."""
-
+def apply_provider_safe_display_policy_to_item(item: dict, *args, **kwargs) -> dict:
     if not isinstance(item, dict):
         return item
-    out = dict(item)
-    source_rows: list[dict[str, Any]] = []
-    source_field = ""
-    for field in ("providers", "watch_providers", "availability", "ott_all"):
-        rows, _ = _parse_rows(out.get(field))
-        if rows:
-            source_rows, source_field = rows, field
-            break
-    if not source_rows:
-        for field in ("availability_json", "provider_summary"):
-            rows, _ = _parse_rows(out.get(field))
-            if rows:
-                source_rows, source_field = rows, field
-                break
-    if not source_rows and any(out.get(field) for field in ("provider_key", "provider_name", "provider_display_name")):
-        source_rows = [out]
-        source_field = "item"
-    if not source_rows:
-        return out
 
-    public, hidden = apply_provider_safe_display_policy(source_rows)
-    for field in ("providers", "watch_providers", "availability", "ott_all"):
-        if field in out or field == source_field:
-            out[field] = public
-    for field in ("availability_json", "provider_summary"):
-        if field in out and isinstance(out.get(field), str):
-            out[field] = json.dumps(public, ensure_ascii=False)
-    out["provider_hidden_rows"] = hidden
-    out["provider_public_count"] = len(public)
-    out["provider_hidden_count"] = len(hidden)
-    out["provider_policy_version"] = POLICY_VERSION
+    item = dict(item)
+    item = _apply_overlay_to_item(item)
+
+    title = str(item.get("title") or item.get("name") or "").strip()
+    slug = str(item.get("slug") or item.get("content_slug") or "").strip().lower()
+
+    raw = _provider_list_from_item(item)
+    public = []
+    hidden = 0
+
+    for row in raw:
+        clean = _sanitize_provider(row, title=title, content_slug=slug)
+        if clean:
+            public.append(clean)
+        else:
+            hidden += 1
+
+    public.sort(key=lambda r: int(r.get("provider_display_rank") or 99))
+
+    item["providers"] = public
+    item["availability"] = public
+    item["ott_all"] = public
+    item["watch_providers"] = public
+    item["provider_public_count"] = len(public)
+    item["provider_hidden_count"] = hidden
+    item["provider_policy_version"] = PROVIDER_DISPLAY_POLICY_VERSION
+
     if public:
         primary = public[0]
-        out["provider_display_primary_key"] = primary.get("provider_key")
-        out["provider_display_primary_name"] = primary.get("provider_display_name") or primary.get("provider_name")
-        out["provider_display_primary_label"] = primary.get("provider_public_label")
-    return out
+        item["ott_primary"] = primary.get("provider_display_name") or primary.get("provider_name")
+        item["ott_primary_key"] = primary.get("provider_key")
+        item["provider_display_primary_key"] = primary.get("provider_key")
+        item["provider_display_primary_name"] = primary.get("provider_display_name") or primary.get("provider_name")
+        item["provider_display_primary_label"] = primary.get("provider_public_label")
+    else:
+        item["provider_display_primary_key"] = None
+        item["provider_display_primary_name"] = None
+        item["provider_display_primary_label"] = None
+
+    return item
