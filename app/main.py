@@ -571,15 +571,11 @@ def _v4_apply_provider_correction_rows(slug: str, rows: list[dict]) -> list[dict
     if not correction:
         return rows
 
-    normalized = [dict(row) for row in rows if isinstance(row, dict)]
-    existing = []
-    for row in normalized:
-        if _v4_provider_key(row) == correction["provider_key"]:
-            continue
-        row["overlay_status"] = "demoted"
-        row["overlay_reason"] = correction["source"]
-        existing.append(row)
-    return [_v4_overlay_provider_row(slug, correction)] + existing
+    # Correction overlays are public-trust overrides.
+    # When a title has an approved correction, do not expose conflicting
+    # old provider rows publicly. This prevents cases like:
+    # Karuppu -> Prime Video overlay + old ShemarooMe/TMDB wrong-title row.
+    return [_v4_overlay_provider_row(slug, correction)]
 
 
 def _v4_apply_provider_correction_card(item: dict) -> dict:
