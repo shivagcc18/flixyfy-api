@@ -537,6 +537,26 @@ def _v4_search_payload(q: str | None = None, page: int = 1, limit: int = 24, dom
 
         raw = search_fn(q=q, domain=mapped_domain, limit=limit)
         out = _v4_items_payload(raw, page=page, limit=limit, domain=mapped_domain)
+        canonical = _v4_people_canonical_for_query_v2(q)
+        if canonical and page == 1:
+            try:
+                person_payload = _v4_people_payload("historical", page=1, limit=3, q=q, tier="all")
+                people_items = []
+                for person in list(person_payload.get("items") or []):
+                    person_item = dict(person)
+                    person_item["entity_type"] = "person"
+                    person_item["type"] = "person"
+                    people_items.append(person_item)
+                if people_items:
+                    existing_keys = {_v4_people_merge_key_v2(item) for item in people_items}
+                    movie_items = [item for item in list(out.get("items") or []) if _v4_people_merge_key_v2(item) not in existing_keys]
+                    out["items"] = (people_items + movie_items)[:limit]
+                    out["results"] = out["items"]
+                    out["movies"] = out["items"]
+                    out["data"] = out["items"]
+                    out["total"] = max(int(out.get("total") or 0), len(out["items"]))
+            except Exception:
+                pass
         out["query"] = q
         out["type"] = type or "all"
         out["region"] = region or "all"
@@ -643,33 +663,104 @@ def _v4_language_aliases(language: str | None) -> list[str]:
 
 
 # FLIXYFY_PEOPLE_RANKING_TOP_PERSON_FIX_V2
-_V4_TOP_PERSON_BOOST_PATTERNS = [
-    (100000, ["ntr", "n. t. rama rao", "n t rama rao", "nandamuri taraka rama rao", "n-t-rama-rao", "nandamuri-taraka-rama-rao"]),
-    (99000, ["anr", "akkineni nageswara rao", "akkineni-nageswara-rao"]),
-    (98000, ["krishna", "ghattamaneni krishna", "ghattamaneni-krishna"]),
-    (97000, ["chiranjeevi", "konidela chiranjeevi", "konidela-chiranjeevi"]),
-    (96000, ["balakrishna", "nandamuri balakrishna", "nandamuri-balakrishna"]),
-    (95000, ["savitri"]),
-    (94000, ["sridevi", "sri devi"]),
-    (93000, ["brahmanandam"]),
-    (92000, ["jayasudha"]),
-    (91000, ["jamuna"]),
+_V4_CANONICAL_PEOPLE = [
+    {
+        "display_name": "N. T. Rama Rao",
+        "slug": "n-t-rama-rao",
+        "score": 100000,
+        "aliases": ["ntr", "n. t. rama rao", "n t rama rao", "nandamuri taraka rama rao", "n-t-rama-rao", "nandamuri-taraka-rama-rao"],
+    },
+    {
+        "display_name": "Akkineni Nageswara Rao",
+        "slug": "akkineni-nageswara-rao",
+        "score": 99000,
+        "aliases": ["anr", "a nageswara rao", "a. nageswara rao", "akkineni nageswara rao", "a-nageswara-rao", "akkineni-nageswara-rao"],
+    },
+    {"display_name": "Krishna", "slug": "krishna", "score": 98000, "aliases": ["krishna", "ghattamaneni krishna", "ghattamaneni-krishna"]},
+    {"display_name": "Chiranjeevi", "slug": "chiranjeevi", "score": 97000, "aliases": ["chiranjeevi", "konidela chiranjeevi", "konidela-chiranjeevi"]},
+    {"display_name": "Balakrishna", "slug": "balakrishna", "score": 96000, "aliases": ["balakrishna", "nandamuri balakrishna", "nandamuri-balakrishna"]},
+    {"display_name": "Savitri", "slug": "savitri", "score": 95000, "aliases": ["savitri"]},
+    {"display_name": "Sridevi", "slug": "sridevi", "score": 94000, "aliases": ["sridevi", "sri devi", "sri-devi"]},
+    {"display_name": "Brahmanandam", "slug": "brahmanandam", "score": 93000, "aliases": ["brahmanandam"]},
+    {"display_name": "Jayasudha", "slug": "jayasudha", "score": 92000, "aliases": ["jayasudha", "jaya sudha", "jaya-sudha"]},
+    {"display_name": "Jamuna", "slug": "jamuna", "score": 91000, "aliases": ["jamuna"]},
 ]
+
+_V4_CANONICAL_BY_COMPACT: dict[str, dict] = {}
+for _person in _V4_CANONICAL_PEOPLE:
+    for _alias in list(_person["aliases"]) + [_person["display_name"], _person["slug"]]:
+        _V4_CANONICAL_BY_COMPACT[re.sub(r"[^a-z0-9]+", "", str(_alias).lower())] = _person
 
 _V4_PEOPLE_QUERY_ALIASES = {
     "ntr": ["ntr", "n. t. rama rao", "n t rama rao", "nandamuri taraka rama rao"],
-    "anr": ["anr", "akkineni nageswara rao"],
+    "anr": ["anr", "a nageswara rao", "akkineni nageswara rao"],
     "balakrishna": ["balakrishna", "nandamuri balakrishna"],
     "chiranjeevi": ["chiranjeevi", "konidela chiranjeevi"],
     "krishna": ["krishna", "ghattamaneni krishna"],
     "savitri": ["savitri"],
     "sridevi": ["sridevi", "sri devi"],
     "brahmanandam": ["brahmanandam"],
+    "jayasudha": ["jayasudha", "jaya sudha"],
+    "jamuna": ["jamuna"],
 }
 
 def _v4_people_bad_name_v2(name: str | None) -> bool:
     value = str(name or "").strip().lower()
     return value in {"", "n/a", "n/a n/a", "unknown", "none", "null", "na"}
+
+def _v4_people_compact_v2(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+def _v4_people_canonical_for_value_v2(value: str | None) -> dict | None:
+    return _V4_CANONICAL_BY_COMPACT.get(_v4_people_compact_v2(value))
+
+def _v4_people_canonical_for_query_v2(q: str | None) -> dict | None:
+    return _v4_people_canonical_for_value_v2(q)
+
+def _v4_people_noisy_query_fragment_v2(name: str | None, q: str | None, domain: str) -> bool:
+    query = _v4_people_compact_v2(q)
+    if _v4_norm_domain(domain) != "historical" or query not in {"ntr", "anr"}:
+        return False
+    value = str(name or "").strip()
+    compact = _v4_people_compact_v2(value)
+    canonical = _v4_people_canonical_for_query_v2(query) or {}
+    allowed = {_v4_people_compact_v2(alias) for alias in (canonical.get("aliases") or [])}
+    allowed.add(_v4_people_compact_v2(canonical.get("display_name")))
+    if compact in allowed:
+        return False
+    return bool(re.search(rf"(^|\s){re.escape(query)}$", value.lower()))
+
+def _v4_people_count_expr_sql_v2(columns: set[str], preferred: tuple[str, ...]) -> str:
+    present = [col for col in preferred if col in columns]
+    if not present:
+        return "0"
+    if len(present) == 1:
+        return f'COALESCE({_v4_qi(present[0])}, 0)'
+    return "GREATEST(" + ", ".join(f'COALESCE({_v4_qi(col)}, 0)' for col in present) + ")"
+
+def _v4_people_text_expr_sql_v2(columns: set[str], preferred: tuple[str, ...]) -> str:
+    present = [col for col in preferred if col in columns]
+    if not present:
+        return "''"
+    return "COALESCE(" + ", ".join(_v4_qi(col) for col in present) + ", '')"
+
+def _v4_people_threshold_count_expr_sql_v2(columns: set[str]) -> str:
+    return _v4_people_count_expr_sql_v2(columns, ("career_attached_movie_count", "total_movie_count", "movie_count", "primary_language_movie_count"))
+
+def _v4_people_default_min_movies_v2(domain: str, tier: str | None, q: str | None, min_movies: int | None) -> int | None:
+    if min_movies is not None:
+        return max(0, int(min_movies or 0))
+    if str(q or "").strip():
+        return None
+    domain = _v4_norm_domain(domain)
+    tier_key = str(tier or "").strip().lower()
+    if tier_key in {"all", "none", "0"}:
+        return None
+    if domain == "historical":
+        if tier_key in {"eligible", "secondary"}:
+            return 25
+        return 50
+    return 20
 
 def _v4_people_query_terms_v2(q: str | None) -> list[str]:
     value = str(q or "").strip().lower()
@@ -695,30 +786,27 @@ def _v4_people_name_blob_v2(item: dict) -> str:
     ).lower()
 
 def _v4_people_top_boost_v2(item: dict) -> int:
-    blob = _v4_people_name_blob_v2(item)
-    slug = str(item.get("person_slug") or item.get("slug") or "").lower()
-    for score, patterns in _V4_TOP_PERSON_BOOST_PATTERNS:
-        for pat in patterns:
-            p = pat.lower()
-            if "-" in p and slug == p:
-                return score
-            if p in blob:
-                return score
+    slug = str(item.get("person_slug") or item.get("slug") or "")
+    names = [item.get(k) for k in ("person_name", "display_name", "title", "name", "person_slug", "slug")]
+    for value in [slug, *names]:
+        canonical = _v4_people_canonical_for_value_v2(value)
+        if canonical:
+            return int(canonical.get("score") or 0)
     return 0
 
-def _v4_people_top_boost_sql_v2() -> str:
-    name_expr = 'LOWER(COALESCE("person_name", "name", \'\'))'
-    slug_expr = 'LOWER(COALESCE("person_slug", "slug", \'\'))'
+def _v4_people_top_boost_sql_v2(columns: set[str]) -> str:
+    name_expr = _v4_people_text_expr_sql_v2(columns, ("person_name", "display_name", "name", "title"))
+    slug_expr = _v4_people_text_expr_sql_v2(columns, ("person_slug", "slug"))
+    name_compact = f"LOWER(REGEXP_REPLACE({name_expr}, '[^a-zA-Z0-9]+', '', 'g'))"
+    slug_compact = f"LOWER(REGEXP_REPLACE({slug_expr}, '[^a-zA-Z0-9]+', '', 'g'))"
     parts = []
-    for score, patterns in _V4_TOP_PERSON_BOOST_PATTERNS:
-        checks = []
-        for pat in patterns:
-            p = pat.replace("'", "''").lower()
-            if "-" in p:
-                checks.append(f"{slug_expr} = '{p}'")
-            else:
-                checks.append(f"{name_expr} LIKE '%{p}%'")
-        parts.append("WHEN " + " OR ".join(checks) + f" THEN {score}")
+    for person in _V4_CANONICAL_PEOPLE:
+        aliases = {_v4_people_compact_v2(alias) for alias in list(person["aliases"]) + [person["display_name"], person["slug"]]}
+        aliases = sorted(alias for alias in aliases if alias)
+        if not aliases:
+            continue
+        quoted = ",".join("'" + alias.replace("'", "''") + "'" for alias in aliases)
+        parts.append(f"WHEN {name_compact} IN ({quoted}) OR {slug_compact} IN ({quoted}) THEN {int(person['score'])}")
     return "CASE " + " ".join(parts) + " ELSE 0 END"
 
 def _v4_people_matches_query_v2(item: dict, terms: list[str]) -> bool:
@@ -746,12 +834,17 @@ def _v4_people_merge_key_v2(item: dict) -> str:
 
 def _v4_people_normalize_item_v2(row: dict) -> dict:
     item = dict(row or {})
-    name = item.get("person_name") or item.get("display_name") or item.get("title") or item.get("name") or ""
-    slug = item.get("person_slug") or item.get("slug") or _v4_slugify(name)
+    raw_name = item.get("person_name") or item.get("display_name") or item.get("title") or item.get("name") or ""
+    raw_slug = item.get("person_slug") or item.get("slug") or _v4_slugify(raw_name)
+    canonical = _v4_people_canonical_for_value_v2(raw_slug) or _v4_people_canonical_for_value_v2(raw_name)
+    name = canonical.get("display_name") if canonical else raw_name
+    slug = canonical.get("slug") if canonical else raw_slug
     item["domain"] = "person"
     item["source_domain"] = "person"
     item["person_name"] = name
+    item["display_name"] = item.get("display_name") if not canonical else name
     item["display_name"] = item.get("display_name") or name
+    item["title"] = item.get("title") if not canonical else name
     item["title"] = item.get("title") or name
     item["person_slug"] = slug
     item["slug"] = slug
@@ -761,7 +854,8 @@ def _v4_people_normalize_item_v2(row: dict) -> dict:
     item["career_attached_movie_count"] = int(item.get("career_attached_movie_count") or item.get("total_movie_count") or item.get("movie_count") or 0)
     item["total_movie_count"] = int(item.get("total_movie_count") or item.get("career_attached_movie_count") or item.get("movie_count") or 0)
     item["youtube_movie_count"] = int(item.get("youtube_movie_count") or 0)
-    item["ranking_boost"] = _v4_people_top_boost_v2(item)
+    item["canonical_person_boost"] = _v4_people_top_boost_v2(item)
+    item["ranking_boost"] = item["canonical_person_boost"]
     return item
 
 def _v4_people_from_search_payload(domain: str = "historical", page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None) -> dict:
@@ -790,28 +884,28 @@ def _v4_people_from_search_payload(domain: str = "historical", page: int = 1, li
         where.append("(" + " OR ".join(term_parts) + ")")
 
     clause = " WHERE " + " AND ".join(where)
-    scan_limit = 5000
     rows = _v4_rows(
         f'SELECT "title", "slug", "search_text", "language_slug", "language_name", "release_year" '
         f'FROM public.{_v4_qi(table)}{clause} '
         'ORDER BY COALESCE("rank_score", 0) DESC, COALESCE("release_year", 0) DESC LIMIT %s',
-        params + [scan_limit],
+        params + [5000],
     )
 
     people: dict[str, dict] = {}
     for row in rows:
         row_language = str(row.get("language_slug") or row.get("language_name") or "").strip().lower()
         row_language_name = row.get("language_name") or row.get("language_slug") or ""
-        for name in _v4_people_candidates_from_search_row(row):
-            if _v4_people_bad_name_v2(name):
+        for raw_name in _v4_people_candidates_from_search_row(row):
+            if _v4_people_bad_name_v2(raw_name) or _v4_people_noisy_query_fragment_v2(raw_name, q, domain):
                 continue
-            slug = _v4_slugify(name)
+            canonical = _v4_people_canonical_for_value_v2(raw_name)
+            name = canonical.get("display_name") if canonical else raw_name
+            slug = canonical.get("slug") if canonical else _v4_slugify(name)
             item_probe = {"person_name": name, "person_slug": slug}
             if not _v4_people_matches_query_v2(item_probe, q_terms):
                 continue
-            key = slug
             item = people.setdefault(
-                key,
+                slug,
                 {
                     "domain": "person",
                     "source_domain": "person",
@@ -846,13 +940,21 @@ def _v4_people_from_search_payload(domain: str = "historical", page: int = 1, li
     start = (page - 1) * limit
     return _v4_items_payload({"total": total, "items": items[start:start + limit]}, page=page, limit=limit, domain=domain)
 
-def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None) -> dict:
+def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None, tier: str | None = None) -> dict:
     domain = _v4_norm_domain(domain)
     limit = _v4_limit(limit)
     page = max(int(page or 1), 1)
     table = _v4_person_table(domain)
+    columns = _v4_table_columns(table)
+    name_sql = _v4_people_text_expr_sql_v2(columns, ("person_name", "display_name", "name", "title"))
+    slug_sql = _v4_people_text_expr_sql_v2(columns, ("person_slug", "slug"))
+    threshold_expr = _v4_people_threshold_count_expr_sql_v2(columns)
+    career_expr = _v4_people_count_expr_sql_v2(columns, ("career_attached_movie_count", "total_movie_count", "movie_count"))
+    total_expr = _v4_people_count_expr_sql_v2(columns, ("total_movie_count", "movie_count", "career_attached_movie_count"))
+    movie_expr = _v4_people_count_expr_sql_v2(columns, ("movie_count", "primary_language_movie_count", "total_movie_count"))
+    youtube_expr = _v4_people_count_expr_sql_v2(columns, ("youtube_movie_count",))
 
-    where = ['LOWER(COALESCE("person_name", "name", \'\')) NOT IN (\'\', \'n/a\', \'n/a n/a\', \'unknown\', \'none\', \'null\', \'na\')']
+    where = [f"LOWER({name_sql}) NOT IN ('', 'n/a', 'n/a n/a', 'unknown', 'none', 'null', 'na')"]
     params = []
 
     q_terms = _v4_people_query_terms_v2(q)
@@ -860,20 +962,33 @@ def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 2
         q_parts = []
         for term in q_terms:
             like = "%" + term.lower() + "%"
-            q_parts.append('(LOWER(COALESCE("person_name", \'\')) LIKE %s OR LOWER(COALESCE("name", \'\')) LIKE %s OR LOWER(COALESCE("person_slug", \'\')) LIKE %s)')
-            params.extend([like, like, like])
-        where.append("(" + " OR ".join(q_parts) + ")")
+            compact = _v4_people_compact_v2(term)
+            for col in ("person_name", "display_name", "name", "title", "person_slug", "slug"):
+                if col in columns:
+                    q_parts.append(f"LOWER(COALESCE(CAST({_v4_qi(col)} AS TEXT), '')) LIKE %s")
+                    params.append(like)
+                    q_parts.append(f"LOWER(REGEXP_REPLACE(COALESCE(CAST({_v4_qi(col)} AS TEXT), ''), '[^a-zA-Z0-9]+', '', 'g')) = %s")
+                    params.append(compact)
+        if q_parts:
+            where.append("(" + " OR ".join(q_parts) + ")")
 
     aliases = _v4_language_aliases(language)
     if aliases:
         placeholders = ",".join(["%s"] * len(aliases))
-        where.append(f'(LOWER(COALESCE("primary_language_slug", "language_slug", \'\')) IN ({placeholders}) OR LOWER(COALESCE("primary_language_name", "language_name", \'\')) IN ({placeholders}))')
-        params.extend(aliases)
-        params.extend(aliases)
+        lang_parts = []
+        for col in ("primary_language_slug", "language_slug", "primary_language_name", "language_name"):
+            if col in columns:
+                lang_parts.append(f"LOWER(COALESCE(CAST({_v4_qi(col)} AS TEXT), '')) IN ({placeholders})")
+                params.extend(aliases)
+        if lang_parts:
+            where.append("(" + " OR ".join(lang_parts) + ")")
 
-    if min_movies:
-        where.append('COALESCE("total_movie_count", "movie_count", 0) >= %s')
-        params.append(int(min_movies))
+    effective_min_movies = _v4_people_default_min_movies_v2(domain, tier, q, min_movies)
+    if effective_min_movies:
+        where.append(f"{threshold_expr} >= %s")
+        params.append(int(effective_min_movies))
+    else:
+        where.append(f"{threshold_expr} > 0")
 
     clause = " WHERE " + " AND ".join(where)
 
@@ -885,11 +1000,8 @@ def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 2
         fetch_limit = max(250, min(1000, limit * 30))
         table_rows = _v4_rows(
             f'SELECT {_v4_person_select_sql(table)} FROM public.{_v4_qi(table)}{clause} '
-            f'ORDER BY {_v4_people_top_boost_sql_v2()} DESC, '
-            'COALESCE("career_attached_movie_count", "total_movie_count", "movie_count", 0) DESC, '
-            'COALESCE("total_movie_count", "movie_count", 0) DESC, '
-            'COALESCE("youtube_movie_count", 0) DESC, '
-            'COALESCE("person_name", "name", \'\') ASC '
+            f'ORDER BY {_v4_people_top_boost_sql_v2(columns)} DESC, '
+            f'{career_expr} DESC, {total_expr} DESC, {movie_expr} DESC, {youtube_expr} DESC, {name_sql} ASC '
             'LIMIT %s',
             params + [fetch_limit],
         )
@@ -897,13 +1009,15 @@ def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 2
         table_rows = []
         table_total = 0
 
-    search_payload = _v4_people_from_search_payload(domain=domain, page=1, limit=100, q=q, language=language, min_movies=min_movies)
-    search_rows = list(search_payload.get("items") or [])
+    search_rows = []
+    if q_terms:
+        search_payload = _v4_people_from_search_payload(domain=domain, page=1, limit=100, q=q, language=language, min_movies=min_movies)
+        search_rows = list(search_payload.get("items") or [])
 
     merged: dict[str, dict] = {}
     for row in list(table_rows or []) + search_rows:
         item = _v4_people_normalize_item_v2(row)
-        if _v4_people_bad_name_v2(item.get("person_name")):
+        if _v4_people_bad_name_v2(item.get("person_name")) or _v4_people_noisy_query_fragment_v2(item.get("person_name"), q, domain):
             continue
         if q_terms and not _v4_people_matches_query_v2(item, q_terms):
             continue
@@ -912,12 +1026,12 @@ def _v4_people_payload(domain: str = "historical", page: int = 1, limit: int = 2
         if not existing:
             merged[key] = item
             continue
-        # Preserve the better visible identity, but keep the stronger counts.
         for count_key in ("movie_count", "primary_language_movie_count", "career_attached_movie_count", "total_movie_count", "youtube_movie_count"):
             existing[count_key] = max(int(existing.get(count_key) or 0), int(item.get(count_key) or 0))
         if not existing.get("poster_url") and item.get("poster_url"):
             existing["poster_url"] = item.get("poster_url")
-        existing["ranking_boost"] = max(int(existing.get("ranking_boost") or 0), int(item.get("ranking_boost") or 0))
+        existing["canonical_person_boost"] = max(int(existing.get("canonical_person_boost") or 0), int(item.get("canonical_person_boost") or 0))
+        existing["ranking_boost"] = existing["canonical_person_boost"]
 
     items = list(merged.values())
     items.sort(key=_v4_people_sort_key_v2)
@@ -1010,12 +1124,12 @@ def _flixyfy_v4_search_suggestions(q: str | None = None, limit: int = 10):
     return {"query": q or "", "suggestions": suggestions, "items": suggestions, "total": len(suggestions)}
 
 @app.get("/api/v4/historical/people")
-def _flixyfy_v4_historical_people(page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None):
-    return _v4_people_payload("historical", page=page, limit=limit, q=q, language=language, min_movies=min_movies)
+def _flixyfy_v4_historical_people(page: int = 1, limit: int = 24, q: str | None = None, language: str | None = None, min_movies: int | None = None, tier: str | None = None):
+    return _v4_people_payload("historical", page=page, limit=limit, q=q, language=language, min_movies=min_movies, tier=tier)
 
 @app.get("/api/v4/people")
-def _flixyfy_v4_people(page: int = 1, limit: int = 24, q: str | None = None, domain: str | None = None, language: str | None = None, min_movies: int | None = None):
-    return _v4_people_payload(domain or "current", page=page, limit=limit, q=q, language=language, min_movies=min_movies)
+def _flixyfy_v4_people(page: int = 1, limit: int = 24, q: str | None = None, domain: str | None = None, language: str | None = None, min_movies: int | None = None, tier: str | None = None):
+    return _v4_people_payload(domain or "current", page=page, limit=limit, q=q, language=language, min_movies=min_movies, tier=tier)
 
 @app.get("/api/v4/language/{language_slug}")
 def _flixyfy_v4_language(language_slug: str, page: int = 1, limit: int = 24, sort: str | None = None):
