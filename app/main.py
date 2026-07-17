@@ -540,6 +540,200 @@ def _v4_provider_key(row: dict) -> str:
     ).strip().lower().replace(" ", "_")
 
 
+
+_V4_AGGREGATOR_DIRECT_HOSTS = ("themoviedb.org", "tmdb.org", "justwatch.com")
+
+_V4_DIRECT_URL_TITLE_STOP = {
+    "movie", "movies", "watch", "online", "stream", "streaming", "rent", "buy",
+    "india", "in", "title", "details", "detail", "video", "videos", "search",
+    "results", "ref", "phrase", "play", "store", "tv", "www", "com", "locale"
+}
+
+_V4_PROVIDER_LABELS = {
+    "netflix": "Netflix",
+    "prime_video": "Prime Video",
+    "amazon_prime_video": "Prime Video",
+    "amazon_prime_video_with_ads": "Prime Video",
+    "amazon_video": "Amazon Video",
+    "amazonvideo": "Amazon Video",
+    "jiohotstar": "JioHotstar",
+    "hotstar": "JioHotstar",
+    "zee5": "ZEE5",
+    "sonyliv": "SonyLIV",
+    "sony_liv": "SonyLIV",
+    "sun_nxt": "Sun NXT",
+    "sunnxt": "Sun NXT",
+    "aha": "Aha",
+    "shemaroome": "ShemarooMe",
+    "youtube": "YouTube",
+    "vi_movies_and_tv": "VI Movies and TV",
+    "mxplayer": "MX Player",
+    "mx_player": "MX Player",
+    "googleplay": "Google Play",
+    "google_tv": "Google TV",
+    "apple_tv_store": "Apple TV",
+    "appletvstore": "Apple TV",
+}
+
+_V4_PROVIDER_SEARCH_TEMPLATES = {
+    "netflix": "https://www.netflix.com/search?q={q}",
+    "prime_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "amazon_prime_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "amazon_prime_video_with_ads": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "amazon_video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "amazonvideo": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}",
+    "jiohotstar": "https://www.hotstar.com/in/search?q={q}",
+    "hotstar": "https://www.hotstar.com/in/search?q={q}",
+    "zee5": "https://www.zee5.com/search?q={q}",
+    "sonyliv": "https://www.sonyliv.com/search?q={q}",
+    "sony_liv": "https://www.sonyliv.com/search?q={q}",
+    "sun_nxt": "https://www.sunnxt.com/search?q={q}",
+    "sunnxt": "https://www.sunnxt.com/search?q={q}",
+    "aha": "https://www.aha.video/search?q={q}",
+    "shemaroome": "https://www.shemaroome.com/search?q={q}",
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "vi_movies_and_tv": "https://www.myvi.in/vi-movies-and-tv/search?q={q}",
+    "mxplayer": "https://www.mxplayer.in/search/{q}",
+    "mx_player": "https://www.mxplayer.in/search/{q}",
+    "googleplay": "https://play.google.com/store/search?q={q}&c=movies",
+    "google_tv": "https://play.google.com/store/search?q={q}&c=movies",
+    "apple_tv_store": "https://tv.apple.com/search?term={q}",
+    "appletvstore": "https://tv.apple.com/search?term={q}",
+}
+
+_V4_PROVIDER_HOME = {
+    "netflix": "https://www.netflix.com/in/",
+    "prime_video": "https://www.primevideo.com/",
+    "amazon_prime_video": "https://www.primevideo.com/",
+    "amazon_prime_video_with_ads": "https://www.primevideo.com/",
+    "amazon_video": "https://www.primevideo.com/",
+    "amazonvideo": "https://www.primevideo.com/",
+    "jiohotstar": "https://www.hotstar.com/in/",
+    "hotstar": "https://www.hotstar.com/in/",
+    "zee5": "https://www.zee5.com/",
+    "sonyliv": "https://www.sonyliv.com/",
+    "sony_liv": "https://www.sonyliv.com/",
+    "sun_nxt": "https://www.sunnxt.com/",
+    "sunnxt": "https://www.sunnxt.com/",
+    "aha": "https://www.aha.video/",
+    "shemaroome": "https://www.shemaroome.com/",
+    "youtube": "https://www.youtube.com/",
+    "vi_movies_and_tv": "https://www.myvi.in/vi-movies-and-tv",
+    "mxplayer": "https://www.mxplayer.in/",
+    "mx_player": "https://www.mxplayer.in/",
+    "googleplay": "https://play.google.com/store/movies",
+    "google_tv": "https://play.google.com/store/movies",
+    "apple_tv_store": "https://tv.apple.com/",
+    "appletvstore": "https://tv.apple.com/",
+}
+
+
+def _v4_url_host(url: str | None) -> str:
+    from urllib.parse import urlparse
+    try:
+        return urlparse(str(url or "")).netloc.lower().replace("www.", "")
+    except Exception:
+        return ""
+
+
+def _v4_is_aggregator_direct_url(url: str | None) -> bool:
+    host = _v4_url_host(url)
+    return any(x in host for x in _V4_AGGREGATOR_DIRECT_HOSTS)
+
+
+def _v4_token_text(value: str | None) -> set[str]:
+    tokens = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split()
+    return {x for x in tokens if len(x) >= 3 and x not in _V4_DIRECT_URL_TITLE_STOP}
+
+
+def _v4_url_tokens(url: str | None) -> set[str]:
+    from urllib.parse import unquote, urlparse
+    try:
+        parsed = urlparse(str(url or ""))
+    except Exception:
+        return set()
+    text = f"{parsed.netloc} {unquote(parsed.path or '')} {parsed.query}"
+    text = re.sub(r"\d+", " ", text)
+    return _v4_token_text(text)
+
+
+def _v4_url_title_mismatch(title: str | None, url: str | None) -> bool:
+    title_tokens = _v4_token_text(title)
+    url_tokens = _v4_url_tokens(url)
+    if not title_tokens or not url_tokens:
+        return False
+    return not bool(title_tokens.intersection(url_tokens))
+
+
+def _v4_provider_display_label(provider_key: str, row: dict) -> str:
+    return str(
+        row.get("provider_display_name")
+        or row.get("provider_name")
+        or _V4_PROVIDER_LABELS.get(provider_key)
+        or provider_key.replace("_", " ").title()
+    ).strip()
+
+
+def _v4_provider_search_url(provider_key: str, title: str | None) -> str:
+    from urllib.parse import quote_plus
+    template = _V4_PROVIDER_SEARCH_TEMPLATES.get(provider_key)
+    return template.format(q=quote_plus(str(title or ""))) if template else ""
+
+
+def _v4_public_provider_firewall_after_policy(title: str | None, rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    public_rows = []
+    hidden_rows = []
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        out = dict(row)
+        provider_key = _v4_provider_key(out)
+        provider_name = _v4_provider_display_label(provider_key, out)
+        final_url = str(out.get("final_url") or out.get("watch_url") or out.get("url") or "").strip()
+
+        if final_url and _v4_is_aggregator_direct_url(final_url):
+            if _v4_url_title_mismatch(title, final_url):
+                out["provider_is_public_safe"] = False
+                out["provider_display_reason"] = "hidden_aggregator_direct_title_mismatch"
+                out["provider_trust_label"] = "HIDDEN_AGGREGATOR_TITLE_MISMATCH"
+                hidden_rows.append(out)
+                continue
+
+            search_url = str(out.get("search_url") or "").strip() or _v4_provider_search_url(provider_key, title)
+            homepage_url = str(out.get("homepage_url") or "").strip() or _V4_PROVIDER_HOME.get(provider_key, "")
+
+            if search_url:
+                out["final_url"] = search_url
+                out["search_url"] = search_url
+                out["provider_public_label"] = f"Search on {provider_name}"
+                out["provider_trust_label"] = "PROVIDER_SEARCH_FALLBACK"
+                out["provider_display_action"] = "search"
+                out["provider_display_rank"] = max(int(out.get("provider_display_rank") or 5), 5)
+                out["provider_display_reason"] = "aggregator_direct_relabel_to_provider_search"
+                out["provider_is_public_safe"] = True
+            elif homepage_url:
+                out["final_url"] = homepage_url
+                out["homepage_url"] = homepage_url
+                out["provider_public_label"] = f"Open {provider_name}"
+                out["provider_trust_label"] = "PROVIDER_HOMEPAGE_FALLBACK"
+                out["provider_display_action"] = "open"
+                out["provider_display_rank"] = max(int(out.get("provider_display_rank") or 9), 9)
+                out["provider_display_reason"] = "aggregator_direct_relabel_to_provider_homepage"
+                out["provider_is_public_safe"] = True
+            else:
+                out["provider_is_public_safe"] = False
+                out["provider_display_reason"] = "hidden_aggregator_direct_no_safe_provider_navigation"
+                out["provider_trust_label"] = "HIDDEN_AGGREGATOR_NO_SAFE_NAVIGATION"
+                hidden_rows.append(out)
+                continue
+
+        public_rows.append(out)
+
+    return public_rows, hidden_rows
+
+
 def _v4_overlay_provider_row(slug: str, correction: dict) -> dict:
     homepage_url = correction["homepage_url"]
     return {
@@ -780,6 +974,8 @@ def _v4_detail_payload(domain: str, slug: str) -> dict:
     availability = _v4_provider_rows(slug, domain)
     availability = _v4_apply_provider_correction_rows(slug, availability)
     availability, hidden_provider_rows = apply_provider_safe_display_policy(availability)
+    availability, firewall_hidden_rows = _v4_public_provider_firewall_after_policy(row.get("title"), availability)
+    hidden_provider_rows = list(hidden_provider_rows or []) + list(firewall_hidden_rows or [])
     row["availability"] = availability
     row["ott_all"] = availability
     row["watch_providers"] = availability
