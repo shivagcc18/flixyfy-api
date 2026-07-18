@@ -1749,3 +1749,264 @@ async def _flixyfy_bad_public_slug_pattern_hide_middleware_v2(request, call_next
         headers=headers,
     )
 
+# ---------------------------------------------------------------------
+# FLIXYFY_PROVIDER_CONTRACT_UNIFIED_DETAIL_V1
+# Backend-only provider contract normalizer for detail pages.
+# Expands compact provider_keys/provider_names/provider_final_urls into:
+# availability, ott_all, providers, watch_providers, provider_display_*.
+# No DB mutation. No provider table mutation.
+# ---------------------------------------------------------------------
+from fastapi.responses import JSONResponse as _FlixyfyProviderContractJSONResponse
+
+_FLIXYFY_PROVIDER_CONTRACT_UNIFIED_DETAIL_V1 = "FLIXYFY_PROVIDER_CONTRACT_UNIFIED_DETAIL_V1"
+
+_FLIXYFY_PROVIDER_HOME_URLS_V1 = {
+    "jiohotstar": "https://www.hotstar.com/in/",
+    "hotstar": "https://www.hotstar.com/in/",
+    "disney_hotstar": "https://www.hotstar.com/in/",
+    "prime_video": "https://www.primevideo.com/",
+    "amazon_prime_video": "https://www.primevideo.com/",
+    "amazon_prime_video_with_ads": "https://www.primevideo.com/",
+    "amazonvideo": "https://www.primevideo.com/",
+    "netflix": "https://www.netflix.com/in/",
+    "youtube": "https://www.youtube.com/",
+    "zee5": "https://www.zee5.com/",
+    "sonyliv": "https://www.sonyliv.com/",
+    "sony_liv": "https://www.sonyliv.com/",
+    "aha": "https://www.aha.video/",
+    "sunnxt": "https://www.sunnxt.com/",
+    "mx_player": "https://www.mxplayer.in/",
+    "eros_now": "https://www.erosnow.com/",
+    "hoichoi": "https://www.hoichoi.tv/",
+    "manorama_max": "https://www.manoramamax.com/",
+    "shemaroome": "https://www.shemaroome.com/",
+    "apple_tv": "https://tv.apple.com/",
+    "google_play": "https://play.google.com/store/movies",
+    "bookmyshow": "https://in.bookmyshow.com/",
+}
+
+_FLIXYFY_PROVIDER_DISPLAY_NAMES_V1 = {
+    "jiohotstar": "JioHotstar",
+    "hotstar": "JioHotstar",
+    "disney_hotstar": "JioHotstar",
+    "prime_video": "Prime Video",
+    "amazon_prime_video": "Prime Video",
+    "amazon_prime_video_with_ads": "Prime Video",
+    "amazonvideo": "Prime Video",
+    "netflix": "Netflix",
+    "youtube": "YouTube",
+    "zee5": "ZEE5",
+    "sonyliv": "SonyLIV",
+    "sony_liv": "SonyLIV",
+    "aha": "aha",
+    "sunnxt": "Sun NXT",
+    "mx_player": "MX Player",
+    "eros_now": "Eros Now",
+    "hoichoi": "Hoichoi",
+    "manorama_max": "ManoramaMAX",
+    "shemaroome": "ShemarooMe",
+    "apple_tv": "Apple TV",
+    "google_play": "Google Play",
+    "bookmyshow": "BookMyShow",
+}
+
+def _flixyfy_split_provider_contract_field_v1(value):
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    try:
+        decoded = json.loads(text)
+        if isinstance(decoded, list):
+            return [str(x).strip() for x in decoded if str(x).strip()]
+    except Exception:
+        pass
+
+    for sep in ["|", ";", "\n", "\r"]:
+        if sep in text:
+            return [x.strip() for x in text.split(sep) if x.strip()]
+
+    if "," in text:
+        return [x.strip() for x in text.split(",") if x.strip()]
+
+    return [text]
+
+def _flixyfy_provider_contract_label_v1(provider_key, final_url):
+    provider_key = str(provider_key or "").strip().lower()
+    name = _FLIXYFY_PROVIDER_DISPLAY_NAMES_V1.get(provider_key) or str(provider_key or "").replace("_", " ").title()
+
+    if provider_key == "youtube":
+        return "Watch on YouTube", "YOUTUBE_DIRECT"
+
+    # For compact fallback rows we only know provider availability, not exact deeplink.
+    # Use honest launch-safe language.
+    return f"Open {name}", "PROVIDER_HOMEPAGE_FALLBACK"
+
+def _flixyfy_build_provider_contract_rows_v1(payload):
+    keys = _flixyfy_split_provider_contract_field_v1(payload.get("provider_keys"))
+    names = _flixyfy_split_provider_contract_field_v1(payload.get("provider_names"))
+    urls = _flixyfy_split_provider_contract_field_v1(payload.get("provider_final_urls"))
+
+    rows = []
+
+    for idx, raw_key in enumerate(keys):
+        provider_key = str(raw_key or "").strip().lower()
+        if not provider_key:
+            continue
+
+        provider_name = names[idx] if idx < len(names) and names[idx] else None
+        provider_name = provider_name or _FLIXYFY_PROVIDER_DISPLAY_NAMES_V1.get(provider_key) or provider_key.replace("_", " ").title()
+
+        final_url = urls[idx] if idx < len(urls) and urls[idx] else None
+        final_url = final_url or _FLIXYFY_PROVIDER_HOME_URLS_V1.get(provider_key) or ""
+
+        public_label, trust_label = _flixyfy_provider_contract_label_v1(provider_key, final_url)
+
+        rows.append({
+            "provider_key": provider_key,
+            "provider": provider_name,
+            "provider_name": provider_name,
+            "display_name": provider_name,
+            "name": provider_name,
+            "final_url": final_url,
+            "url": final_url,
+            "watch_url": final_url,
+            "web_url": final_url,
+            "provider_public_label": public_label,
+            "provider_display_label": public_label,
+            "provider_trust_label": trust_label,
+            "provider_is_public_safe": True,
+            "source": _FLIXYFY_PROVIDER_CONTRACT_UNIFIED_DETAIL_V1,
+        })
+
+    return rows
+
+def _flixyfy_normalize_provider_contract_detail_v1(payload):
+    if not isinstance(payload, dict):
+        return payload, False
+
+    changed = False
+
+    existing_rows = []
+    for key in ("ott_all", "availability", "providers", "watch_providers"):
+        value = payload.get(key)
+        if isinstance(value, list) and value:
+            existing_rows = value
+            break
+
+    compact_rows = _flixyfy_build_provider_contract_rows_v1(payload)
+
+    if not existing_rows and compact_rows:
+        for key in ("ott_all", "availability", "providers", "watch_providers"):
+            payload[key] = compact_rows
+        payload["provider_public_count"] = len(compact_rows)
+        payload["provider_hidden_count"] = int(payload.get("provider_hidden_count") or 0)
+        changed = True
+        existing_rows = compact_rows
+
+    if existing_rows:
+        first = existing_rows[0]
+        if isinstance(first, dict):
+            provider_key = str(
+                first.get("provider_key")
+                or first.get("provider_slug")
+                or first.get("key")
+                or ""
+            ).strip().lower()
+
+            provider_name = str(
+                first.get("provider_name")
+                or first.get("provider")
+                or first.get("display_name")
+                or first.get("name")
+                or _FLIXYFY_PROVIDER_DISPLAY_NAMES_V1.get(provider_key)
+                or provider_key.replace("_", " ").title()
+            ).strip()
+
+            final_url = str(
+                first.get("final_url")
+                or first.get("url")
+                or first.get("watch_url")
+                or first.get("web_url")
+                or _FLIXYFY_PROVIDER_HOME_URLS_V1.get(provider_key)
+                or ""
+            ).strip()
+
+            label, trust_label = _flixyfy_provider_contract_label_v1(provider_key, final_url)
+
+            if not payload.get("provider_display_primary_key") and provider_key:
+                payload["provider_display_primary_key"] = provider_key
+                changed = True
+
+            if not payload.get("provider_display_primary_name") and provider_name:
+                payload["provider_display_primary_name"] = provider_name
+                changed = True
+
+            if not payload.get("provider_display_primary_label"):
+                payload["provider_display_primary_label"] = label
+                changed = True
+
+            if not payload.get("ott_primary_key") and provider_key:
+                payload["ott_primary_key"] = provider_key
+                changed = True
+
+            if not payload.get("ott_primary") and provider_name:
+                payload["ott_primary"] = provider_name
+                changed = True
+
+    if changed:
+        payload["provider_contract_version"] = _FLIXYFY_PROVIDER_CONTRACT_UNIFIED_DETAIL_V1
+
+    return payload, changed
+
+@app.middleware("http")
+async def _flixyfy_provider_contract_unified_detail_middleware_v1(request, call_next):
+    response = await call_next(request)
+
+    path = request.url.path
+
+    detail_prefixes = (
+        "/api/v4/movie/",
+        "/api/v4/movies/",
+        "/api/v4/current/",
+        "/api/v4/historical/",
+        "/api/v4/hollywood/",
+        "/api/v4/webseries/",
+    )
+
+    if not any(path.startswith(prefix) for prefix in detail_prefixes):
+        return response
+
+    if getattr(response, "status_code", None) != 200:
+        return response
+
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type.lower():
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return response
+
+    payload, changed = _flixyfy_normalize_provider_contract_detail_v1(payload)
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+
+    return _FlixyfyProviderContractJSONResponse(
+        content=payload,
+        status_code=response.status_code,
+        headers=headers,
+    )
+
