@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import os
 import json
 import re
@@ -1567,3 +1567,82 @@ def _flixyfy_v4_detail(domain: str, slug: str):
 # FLIXYFY canonical provider and exact search middleware V1
 from app.fresh_canonical_provider_search_middleware_v1 import install_fresh_canonical_provider_search_middleware_v1
 install_fresh_canonical_provider_search_middleware_v1(app)
+
+# ---------------------------------------------------------------------
+# FLIXYFY_BAD_MOJIBAKE_SLUG_PUBLIC_HIDE_V1
+# Hide malformed public list rows whose detail route 404s.
+# No DB mutation. No provider mutation. Public API filter only.
+# ---------------------------------------------------------------------
+from fastapi.responses import JSONResponse as _FlixyfyBadSlugJSONResponse
+
+_FLIXYFY_BAD_PUBLIC_SLUGS_V1 = {
+    "jora-shaliker-ghor-à¦-à¦¡-à¦¶-à¦²-à¦-à¦°-à¦¦°-2026",
+    "tomake-paowar-jonno-à¦¤-à¦®-à¦-à¦ª-à¦à¦¯-à¦°-à¦à¦¨-à¦¯-2026",
+}
+
+def _flixyfy_filter_bad_public_slugs_v1(payload):
+    removed = 0
+
+    def clean_list(values):
+        nonlocal removed
+        if not isinstance(values, list):
+            return values
+        out = []
+        for item in values:
+            if isinstance(item, dict) and str(item.get("slug") or "") in _FLIXYFY_BAD_PUBLIC_SLUGS_V1:
+                removed += 1
+                continue
+            out.append(item)
+        return out
+
+    if isinstance(payload, dict):
+        for key in ("items", "results", "movies", "data"):
+            if isinstance(payload.get(key), list):
+                payload[key] = clean_list(payload[key])
+
+        if removed:
+            payload["bad_slug_filtered_count"] = removed
+            payload["bad_slug_filter_version"] = "FLIXYFY_BAD_MOJIBAKE_SLUG_PUBLIC_HIDE_V1"
+
+    elif isinstance(payload, list):
+        payload = clean_list(payload)
+
+    return payload, removed
+
+@app.middleware("http")
+async def _flixyfy_bad_mojibake_slug_public_hide_middleware_v1(request, call_next):
+    response = await call_next(request)
+
+    if request.url.path not in {"/api/v4/movies"}:
+        return response
+
+    if getattr(response, "status_code", None) != 200:
+        return response
+
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type.lower():
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return _FlixyfyBadSlugJSONResponse(
+            content=json.loads(body.decode("utf-8", errors="ignore")),
+            status_code=response.status_code,
+        )
+
+    payload, removed = _flixyfy_filter_bad_public_slugs_v1(payload)
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+
+    return _FlixyfyBadSlugJSONResponse(
+        content=payload,
+        status_code=response.status_code,
+        headers=headers,
+    )
+
