@@ -1646,3 +1646,106 @@ async def _flixyfy_bad_mojibake_slug_public_hide_middleware_v1(request, call_nex
         headers=headers,
     )
 
+# ---------------------------------------------------------------------
+# FLIXYFY_BAD_PUBLIC_SLUG_PATTERN_HIDE_V2
+# Generic public list firewall:
+# public movie slugs must be lowercase ascii a-z, 0-9, hyphen.
+# This hides mojibake/corrupt slug rows from /api/v4/movies.
+# No DB mutation. No provider mutation. Public API filter only.
+# ---------------------------------------------------------------------
+from fastapi.responses import JSONResponse as _FlixyfyBadSlugV2JSONResponse
+
+_FLIXYFY_BAD_PUBLIC_SLUG_PATTERN_HIDE_V2 = "FLIXYFY_BAD_PUBLIC_SLUG_PATTERN_HIDE_V2"
+
+def _flixyfy_is_bad_public_slug_pattern_v2(slug):
+    slug = str(slug or "").strip()
+    if not slug:
+        return True
+
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-")
+    if any(ch not in allowed for ch in slug):
+        return True
+
+    if "--" in slug:
+        return True
+
+    if slug.startswith("-") or slug.endswith("-"):
+        return True
+
+    return False
+
+def _flixyfy_filter_bad_public_slug_pattern_v2(payload):
+    removed = 0
+    removed_slugs = []
+
+    def clean_list(values):
+        nonlocal removed, removed_slugs
+
+        if not isinstance(values, list):
+            return values
+
+        out = []
+        for item in values:
+            if isinstance(item, dict):
+                slug = str(item.get("slug") or "")
+                if _flixyfy_is_bad_public_slug_pattern_v2(slug):
+                    removed += 1
+                    removed_slugs.append(slug)
+                    continue
+            out.append(item)
+
+        return out
+
+    if isinstance(payload, dict):
+        for key in ("items", "results", "movies"):
+            if isinstance(payload.get(key), list):
+                payload[key] = clean_list(payload[key])
+
+        # Some responses may use data as list.
+        if isinstance(payload.get("data"), list):
+            payload["data"] = clean_list(payload["data"])
+
+        if removed:
+            payload["bad_slug_filtered_count"] = removed
+            payload["bad_slug_filter_version"] = _FLIXYFY_BAD_PUBLIC_SLUG_PATTERN_HIDE_V2
+            payload["bad_slug_filtered_sample"] = removed_slugs[:10]
+
+    elif isinstance(payload, list):
+        payload = clean_list(payload)
+
+    return payload, removed
+
+@app.middleware("http")
+async def _flixyfy_bad_public_slug_pattern_hide_middleware_v2(request, call_next):
+    response = await call_next(request)
+
+    if request.url.path != "/api/v4/movies":
+        return response
+
+    if getattr(response, "status_code", None) != 200:
+        return response
+
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type.lower():
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return response
+
+    payload, removed = _flixyfy_filter_bad_public_slug_pattern_v2(payload)
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+
+    return _FlixyfyBadSlugV2JSONResponse(
+        content=payload,
+        status_code=response.status_code,
+        headers=headers,
+    )
+
