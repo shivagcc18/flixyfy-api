@@ -54,7 +54,7 @@ def _canonical_current_youtube() -> tuple[int | None, set[str] | None]:
             cursor.execute(
                 """
                 SELECT COUNT(DISTINCT content_slug)
-                FROM provider_availability_serving_v2
+                FROM provider_availability_serving_v5
                 WHERE lower(coalesce(domain::text, '')) = 'current'
                   AND lower(coalesce(provider_key::text, '')) = 'youtube'
                 """
@@ -64,7 +64,7 @@ def _canonical_current_youtube() -> tuple[int | None, set[str] | None]:
             cursor.execute(
                 """
                 SELECT DISTINCT content_slug::text
-                FROM provider_availability_serving_v2
+                FROM provider_availability_serving_v5
                 WHERE lower(coalesce(domain::text, '')) = 'current'
                   AND lower(coalesce(provider_key::text, '')) = 'youtube'
                 """

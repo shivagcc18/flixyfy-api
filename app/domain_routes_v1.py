@@ -1149,7 +1149,6 @@ DOMAIN_PROVIDER_TABLES = {
         "hollywood_availability_serving_v3",
         "hollywood_availability_serving_v2",
         "hollywood_availability_serving_v1",
-        "provider_availability_serving_v2",
         "provider_availability_serving_v1",
     ),
     "historical": (
@@ -1157,12 +1156,10 @@ DOMAIN_PROVIDER_TABLES = {
         "historical_availability_serving_v3",
         "historical_availability_serving_v2",
         "historical_availability_v2",
-        "provider_availability_serving_v2",
         "provider_availability_serving_v1",
     ),
     "current": (
         "current_availability_serving_v5",
-        "provider_availability_serving_v2",
         "provider_availability_serving_v1",
         "ott_availability_normalized_v2",
         "ott_availability_normalized_v1",
