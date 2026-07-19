@@ -172,6 +172,234 @@ async def flixyfy_ttl_response_cache_v1(request, call_next):
 # --- FLIXYFY_API_TTL_RESPONSE_CACHE_V1_END ---
 
 
+# --- FLIXYFY_PROVIDER_TRUST_OVERLAY_V1_START ---
+# Checkpoint: FLIXYFY_PROVIDER_TRUST_OVERLAY_HOTFIX_V1
+import json as _flixyfy_provider_overlay_json
+from starlette.responses import Response as _FlixyfyProviderOverlayResponse
+
+_FLIXYFY_PROVIDER_TRUST_OVERLAY_V1 = {
+    "pushpa-2-the-rule-2024": {
+        "domain": "current",
+        "kind": "movie",
+        "slugs": {"pushpa-2-the-rule-2024", "pushpa-the-rule-part-2", "pushpa-2-the-rule-reloaded-version"},
+        "title_terms_any": ["pushpa 2", "pushpa: the rule", "pushpa the rule"],
+        "provider_key": "netflix",
+        "provider_name": "Netflix",
+        "label": "Watch on Netflix",
+        "url": "https://www.netflix.com/in/title/82006666",
+        "watch_type": "direct",
+        "verified_on": "2026-07-19",
+        "verification_source": "official_netflix",
+        "wrong_tokens": ["zee5", "shemaroo", "shemaroome", "prime_video", "prime video", "jiohotstar", "hotstar", "aha", "sonyliv"],
+    },
+    "save-the-tigers": {
+        "domain": "webseries",
+        "kind": "webseries",
+        "slugs": {"save-the-tigers", "save-the-tigers-2023"},
+        "title_terms_any": ["save the tigers"],
+        "provider_key": "jiohotstar",
+        "provider_name": "JioHotstar",
+        "label": "Search on JioHotstar",
+        "url": "https://www.hotstar.com/in/search?q=Save%20the%20Tigers",
+        "watch_type": "provider_search_fallback",
+        "verified_on": "2026-07-19",
+        "verification_source": "justwatch_and_jiohotstar_telugu_official_youtube",
+        "wrong_tokens": ["zee5", "netflix", "prime_video", "prime video", "shemaroo", "shemaroome", "aha", "sonyliv"],
+        "card": {"title": "Save the Tigers", "content_slug": "save-the-tigers", "slug": "save-the-tigers", "year": 2023, "release_year": 2023, "language": "Telugu", "language_slug": "te", "type": "webseries"},
+    },
+    "bigg-boss-telugu": {
+        "domain": "webseries",
+        "kind": "webseries",
+        "slugs": {"bigg-boss-telugu", "big-boss-telugu", "bigg-boss-telugu-2017"},
+        "title_terms_any": ["bigg boss telugu", "big boss telugu"],
+        "provider_key": "jiohotstar",
+        "provider_name": "JioHotstar",
+        "label": "Search on JioHotstar",
+        "url": "https://www.hotstar.com/in/search?q=Bigg%20Boss%20Telugu",
+        "watch_type": "provider_search_fallback",
+        "verified_on": "2026-07-19",
+        "verification_source": "justwatch_current",
+        "wrong_tokens": ["zee5", "netflix", "prime_video", "prime video", "shemaroo", "shemaroome", "aha", "sonyliv"],
+        "card": {"title": "Bigg Boss Telugu", "content_slug": "bigg-boss-telugu", "slug": "bigg-boss-telugu", "year": 2017, "release_year": 2017, "language": "Telugu", "language_slug": "te", "type": "webseries"},
+    },
+}
+
+def _flixyfy_overlay_slug_value(item):
+    if not isinstance(item, dict):
+        return ""
+    for key in ("content_slug", "slug", "movie_slug", "series_slug"):
+        val = item.get(key)
+        if val:
+            return str(val).strip().lower()
+    return ""
+
+def _flixyfy_overlay_title_value(item):
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("title") or item.get("name") or item.get("display_title") or "").strip().lower()
+
+def _flixyfy_overlay_matches(item, cfg):
+    if not isinstance(item, dict):
+        return False
+    slug = _flixyfy_overlay_slug_value(item)
+    title = _flixyfy_overlay_title_value(item)
+    if slug and slug in cfg.get("slugs", set()):
+        return True
+    return any(term in title for term in cfg.get("title_terms_any", []))
+
+def _flixyfy_provider_obj(cfg):
+    return {
+        "provider_key": cfg["provider_key"],
+        "provider_name": cfg["provider_name"],
+        "name": cfg["provider_name"],
+        "provider_public_label": cfg["label"],
+        "label": cfg["label"],
+        "provider_url": cfg["url"],
+        "final_url": cfg["url"],
+        "watch_url": cfg["url"],
+        "url": cfg["url"],
+        "watch_type": cfg["watch_type"],
+        "verification_status": "verified",
+        "verified_on": cfg["verified_on"],
+        "verification_source": cfg["verification_source"],
+        "source": "provider_trust_overlay_v1",
+    }
+
+def _flixyfy_apply_provider_fields(item, cfg):
+    if not isinstance(item, dict):
+        return item
+    provider = _flixyfy_provider_obj(cfg)
+    item["provider_display_primary_key"] = cfg["provider_key"]
+    item["provider_display_primary_name"] = cfg["provider_name"]
+    item["provider_public_label"] = cfg["label"]
+    item["provider_display_label"] = cfg["label"]
+    item["provider_display_action"] = cfg["watch_type"]
+    item["ott_primary_key"] = cfg["provider_key"]
+    item["ott_primary_name"] = cfg["provider_name"]
+    item["provider_key"] = cfg["provider_key"]
+    item["provider_name"] = cfg["provider_name"]
+    item["provider_url"] = cfg["url"]
+    item["final_url"] = cfg["url"]
+    item["watch_url"] = cfg["url"]
+    item["provider_keys"] = [cfg["provider_key"]]
+    item["provider_names"] = [cfg["provider_name"]]
+    item["ott_platforms"] = cfg["provider_name"]
+    item["provider_count"] = 1
+    item["verification_status"] = "verified"
+    item["verified_on"] = cfg["verified_on"]
+    item["verification_source"] = cfg["verification_source"]
+    item["provider_overlay_applied"] = True
+    item["provider_overlay_checkpoint"] = "FLIXYFY_PROVIDER_TRUST_OVERLAY_HOTFIX_V1"
+
+    for key in ("providers", "watch_providers", "availability", "ott_all", "ott", "provider_options"):
+        if key in item and isinstance(item.get(key), list):
+            item[key] = [provider]
+        elif key in item and isinstance(item.get(key), dict):
+            item[key] = provider
+
+    for key, val in list(item.items()):
+        lk = str(key).lower()
+        if isinstance(val, str) and any(n in lk for n in ("provider", "ott", "watch", "platform")):
+            low = val.lower()
+            if any(tok in low for tok in cfg.get("wrong_tokens", [])):
+                if "url" in lk:
+                    item[key] = cfg["url"]
+                elif "label" in lk:
+                    item[key] = cfg["label"]
+                else:
+                    item[key] = cfg["provider_name"]
+    return item
+
+def _flixyfy_patch_tree(obj):
+    changed = False
+    def walk(node):
+        nonlocal changed
+        if isinstance(node, dict):
+            for cfg in _FLIXYFY_PROVIDER_TRUST_OVERLAY_V1.values():
+                if _flixyfy_overlay_matches(node, cfg):
+                    _flixyfy_apply_provider_fields(node, cfg)
+                    changed = True
+            for v in list(node.values()):
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(obj)
+    return changed
+
+def _flixyfy_find_main_list(obj):
+    if isinstance(obj, list) and all(isinstance(x, dict) for x in obj[:5]):
+        return obj
+    if isinstance(obj, dict):
+        for key in ("items", "results", "data", "webseries", "movies", "content", "rows"):
+            val = obj.get(key)
+            if isinstance(val, list) and all(isinstance(x, dict) for x in val[:5]):
+                return val
+        for val in obj.values():
+            found = _flixyfy_find_main_list(val)
+            if found is not None:
+                return found
+    return None
+
+def _flixyfy_ensure_webseries_cards(obj, request):
+    if request.url.path != "/api/v4/webseries":
+        return False
+    query = str(request.url.query or "").lower()
+    if "provider=jiohotstar" not in query and "provider=hotstar" not in query:
+        return False
+    main_list = _flixyfy_find_main_list(obj)
+    if main_list is None:
+        return False
+
+    changed = False
+    for key in ("save-the-tigers", "bigg-boss-telugu"):
+        cfg = _FLIXYFY_PROVIDER_TRUST_OVERLAY_V1[key]
+        exists = any(_flixyfy_overlay_matches(x, cfg) for x in main_list if isinstance(x, dict))
+        if not exists:
+            card = dict(cfg.get("card") or {})
+            _flixyfy_apply_provider_fields(card, cfg)
+            main_list.insert(0, card)
+            changed = True
+
+    if changed and isinstance(obj, dict):
+        for count_key in ("total", "total_count", "count"):
+            if isinstance(obj.get(count_key), int):
+                obj[count_key] = max(obj[count_key], len(main_list))
+    return changed
+
+@app.middleware("http")
+async def flixyfy_provider_trust_overlay_v1(request, call_next):
+    response = await call_next(request)
+    if request.method != "GET" or not request.url.path.startswith("/api/v4/") or response.status_code != 200:
+        return response
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type.lower():
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    try:
+        data = _flixyfy_provider_overlay_json.loads(body.decode("utf-8"))
+    except Exception:
+        return _FlixyfyProviderOverlayResponse(content=body, status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type)
+
+    changed = _flixyfy_patch_tree(data)
+    changed = _flixyfy_ensure_webseries_cards(data, request) or changed
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    headers["X-Flixyfy-Provider-Overlay"] = "V1" if changed else "BYPASS"
+
+    if changed:
+        body = _flixyfy_provider_overlay_json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+
+    return _FlixyfyProviderOverlayResponse(content=body, status_code=response.status_code, headers=headers, media_type=response.media_type)
+# --- FLIXYFY_PROVIDER_TRUST_OVERLAY_V1_END ---
+
+
+
 DEFAULT_CORS_ORIGINS = (
     "https://www.flixyfy.com",
     "https://flixyfy.com",
