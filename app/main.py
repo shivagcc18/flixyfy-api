@@ -399,6 +399,65 @@ async def flixyfy_provider_trust_overlay_v1(request, call_next):
 # --- FLIXYFY_PROVIDER_TRUST_OVERLAY_V1_END ---
 
 
+# --- FLIXYFY_RRR_PROVIDER_TRUST_OVERLAY_V2_START ---
+import json as _rrr_json
+from starlette.responses import Response as _RRRResponse
+_RRR_PROVIDERS_V2=[
+ {"provider_key":"netflix","provider_name":"Netflix","name":"Netflix","provider_public_label":"Watch on Netflix","label":"Watch on Netflix","provider_url":"https://www.netflix.com/in/title/81476453","final_url":"https://www.netflix.com/in/title/81476453","watch_url":"https://www.netflix.com/in/title/81476453","url":"https://www.netflix.com/in/title/81476453","watch_type":"direct","verification_status":"verified","verified_on":"2026-07-19","verification_source":"official_netflix"},
+ {"provider_key":"zee5","provider_name":"ZEE5","name":"ZEE5","provider_public_label":"Watch on ZEE5","label":"Watch on ZEE5","provider_url":"https://www.zee5.com/movies/details/rrr/0-0-1z5145092","final_url":"https://www.zee5.com/movies/details/rrr/0-0-1z5145092","watch_url":"https://www.zee5.com/movies/details/rrr/0-0-1z5145092","url":"https://www.zee5.com/movies/details/rrr/0-0-1z5145092","watch_type":"direct","verification_status":"verified","verified_on":"2026-07-19","verification_source":"official_zee5"}
+]
+_RRR_BAD_TOKENS=["sunnxt","sun nxt","shemaroo","shemaroome","aha","sonyliv","prime_video","prime video"]
+def _rrr_match(x):
+    if not isinstance(x,dict): return False
+    slug=str(x.get("content_slug") or x.get("slug") or x.get("movie_slug") or "").lower()
+    title=str(x.get("title") or x.get("name") or "").lower()
+    return slug in {"rrr-2022","roudram-ranam-rudhiram-2022"} or title=="rrr" or "roudram ranam rudhiram" in title
+def _rrr_apply(x):
+    p=_RRR_PROVIDERS_V2[0]
+    x["provider_display_primary_key"]="netflix"; x["provider_display_primary_name"]="Netflix"
+    x["provider_public_label"]="Watch on Netflix"; x["provider_display_label"]="Watch on Netflix"; x["provider_display_action"]="direct"
+    x["ott_primary_key"]="netflix"; x["ott_primary_name"]="Netflix"; x["provider_key"]="netflix"; x["provider_name"]="Netflix"
+    x["provider_url"]=p["url"]; x["final_url"]=p["url"]; x["watch_url"]=p["url"]
+    x["provider_keys"]=["netflix","zee5"]; x["provider_names"]=["Netflix","ZEE5"]; x["ott_platforms"]="Netflix, ZEE5"; x["provider_count"]=2
+    for key in ("providers","watch_providers","availability","ott_all","ott","provider_options"): x[key]=_RRR_PROVIDERS_V2
+    x["verification_status"]="verified"; x["verified_on"]="2026-07-19"; x["verification_source"]="official_netflix_official_zee5"
+    x["provider_overlay_applied"]=True; x["provider_overlay_checkpoint"]="FLIXYFY_RRR_PROVIDER_TRUST_OVERLAY_V2"
+    for k,v in list(x.items()):
+        if isinstance(v,str) and any(tok in v.lower() for tok in _RRR_BAD_TOKENS):
+            lk=str(k).lower()
+            if "url" in lk: x[k]=p["url"]
+            elif "label" in lk: x[k]="Watch on Netflix"
+            elif any(n in lk for n in ("provider","ott","platform","watch")): x[k]="Netflix, ZEE5"
+    return x
+def _rrr_walk(obj):
+    changed=False
+    def walk(x):
+        nonlocal changed
+        if isinstance(x,dict):
+            if _rrr_match(x): _rrr_apply(x); changed=True
+            for v in list(x.values()): walk(v)
+        elif isinstance(x,list):
+            for y in x[:200]: walk(y)
+    walk(obj); return changed
+@app.middleware("http")
+async def flixyfy_rrr_provider_trust_overlay_v2(request, call_next):
+    response=await call_next(request)
+    if request.method!="GET" or not request.url.path.startswith("/api/v4/") or response.status_code!=200:
+        return response
+    if "application/json" not in response.headers.get("content-type","").lower():
+        return response
+    body=b""
+    async for chunk in response.body_iterator: body += chunk
+    try: data=_rrr_json.loads(body.decode("utf-8"))
+    except Exception: return _RRRResponse(content=body,status_code=response.status_code,headers=dict(response.headers),media_type=response.media_type)
+    changed=_rrr_walk(data)
+    headers=dict(response.headers); headers.pop("content-length",None); headers["X-Flixyfy-RRR-Provider-Overlay"]="V2" if changed else "BYPASS"
+    if changed: body=_rrr_json.dumps(data,ensure_ascii=False,default=str).encode("utf-8")
+    return _RRRResponse(content=body,status_code=response.status_code,headers=headers,media_type=response.media_type)
+# --- FLIXYFY_RRR_PROVIDER_TRUST_OVERLAY_V2_END ---
+
+
+
 
 DEFAULT_CORS_ORIGINS = (
     "https://www.flixyfy.com",
