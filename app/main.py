@@ -75,6 +75,103 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="FLIXYFY Fresh Lean API", version="1.0.0", lifespan=lifespan)
 
+# --- FLIXYFY_API_TTL_RESPONSE_CACHE_V1_START ---
+# Local code checkpoint: FLIXYFY_API_TTL_CACHE_AND_ROUTE_PROFILER_V1
+# GET-only in-memory TTL cache for public v4 API reads.
+# Safe: does not cache non-GET, non-200, or non-/api/v4 responses.
+import asyncio as _flixyfy_cache_asyncio
+import time as _flixyfy_cache_time
+import hashlib as _flixyfy_cache_hashlib
+from starlette.responses import Response as _FlixyfyCacheResponse
+
+_FLIXYFY_TTL_CACHE = {}
+_FLIXYFY_TTL_CACHE_LOCK = _flixyfy_cache_asyncio.Lock()
+_FLIXYFY_TTL_CACHE_MAX_ITEMS = int(os.getenv("FLIXYFY_TTL_CACHE_MAX_ITEMS", "512"))
+_FLIXYFY_TTL_CACHE_DEFAULT_SECONDS = int(os.getenv("FLIXYFY_TTL_CACHE_DEFAULT_SECONDS", "180"))
+
+def _flixyfy_cache_ttl_for_path(path: str) -> int:
+    if path.startswith("/api/v4/search"):
+        return int(os.getenv("FLIXYFY_TTL_CACHE_SEARCH_SECONDS", "90"))
+    if path.startswith("/api/v4/movie/"):
+        return int(os.getenv("FLIXYFY_TTL_CACHE_DETAIL_SECONDS", "600"))
+    if path.startswith("/api/v4/movies") or path.startswith("/api/v4/webseries") or path.startswith("/api/v4/historical") or path.startswith("/api/v4/hollywood"):
+        return int(os.getenv("FLIXYFY_TTL_CACHE_LIST_SECONDS", "240"))
+    return _FLIXYFY_TTL_CACHE_DEFAULT_SECONDS
+
+def _flixyfy_cache_allowed(path: str) -> bool:
+    return (
+        path.startswith("/api/v4/search")
+        or path.startswith("/api/v4/movie/")
+        or path.startswith("/api/v4/movies")
+        or path.startswith("/api/v4/webseries")
+        or path.startswith("/api/v4/historical")
+        or path.startswith("/api/v4/hollywood")
+    )
+
+def _flixyfy_cache_key(request) -> str:
+    raw = f"{request.method}:{request.url.path}?{request.url.query}"
+    return _flixyfy_cache_hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+@app.middleware("http")
+async def flixyfy_ttl_response_cache_v1(request, call_next):
+    if request.method != "GET" or not _flixyfy_cache_allowed(request.url.path):
+        return await call_next(request)
+
+    key = _flixyfy_cache_key(request)
+    now = _flixyfy_cache_time.time()
+
+    async with _FLIXYFY_TTL_CACHE_LOCK:
+        item = _FLIXYFY_TTL_CACHE.get(key)
+        if item and item["expires_at"] > now:
+            headers = dict(item.get("headers") or {})
+            headers["X-Flixyfy-Cache"] = "HIT"
+            headers["X-Flixyfy-Cache-TTL"] = str(int(item["expires_at"] - now))
+            return _FlixyfyCacheResponse(
+                content=item["body"],
+                status_code=item["status_code"],
+                headers=headers,
+                media_type=item.get("media_type"),
+            )
+
+    response = await call_next(request)
+
+    if response.status_code != 200:
+        response.headers["X-Flixyfy-Cache"] = "BYPASS"
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    ttl = _flixyfy_cache_ttl_for_path(request.url.path)
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    headers["X-Flixyfy-Cache"] = "MISS"
+    headers["X-Flixyfy-Cache-TTL"] = str(ttl)
+
+    if body and len(body) <= int(os.getenv("FLIXYFY_TTL_CACHE_MAX_BODY_BYTES", "1048576")):
+        async with _FLIXYFY_TTL_CACHE_LOCK:
+            if len(_FLIXYFY_TTL_CACHE) >= _FLIXYFY_TTL_CACHE_MAX_ITEMS:
+                oldest_key = min(_FLIXYFY_TTL_CACHE, key=lambda k: _FLIXYFY_TTL_CACHE[k]["created_at"])
+                _FLIXYFY_TTL_CACHE.pop(oldest_key, None)
+            _FLIXYFY_TTL_CACHE[key] = {
+                "created_at": now,
+                "expires_at": now + ttl,
+                "body": body,
+                "status_code": response.status_code,
+                "headers": headers,
+                "media_type": response.media_type,
+            }
+
+    return _FlixyfyCacheResponse(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        media_type=response.media_type,
+    )
+# --- FLIXYFY_API_TTL_RESPONSE_CACHE_V1_END ---
+
+
 DEFAULT_CORS_ORIGINS = (
     "https://www.flixyfy.com",
     "https://flixyfy.com",
