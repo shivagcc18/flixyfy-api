@@ -1,7 +1,6 @@
-﻿fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-pydantic>=2.8,<3
-python-dotenv>=1,<2
-pytest>=8,<9
-httpx2>=0.1,<1
-
+fastapi
+uvicorn[standard]
+psycopg2-binary
+psycopg[binary]>=3.2,<4
+psycopg-pool>=3.2,<4
+python-dotenv
