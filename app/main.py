@@ -151,8 +151,8 @@ def _provider_taxonomy_sql(alias: str = "p") -> str:
     provider_name = f"LOWER(COALESCE({alias}.provider_name, ''))"
     return (
         "CASE "
-        f"WHEN {provider_key} LIKE '%_channel' OR {provider_name} LIKE '% channel' THEN 'ADD_ON_CHANNEL' "
-        f"WHEN {category} IN ('rent', 'buy', 'rental', 'purchase') OR {provider_key} IN ('amazon_video_store', 'apple_tv_store', 'bookmyshow', 'google_play_movies') OR {provider_name} LIKE '%store%' OR {provider_name} LIKE '%bookmyshow%' THEN 'RENTAL_OR_PURCHASE' "
+        f"WHEN {provider_key} LIKE '%%_channel' OR {provider_name} LIKE '%% channel' THEN 'ADD_ON_CHANNEL' "
+        f"WHEN {category} IN ('rent', 'buy', 'rental', 'purchase') OR {provider_key} IN ('amazon_video_store', 'apple_tv_store', 'bookmyshow', 'google_play_movies') OR {provider_name} LIKE '%%store%%' OR {provider_name} LIKE '%%bookmyshow%%' THEN 'RENTAL_OR_PURCHASE' "
         f"WHEN {provider_key} IN ('justwatch_tv', 'tata_play') THEN 'AGGREGATOR' "
         f"WHEN {category} IN ('subscription', 'flatrate', 'paid_ott', 'paid') THEN 'SUBSCRIPTION_OTT' "
         f"WHEN {category} IN ('free', 'free_with_ads', 'ads') THEN 'FREE_STREAMING' "
