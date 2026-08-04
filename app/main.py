@@ -12,6 +12,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from typing import Any, Literal
+from urllib.parse import quote_plus
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -121,6 +122,49 @@ def _provider_key(value: str | None) -> str:
     return str(value or "").strip().lower().replace("-", "_")
 
 
+LANGUAGE_ALIASES: dict[str, tuple[str, ...]] = {
+    "as": ("as", "assamese"), "bn": ("bn", "bengali"), "bho": ("bho", "bhojpuri"),
+    "gu": ("gu", "gujarati"), "hi": ("hi", "hindi"), "kn": ("kn", "kannada"),
+    "ml": ("ml", "malayalam"), "mr": ("mr", "marathi"), "or": ("or", "odia", "oriya"),
+    "pa": ("pa", "punjabi"), "ta": ("ta", "tamil"), "te": ("te", "telugu"),
+    "ur": ("ur", "urdu"),
+}
+
+
+def _language_match_values(value: str | None) -> tuple[str, ...]:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not raw:
+        return ()
+    for values in LANGUAGE_ALIASES.values():
+        if raw in values:
+            return values
+    return (raw,)
+
+
+_RENTAL_PROVIDER_KEYS = {"amazon_video_store", "apple_tv_store", "bookmyshow", "google_play_movies"}
+_AGGREGATOR_PROVIDER_KEYS = {"justwatch_tv", "tata_play"}
+
+
+def _provider_taxonomy_sql(alias: str = "p") -> str:
+    category = f"LOWER(COALESCE({alias}.provider_category, {alias}.availability_type, ''))"
+    provider_key = f"LOWER(COALESCE({alias}.provider_key, ''))"
+    provider_name = f"LOWER(COALESCE({alias}.provider_name, ''))"
+    return (
+        "CASE "
+        f"WHEN {provider_key} LIKE '%_channel' OR {provider_name} LIKE '% channel' THEN 'ADD_ON_CHANNEL' "
+        f"WHEN {category} IN ('rent', 'buy', 'rental', 'purchase') OR {provider_key} IN ('amazon_video_store', 'apple_tv_store', 'bookmyshow', 'google_play_movies') OR {provider_name} LIKE '%store%' OR {provider_name} LIKE '%bookmyshow%' THEN 'RENTAL_OR_PURCHASE' "
+        f"WHEN {provider_key} IN ('justwatch_tv', 'tata_play') THEN 'AGGREGATOR' "
+        f"WHEN {category} IN ('subscription', 'flatrate', 'paid_ott', 'paid') THEN 'SUBSCRIPTION_OTT' "
+        f"WHEN {category} IN ('free', 'free_with_ads', 'ads') THEN 'FREE_STREAMING' "
+        "ELSE 'UNKNOWN_OR_UNAPPROVED' END"
+    )
+
+
+def _approved_provider_sql(alias: str = "p") -> str:
+    taxonomy = _provider_taxonomy_sql(alias)
+    return f"LOWER(COALESCE({alias}.country, '')) IN ('in', 'india', 'ind') AND {taxonomy} IN ('SUBSCRIPTION_OTT', 'FREE_STREAMING')"
+
+
 
 def _person_role(value: Any) -> str:
     role = str(value or "").strip().lower().replace("-", "_")
@@ -170,12 +214,18 @@ MOVIE_SELECT = f"""
         EXISTS (
             SELECT 1 FROM {_qi('provider_ott_availability_v3')} p
             WHERE p.canonical_movie_id = i.canonical_movie_id
+              AND {_approved_provider_sql('p')}
         ) AS has_ott,
         EXISTS (
             SELECT 1 FROM {_qi('movie_youtube_availability_v3')} y
             WHERE y.canonical_movie_id = i.canonical_movie_id
         ) AS has_youtube,
-        COALESCE(i.ott_provider_count, 0) AS provider_count,
+        (
+            SELECT COUNT(DISTINCT p.provider_key)::bigint
+            FROM {_qi('provider_ott_availability_v3')} p
+            WHERE p.canonical_movie_id = i.canonical_movie_id
+              AND {_approved_provider_sql('p')}
+        ) AS approved_provider_count,
         COALESCE(i.youtube_video_count, 0) AS youtube_count
     FROM {_qi('movie_identity_serving_v3')} i
 """
@@ -199,12 +249,12 @@ def _movie_predicates(
         predicates.append(
             f"EXISTS (SELECT 1 FROM {_qi('movie_language_serving_v3')} l "
             f"WHERE l.canonical_movie_id = {alias}.canonical_movie_id "
-            "AND (LOWER(COALESCE(l.language_code, '')) = %s "
-            "OR LOWER(COALESCE(l.language_name, '')) = %s "
-            "OR LOWER(COALESCE(l.normalized_name, '')) = %s))"
+            "AND (LOWER(COALESCE(l.language_code, '')) = ANY(%s) "
+            "OR LOWER(COALESCE(l.language_name, '')) = ANY(%s) "
+            "OR LOWER(COALESCE(l.normalized_name, '')) = ANY(%s)))"
         )
-        language_value = str(language).strip().lower()
-        params.extend([language_value] * 3)
+        language_values = list(_language_match_values(language))
+        params.extend([language_values] * 3)
     if genre:
         predicates.append(
             f"EXISTS (SELECT 1 FROM {_qi('movie_genre_serving_v3')} g "
@@ -228,6 +278,7 @@ def _movie_predicates(
             predicates.append(
                 f"EXISTS (SELECT 1 FROM {_qi('provider_ott_availability_v3')} p "
                 f"WHERE p.canonical_movie_id = {alias}.canonical_movie_id "
+                f"AND {_approved_provider_sql('p')} "
                 "AND LOWER(COALESCE(p.provider_key, '')) = %s)"
             )
             params.append(provider)
@@ -265,7 +316,7 @@ def _normalise_movie(row: dict[str, Any]) -> dict[str, Any]:
     item.setdefault("type", "movie")
     item.setdefault("content_type", "movie")
     item.setdefault("entity_type", "movie")
-    item.setdefault("provider_count", int(item.get("ott_provider_count") or 0))
+    item.setdefault("provider_count", int(item.get("approved_provider_count") or 0))
     item.setdefault("availability_count", int(item.get("provider_count") or 0))
     item.setdefault("youtube_count", int(item.get("youtube_video_count") or 0))
     item.setdefault("has_ott", bool(item.get("has_ott")))
@@ -470,10 +521,51 @@ def _parse_person_id(value: str | None) -> int | None:
 
 def _provider_rows(canonical_movie_id: str) -> list[dict[str, Any]]:
     return _rows(
-        f"SELECT * FROM {_qi('provider_ott_availability_v3')} "
-        "WHERE canonical_movie_id = %s ORDER BY provider_name ASC NULLS LAST, provider_key ASC",
+        f"SELECT * FROM {_qi('provider_ott_availability_v3')} p "
+        f"WHERE p.canonical_movie_id = %s AND {_approved_provider_sql('p')} "
+        "ORDER BY provider_name ASC NULLS LAST, provider_key ASC",
         (canonical_movie_id,),
     )
+
+
+def _provider_taxonomy_value(row: dict[str, Any]) -> str:
+    key = _provider_key(str(row.get("provider_key") or ""))
+    name = str(row.get("provider_name") or "").strip().lower()
+    category = str(row.get("provider_category") or row.get("availability_type") or "").strip().lower()
+    if key.endswith("_channel") or name.endswith(" channel"):
+        return "ADD_ON_CHANNEL"
+    if category in {"rent", "buy", "rental", "purchase"} or key in _RENTAL_PROVIDER_KEYS or "store" in name or "bookmyshow" in name:
+        return "RENTAL_OR_PURCHASE"
+    if key in _AGGREGATOR_PROVIDER_KEYS:
+        return "AGGREGATOR"
+    if category in {"subscription", "flatrate", "paid_ott", "paid"}:
+        return "SUBSCRIPTION_OTT"
+    if category in {"free", "free_with_ads", "ads"}:
+        return "FREE_STREAMING"
+    return "UNKNOWN_OR_UNAPPROVED"
+
+
+def _normalise_provider(row: dict[str, Any], title: str) -> dict[str, Any]:
+    item = dict(row)
+    provider_name = str(item.get("provider_name") or item.get("provider_key") or "Provider")
+    template = str(item.get("search_template") or "").strip()
+    home_url = str(item.get("home_url") or "").strip()
+    if template:
+        button_url = template.replace("{query}", quote_plus(title)).replace("{q}", quote_plus(title))
+        navigation_kind = "SEARCH"
+    else:
+        button_url = home_url
+        navigation_kind = "HOME" if home_url else "UNAVAILABLE"
+    item.update({
+        "provider_display_name": provider_name,
+        "button_url": button_url or None,
+        "button_label": f"Watch on {provider_name}",
+        "navigation_kind": navigation_kind,
+        "access_model": item.get("provider_category") or item.get("availability_type") or "free",
+        "provider_type": _provider_taxonomy_value(item),
+        "media_kind": "ott",
+    })
+    return item
 
 
 def _youtube_rows(canonical_movie_id: str) -> list[dict[str, Any]]:
@@ -509,8 +601,26 @@ def _detail_payload(domain: str, slug: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Not Found")
     item = _normalise_movie(row)
     canonical_movie_id = str(item.get("canonical_movie_id") or "")
-    providers = _provider_rows(canonical_movie_id)
-    youtube = _youtube_rows(canonical_movie_id)
+    providers = [_normalise_provider(row, str(item.get("title") or "")) for row in _provider_rows(canonical_movie_id)]
+    youtube = []
+    for row in _youtube_rows(canonical_movie_id):
+        youtube_item = dict(row)
+        video_id = str(youtube_item.get("video_id") or "").strip()
+        button_url = str(
+            youtube_item.get("video_url")
+            or youtube_item.get("youtube_url")
+            or youtube_item.get("watch_url")
+            or (f"https://www.youtube.com/watch?v={quote_plus(video_id)}" if video_id else "")
+        ).strip()
+        youtube_item.update({
+            "media_kind": "youtube",
+            "availability_type": "free",
+            "access_model": "free",
+            "button_url": button_url or None,
+            "button_label": "Watch on YouTube",
+            "navigation_kind": "DIRECT" if button_url else "UNAVAILABLE",
+        })
+        youtube.append(youtube_item)
     item["availability"] = providers
     item["ott_all"] = providers
     item["watch_providers"] = providers
@@ -721,10 +831,12 @@ def providers(domain: Domain = "current") -> dict[str, Any]:
         "domain": domain,
         "items": _rows(
             f"SELECT LOWER(p.provider_key) AS provider_key, MIN(p.provider_name) AS provider_name, "
+            f"MIN({_provider_taxonomy_sql('p')}) AS provider_type, "
             "COUNT(*)::bigint AS row_count, COUNT(DISTINCT p.canonical_movie_id)::bigint AS content_count "
             f"FROM {_qi('provider_ott_availability_v3')} p JOIN {_qi('movie_identity_serving_v3')} i "
             "ON i.canonical_movie_id = p.canonical_movie_id "
             f"WHERE LOWER(COALESCE(i.domain, '')) IN ({marks}) "
+            f"AND {_approved_provider_sql('p')} "
             "GROUP BY LOWER(p.provider_key) ORDER BY content_count DESC, provider_key",
             tuple(x.lower() for x in domains),
         ),
@@ -738,8 +850,13 @@ def _v4_content(domain: str, page: int, limit: int, provider: str | None, langua
 
 
 def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provider: str | None, language: str | None, year: int | None) -> dict[str, Any]:
-    items = _search_rows(q or "", _normalise_domain(domain) if domain else "all", _limit(limit), provider, language, year) if q else []
-    return _items_payload(items[_offset(page, _limit(limit)) : _offset(page, _limit(limit)) + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
+    current_domain = _normalise_domain(domain) if domain else "current"
+    if not q:
+        total, items = _movie_rows(current_domain, page, limit, provider, language, year)
+        return _items_payload(items, total, page, _limit(limit), current_domain)
+    items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year)
+    start = _offset(page, _limit(limit))
+    return _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
 
 
 @app.get("/api/v4/health")
