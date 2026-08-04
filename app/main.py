@@ -121,6 +121,27 @@ def _provider_key(value: str | None) -> str:
     return str(value or "").strip().lower().replace("-", "_")
 
 
+
+def _person_role(value: Any) -> str:
+    role = str(value or "").strip().lower().replace("-", "_")
+    return "actor" if role in {"cast", "actor", "actress"} else role
+
+
+def _person_roles(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    return sorted({role for role in (_person_role(value) for value in values) if role})
+
+
+def _person_query_forms(value: str) -> tuple[str, str]:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    normalized = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    return normalized, compact
+
+
 def _limit(value: int, default: int = 24, cap: int = 100) -> int:
     try:
         value = int(value)
@@ -165,6 +186,7 @@ def _movie_predicates(
     provider: str | None = None,
     language: str | None = None,
     year: int | None = None,
+    genre: str | None = None,
     alias: str = "i",
 ) -> tuple[list[str], list[Any]]:
     predicates: list[str] = []
@@ -183,6 +205,15 @@ def _movie_predicates(
         )
         language_value = str(language).strip().lower()
         params.extend([language_value] * 3)
+    if genre:
+        predicates.append(
+            f"EXISTS (SELECT 1 FROM {_qi('movie_genre_serving_v3')} g "
+            f"WHERE g.canonical_movie_id = {alias}.canonical_movie_id "
+            "AND (LOWER(COALESCE(g.genre_name, '')) = %s "
+            "OR LOWER(COALESCE(g.normalized_name, '')) = %s))"
+        )
+        genre_value = str(genre).strip().lower()
+        params.extend([genre_value] * 2)
     if year:
         predicates.append(f"{alias}.release_year = %s")
         params.append(int(year))
@@ -277,6 +308,164 @@ def _search_rows(
     output = [_normalise_movie(row) for row in output]
     output.sort(key=lambda row: (float(row.get("rating") or 0), str(row.get("title") or "").lower()), reverse=True)
     return output[: _limit(limit, cap=100)]
+
+
+
+def _person_entity_rows(q: str, limit: int) -> list[dict[str, Any]]:
+    normalized, compact = _person_query_forms(q)
+    if not normalized and not compact:
+        return []
+    relation = _qi("movie_people_serving_v3")
+    bounded_limit = _limit(limit, default=8, cap=20)
+    exact_text = normalized
+    exact_compact = compact
+    prefix_text = f"{normalized}%" if normalized else "%"
+    prefix_compact = f"{compact}%" if compact else "%"
+
+    def fetch(where_sql: str, where_params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        sql = f"""
+            WITH person_candidates AS (
+                SELECT
+                    p.person_id,
+                    MIN(NULLIF(BTRIM(p.name), '')) AS display_name,
+                    ARRAY_AGG(DISTINCT NULLIF(BTRIM(p.name), '') ORDER BY NULLIF(BTRIM(p.name), ''))
+                        FILTER (WHERE NULLIF(BTRIM(p.name), '') IS NOT NULL) AS aliases,
+                    ARRAY_AGG(DISTINCT LOWER(NULLIF(BTRIM(p.role), '')) ORDER BY LOWER(NULLIF(BTRIM(p.role), '')))
+                        FILTER (WHERE NULLIF(BTRIM(p.role), '') IS NOT NULL) AS roles,
+                    COUNT(DISTINCT p.canonical_movie_id)::bigint AS movie_count,
+                    MIN(CASE
+                        WHEN p.normalized_name = %s OR p.compact_name = %s THEN 0
+                        WHEN p.normalized_name LIKE %s OR p.compact_name LIKE %s THEN 1
+                        ELSE 2
+                    END) AS match_rank
+                FROM {relation} p
+                WHERE {where_sql}
+                GROUP BY p.person_id
+            )
+            SELECT person_id, display_name, aliases, roles, movie_count, match_rank,
+                   COUNT(*) OVER()::bigint AS total_matches
+            FROM person_candidates
+            ORDER BY match_rank ASC, movie_count DESC, display_name ASC NULLS LAST, person_id ASC
+            LIMIT %s
+        """
+        return _rows(
+            sql,
+            (exact_text, exact_compact, prefix_text, prefix_compact, *where_params, bounded_limit),
+        )
+
+    prefix_rows = fetch(
+        "(p.normalized_name = %s OR p.compact_name = %s "
+        "OR p.normalized_name LIKE %s OR p.compact_name LIKE %s)",
+        (exact_text, exact_compact, prefix_text, prefix_compact),
+    )
+    if prefix_rows:
+        return prefix_rows
+
+    fuzzy = f"%{normalized}%" if normalized else "%"
+    fuzzy_compact = f"%{compact}%" if compact else "%"
+    return fetch(
+        "(LOWER(COALESCE(p.name, '')) LIKE %s "
+        "OR LOWER(COALESCE(p.normalized_name, '')) LIKE %s "
+        "OR LOWER(COALESCE(p.compact_name, '')) LIKE %s)",
+        (fuzzy, fuzzy, fuzzy_compact),
+    )
+
+
+def _person_entity_payload(row: dict[str, Any], query: str) -> dict[str, Any]:
+    aliases = sorted({str(value).strip() for value in (row.get("aliases") or []) if str(value).strip()})
+    normalized, compact = _person_query_forms(query)
+    matched_alias = next(
+        (
+            alias for alias in aliases
+            if _person_query_forms(alias)[0] == normalized
+            or _person_query_forms(alias)[1] == compact
+            or _person_query_forms(alias)[0].startswith(normalized)
+            or _person_query_forms(alias)[1].startswith(compact)
+        ),
+        None,
+    )
+    display_name = str(row.get("display_name") or matched_alias or "").strip()
+    roles = _person_roles(row.get("roles"))
+    movie_count = int(row.get("movie_count") or 0)
+    role_label = ", ".join(role.replace("_", " ") for role in roles[:3]) or "credited person"
+    payload: dict[str, Any] = {
+        "entity_type": "person",
+        "person_id": str(row.get("person_id")),
+        "display_name": display_name,
+        "aliases": aliases[:12],
+        "disambiguation": f"{role_label}; {movie_count} serving movies",
+        "roles": roles,
+    }
+    if matched_alias and matched_alias.casefold() != display_name.casefold():
+        payload["matched_alias"] = matched_alias
+    return payload
+
+
+def _search_intelligence_rows(
+    q: str | None,
+    domain: str,
+    limit: int,
+    provider: str | None,
+    person_id: int | None,
+    language: str | None,
+    genre: str | None,
+    year: int | None,
+) -> list[dict[str, Any]]:
+    domains = ("current", "historical", "hollywood", "webseries") if domain == "all" else (_normalise_domain(domain),)
+    output: list[dict[str, Any]] = []
+    for current_domain in domains:
+        predicates, params = _movie_predicates(current_domain, provider, language, year, genre)
+        person_roles_select = ""
+        select_params: list[Any] = []
+        if person_id is not None:
+            predicates.append(
+                f"EXISTS (SELECT 1 FROM {_qi('movie_people_serving_v3')} mp "
+                f"WHERE mp.canonical_movie_id = i.canonical_movie_id AND mp.person_id = %s)"
+            )
+            params.append(person_id)
+            person_roles_select = f""",
+                ARRAY(
+                    SELECT DISTINCT mp_roles.role
+                    FROM {_qi('movie_people_serving_v3')} mp_roles
+                    WHERE mp_roles.canonical_movie_id = i.canonical_movie_id
+                      AND mp_roles.person_id = %s
+                      AND mp_roles.role IS NOT NULL
+                ) AS matched_person_roles"""
+            select_params.append(person_id)
+        elif q and q.strip():
+            like = f"%{q.strip()}%"
+            predicates.append(
+                "(LOWER(COALESCE(s.search_text, '')) LIKE LOWER(%s) "
+                "OR LOWER(COALESCE(s.title, '')) LIKE LOWER(%s) "
+                "OR LOWER(COALESCE(s.aliases, '')) LIKE LOWER(%s) "
+                "OR LOWER(COALESCE(s.people, '')) LIKE LOWER(%s))"
+            )
+            params.extend([like] * 4)
+        clause = " WHERE " + " AND ".join(predicates)
+        output.extend(
+            _rows(
+                "SELECT s.*, i.poster, i.backdrop, i.original_language, i.release_year, "
+                "i.domain, i.tmdb_id, i.imdb_id, i.rating, i.canonical_movie_id"
+                + person_roles_select
+                + f" FROM {_qi('movie_search_document_v3')} s "
+                f"JOIN {_qi('movie_identity_serving_v3')} i ON i.canonical_movie_id = s.canonical_movie_id"
+                + clause
+                + " ORDER BY i.rating DESC NULLS LAST, s.title ASC NULLS LAST LIMIT %s",
+                tuple(select_params + params + [_limit(limit, cap=100)]),
+            )
+        )
+    output = [_normalise_movie(row) for row in output]
+    output.sort(key=lambda row: (float(row.get("rating") or 0), str(row.get("title") or "").lower()), reverse=True)
+    return output[: _limit(limit, cap=100)]
+
+
+def _parse_person_id(value: str | None) -> int | None:
+    if value is None or not str(value).strip():
+        return None
+    raw = str(value).strip()
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise HTTPException(status_code=400, detail="person_id must be a canonical person identifier")
+    return int(raw)
 
 
 def _provider_rows(canonical_movie_id: str) -> list[dict[str, Any]]:
@@ -457,6 +646,52 @@ def content(
 def detail(domain: Domain, slug: str) -> dict[str, Any]:
     item = _detail_payload(domain, slug)
     return {"domain": domain, "item": item, "availability": item.get("availability", [])}
+
+
+@app.get("/api/v1/search/entities")
+def search_entities(
+    q: str = Query(..., min_length=1, max_length=120),
+    entity_type: Literal["person"] = "person",
+    limit: int = Query(8, ge=1, le=20),
+) -> dict[str, Any]:
+    rows = _person_entity_rows(q, limit)
+    items = [_person_entity_payload(row, q) for row in rows]
+    total = int((rows[0] or {}).get("total_matches") or 0) if rows else 0
+    return {"query": q, "entity_type": entity_type, "total": total, "limit": _limit(limit, default=8, cap=20), "items": items, "entities": items}
+
+
+@app.get("/api/v1/search/intelligence")
+def search_intelligence(
+    q: str | None = Query(None, max_length=120),
+    person_id: str | None = Query(None, max_length=32),
+    provider: str | None = Query(None, max_length=80),
+    domain: SearchDomain = "all",
+    language: str | None = Query(None, max_length=40),
+    genre: str | None = Query(None, max_length=80),
+    year: int | None = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(24, ge=1, le=100),
+) -> dict[str, Any]:
+    canonical_person_id = _parse_person_id(person_id)
+    size = _limit(limit, cap=100)
+    items = _search_intelligence_rows(q, domain, size, provider, canonical_person_id, language, genre, year)
+    start = _offset(page, size)
+    visible = items[start : start + size]
+    for item in visible:
+        matched_roles = _person_roles(item.pop("matched_person_roles", None))
+        if canonical_person_id is None:
+            continue
+        if not matched_roles:
+            raise RuntimeError("canonical person result missing person edge evidence")
+        evidence: dict[str, Any] = {
+            "person_id": str(canonical_person_id),
+            "person_roles": matched_roles,
+        }
+        if provider:
+            evidence["provider_key"] = _provider_key(provider)
+            evidence["provider_confirmed"] = True
+        item["match_evidence"] = evidence
+    return _items_payload(visible, len(items), page, size, domain if domain != "all" else None)
 
 
 @app.get("/api/v1/search")
