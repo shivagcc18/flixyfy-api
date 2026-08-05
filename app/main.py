@@ -247,14 +247,16 @@ def _movie_predicates(
     params.extend(x.lower() for x in domains)
     if language:
         predicates.append(
-            f"EXISTS (SELECT 1 FROM {_qi('movie_language_serving_v3')} l "
+            f"(LOWER(COALESCE({alias}.original_language, '')) = ANY(%s) "
+            "OR EXISTS (SELECT 1 FROM "
+            f"{_qi('movie_language_serving_v3')} l "
             f"WHERE l.canonical_movie_id = {alias}.canonical_movie_id "
             "AND (LOWER(COALESCE(l.language_code, '')) = ANY(%s) "
             "OR LOWER(COALESCE(l.language_name, '')) = ANY(%s) "
-            "OR LOWER(COALESCE(l.normalized_name, '')) = ANY(%s)))"
+            "OR LOWER(COALESCE(l.normalized_name, '')) = ANY(%s))))"
         )
         language_values = list(_language_match_values(language))
-        params.extend([language_values] * 3)
+        params.extend([language_values] * 4)
     if genre:
         predicates.append(
             f"EXISTS (SELECT 1 FROM {_qi('movie_genre_serving_v3')} g "
