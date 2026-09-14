@@ -5,6 +5,7 @@ import app.main as main
 
 def test_person_query_forms_and_roles():
     assert main._person_query_forms("N. T. Rama Rao") == ("n t rama rao", "ntramarao")
+    assert main._person_query_forms("Jr NTR") == ("n t rama rao jr", "ntramaraojr")
     assert main._person_roles(["Cast", "Director", "cast"]) == ["actor", "director"]
 
 

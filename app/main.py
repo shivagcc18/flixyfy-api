@@ -182,7 +182,9 @@ def _person_roles(values: Any) -> list[str]:
 def _person_query_forms(value: str) -> tuple[str, str]:
     text = re.sub(r"\s+", " ", str(value or "").strip().lower())
     normalized = re.sub(r"[^a-z0-9]+", " ", text).strip()
-    compact = re.sub(r"[^a-z0-9]+", "", text)
+    if normalized in {"jr ntr", "junior ntr"}:
+        normalized = "n t rama rao jr"
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
     return normalized, compact
 
 
