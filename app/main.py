@@ -239,6 +239,8 @@ def _movie_predicates(
     language: str | None = None,
     year: int | None = None,
     genre: str | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
     alias: str = "i",
 ) -> tuple[list[str], list[Any]]:
     predicates: list[str] = []
@@ -249,16 +251,16 @@ def _movie_predicates(
     params.extend(x.lower() for x in domains)
     if language:
         predicates.append(
-            f"(LOWER(COALESCE({alias}.original_language, '')) = ANY(%s) "
+            f"(LOWER(COALESCE({alias}.original_language, '')) = %s "
             "OR EXISTS (SELECT 1 FROM "
             f"{_qi('movie_language_serving_v3')} l "
             f"WHERE l.canonical_movie_id = {alias}.canonical_movie_id "
-            "AND (LOWER(COALESCE(l.language_code, '')) = ANY(%s) "
-            "OR LOWER(COALESCE(l.language_name, '')) = ANY(%s) "
-            "OR LOWER(COALESCE(l.normalized_name, '')) = ANY(%s))))"
+            "AND (LOWER(COALESCE(l.language_code, '')) = %s "
+            "OR LOWER(COALESCE(l.language_name, '')) = %s "
+            "OR LOWER(COALESCE(l.normalized_name, '')) = %s)))"
         )
-        language_values = list(_language_match_values(language))
-        params.extend([language_values] * 4)
+        language_value = str(language).strip().lower()
+        params.extend([language_value] * 4)
     if genre:
         predicates.append(
             f"EXISTS (SELECT 1 FROM {_qi('movie_genre_serving_v3')} g "
@@ -268,9 +270,16 @@ def _movie_predicates(
         )
         genre_value = str(genre).strip().lower()
         params.extend([genre_value] * 2)
-    if year:
+    if year is not None:
         predicates.append(f"{alias}.release_year = %s")
         params.append(int(year))
+    else:
+        if year_from is not None:
+            predicates.append(f"{alias}.release_year >= %s")
+            params.append(int(year_from))
+        if year_to is not None:
+            predicates.append(f"{alias}.release_year <= %s")
+            params.append(int(year_to))
     if provider:
         provider = _provider_key(provider)
         if provider == "youtube":
@@ -296,17 +305,26 @@ def _movie_rows(
     provider: str | None = None,
     language: str | None = None,
     year: int | None = None,
+    sort: str | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     limit = _limit(limit)
-    predicates, params = _movie_predicates(domain, provider, language, year)
+    predicates, params = _movie_predicates(domain, provider, language, year, None, year_from, year_to)
     clause = " WHERE " + " AND ".join(predicates)
     total = _one(
         f"SELECT COUNT(*)::bigint AS total FROM {_qi('movie_identity_serving_v3')} i{clause}",
         tuple(params),
     )
+    order_by = {
+        "popular": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
+        "rating": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
+        "newest": "i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST",
+        "oldest": "i.release_year ASC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST",
+        "title": "i.title ASC NULLS LAST, i.release_year DESC NULLS LAST",
+    }.get((sort or "newest").strip().lower(), "i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST")
     rows = _rows(
-        MOVIE_SELECT + clause
-        + " ORDER BY i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST LIMIT %s OFFSET %s",
+        MOVIE_SELECT + clause + f" ORDER BY {order_by} LIMIT %s OFFSET %s",
         tuple(params + [limit, _offset(page, limit)]),
     )
     return int((total or {}).get("total") or 0), [_normalise_movie(row) for row in rows]
@@ -847,9 +865,12 @@ def providers(domain: Domain = "current") -> dict[str, Any]:
     }
 
 
-def _v4_content(domain: str, page: int, limit: int, provider: str | None, language: str | None, year: int | None) -> dict[str, Any]:
+def _v4_content(
+    domain: str, page: int, limit: int, provider: str | None, language: str | None, year: int | None,
+    sort: str | None = None, year_from: int | None = None, year_to: int | None = None,
+) -> dict[str, Any]:
     domain = _normalise_domain(domain)
-    total, items = _movie_rows(domain, page, limit, provider, language, year)
+    total, items = _movie_rows(domain, page, limit, provider, language, year, sort, year_from, year_to)
     return _items_payload(items, total, page, _limit(limit), domain)
 
 
@@ -893,8 +914,35 @@ def _flixyfy_v4_home(limit: int = 12) -> dict[str, Any]:
 
 
 @app.get("/api/v4/movies")
-def _flixyfy_v4_movies(page: int = 1, limit: int = 24, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None) -> dict[str, Any]:
-    return _v4_content("current", page, limit, provider, language, year)
+def _flixyfy_v4_movies(
+    page: int = 1, limit: int = 24, domain: str = "current", provider: str | None = None,
+    language: str | None = None, year: int | None = None, year_from: int | None = None,
+    year_to: int | None = None, sort: str | None = None,
+) -> dict[str, Any]:
+    return _v4_content(domain, page, limit, provider, language, year, sort, year_from, year_to)
+
+
+def _v4_discovery_home() -> dict[str, Any]:
+    trending = _movie_rows("current", 1, 24, sort="popular")[1]
+    hero = [item for item in trending if item.get("backdrop_url") or item.get("poster_url")][:5]
+    languages = {}
+    for language in ("te", "hi", "ta", "kn", "ml"):
+        candidates = _movie_rows("current", 1, 24, language=language, sort="popular")[1]
+        languages[language] = [
+            item for item in candidates
+            if str(item.get("original_language") or "").strip().lower() == language
+            and item.get("poster_url")
+        ][:12]
+    new_releases = _movie_rows("current", 1, 12, sort="newest")[1]
+    classics = _movie_rows("historical", 1, 12, sort="popular", year_from=1960, year_to=1999)[1]
+    youtube = _movie_rows("current", 1, 12, provider="youtube", sort="popular")[1]
+    return {"hero": hero, "trending": trending[:12], "new_releases": new_releases[:12],
+            "languages": languages, "classics": classics[:12], "youtube": youtube[:12]}
+
+
+@app.get("/api/v4/discovery/home")
+def _flixyfy_v4_discovery_home() -> dict[str, Any]:
+    return _v4_discovery_home()
 
 
 @app.get("/api/v4/current")
