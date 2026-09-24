@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from app.search_sidecar_v1 import resolve_person_search, search_metadata
 
 
 PACKAGE_RELATIONS = frozenset(
@@ -382,6 +383,27 @@ def _search_rows(
     output.sort(key=lambda row: (float(row.get("rating") or 0), str(row.get("title") or "").lower()), reverse=True)
     return output[: _limit(limit, cap=100)]
 
+
+
+def _person_search_rows(result: Any, domain: str, limit: int, language: str | None = None, year: int | None = None) -> list[dict[str, Any]]:
+    if not result.canonical_movie_ids:
+        return []
+    domains = ("current", "historical", "hollywood", "webseries") if domain == "all" else (_normalise_domain(domain),)
+    output: list[dict[str, Any]] = []
+    for current_domain in domains:
+        predicates, params = _movie_predicates(current_domain, None, language, year)
+        predicates.append("i.canonical_movie_id = ANY(%s)")
+        params.append(list(result.canonical_movie_ids))
+        output.extend(
+            _rows(
+                MOVIE_SELECT + " WHERE " + " AND ".join(predicates)
+                + " ORDER BY i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST LIMIT %s",
+                tuple(params + [_limit(limit, cap=100)]),
+            )
+        )
+    output = [_normalise_movie(row) for row in output]
+    output.sort(key=lambda row: (float(row.get("rating") or 0), str(row.get("title") or "").lower()), reverse=True)
+    return output[: _limit(limit, cap=100)]
 
 
 def _person_entity_rows(q: str, limit: int) -> list[dict[str, Any]]:
@@ -832,6 +854,10 @@ def search(
     domain: SearchDomain = "all",
     limit: int = Query(30, ge=1, le=100),
 ) -> dict[str, Any]:
+    sidecar = resolve_person_search(q)
+    if sidecar is not None:
+        items = _person_search_rows(sidecar, domain, limit)
+        return {"query": q, "domain": domain, "total": len(items), "items": items, "person_resolution": search_metadata(sidecar)}
     items = _search_rows(q, domain, limit)
     return {"query": q, "domain": domain, "total": len(items), "items": items}
 
@@ -879,6 +905,13 @@ def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provide
     if not q:
         total, items = _movie_rows(current_domain, page, limit, provider, language, year)
         return _items_payload(items, total, page, _limit(limit), current_domain)
+    sidecar = resolve_person_search(q, provider)
+    if sidecar is not None:
+        items = _person_search_rows(sidecar, current_domain if domain else "all", 100, language, year)
+        start = _offset(page, _limit(limit))
+        payload = _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
+        payload["person_resolution"] = search_metadata(sidecar)
+        return payload
     items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year)
     start = _offset(page, _limit(limit))
     return _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
