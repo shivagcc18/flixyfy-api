@@ -12,7 +12,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from typing import Any, Literal
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -252,16 +252,16 @@ def _movie_predicates(
     params.extend(x.lower() for x in domains)
     if language:
         predicates.append(
-            f"(LOWER(COALESCE({alias}.original_language, '')) = %s "
+            f"(LOWER(COALESCE({alias}.original_language, '')) = ANY(%s) "
             "OR EXISTS (SELECT 1 FROM "
             f"{_qi('movie_language_serving_v3')} l "
             f"WHERE l.canonical_movie_id = {alias}.canonical_movie_id "
-            "AND (LOWER(COALESCE(l.language_code, '')) = %s "
-            "OR LOWER(COALESCE(l.language_name, '')) = %s "
-            "OR LOWER(COALESCE(l.normalized_name, '')) = %s)))"
+            "AND (LOWER(COALESCE(l.language_code, '')) = ANY(%s) "
+            "OR LOWER(COALESCE(l.language_name, '')) = ANY(%s) "
+            "OR LOWER(COALESCE(l.normalized_name, '')) = ANY(%s))))"
         )
-        language_value = str(language).strip().lower()
-        params.extend([language_value] * 4)
+        language_values = list(_language_match_values(language))
+        params.extend([language_values] * 4)
     if genre:
         predicates.append(
             f"EXISTS (SELECT 1 FROM {_qi('movie_genre_serving_v3')} g "
@@ -612,6 +612,291 @@ def _normalise_provider(row: dict[str, Any], title: str) -> dict[str, Any]:
     return item
 
 
+
+_FLIXYFY_PROVIDER_ROUTE_REGISTRY = {'aha': {'home_url': 'https://www.aha.video/',
+         'provider_name': 'aha',
+         'route_status': 'SEARCH_AND_HOME',
+         'search_template': 'https://www.aha.video/search?q={query}'},
+ 'amazon_video_store': {'home_url': 'https://www.primevideo.com/storefront/',
+                        'provider_name': 'Amazon Video Store',
+                        'route_status': 'SEARCH_AND_HOME',
+                        'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'ap_international_south_cinema_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                                                  'provider_name': 'AP International South Cinema Amazon '
+                                                                   'Channel',
+                                                  'route_status': 'SEARCH_AND_HOME',
+                                                  'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'apple_tv_store': {'home_url': 'https://tv.apple.com/in',
+                    'provider_name': 'Apple TV Store',
+                    'route_status': 'SEARCH_AND_HOME',
+                    'search_template': 'https://tv.apple.com/in/search?term={query}'},
+ 'artiflix': {'home_url': None,
+              'provider_name': 'Artiflix',
+              'route_status': 'LABEL_ONLY',
+              'search_template': None},
+ 'bloodstream': {'home_url': None,
+                 'provider_name': 'Bloodstream',
+                 'route_status': 'LABEL_ONLY',
+                 'search_template': None},
+ 'bookmyshow': {'home_url': 'https://in.bookmyshow.com/explore/movies',
+                'provider_name': 'BookMyShow',
+                'route_status': 'SEARCH_AND_HOME',
+                'search_template': 'https://in.bookmyshow.com/explore/search?q={query}'},
+ 'brew': {'home_url': None, 'provider_name': 'Brew', 'route_status': 'LABEL_ONLY', 'search_template': None},
+ 'chaupal_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                            'provider_name': 'Chaupal Amazon Channel',
+                            'route_status': 'SEARCH_AND_HOME',
+                            'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'cultpix': {'home_url': 'https://www.cultpix.com/',
+             'provider_name': 'Cultpix',
+             'route_status': 'HOME',
+             'search_template': None},
+ 'dekkoo': {'home_url': 'https://www.dekkoo.com/',
+            'provider_name': 'Dekkoo',
+            'route_status': 'HOME',
+            'search_template': None},
+ 'docalliance_films': {'home_url': 'https://dafilms.com/',
+                       'provider_name': 'DocAlliance Films',
+                       'route_status': 'HOME',
+                       'search_template': None},
+ 'docubay_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                            'provider_name': 'DocuBay Amazon Channel',
+                            'route_status': 'SEARCH_AND_HOME',
+                            'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'epic_on': {'home_url': 'https://www.epicon.in/',
+             'provider_name': 'EPIC ON',
+             'route_status': 'SEARCH_AND_HOME',
+             'search_template': 'https://www.epicon.in/search?q={query}'},
+ 'eros_now_select_apple_tv_channel': {'home_url': 'https://tv.apple.com/in',
+                                      'provider_name': 'Eros Now Select Apple TV Channel',
+                                      'route_status': 'SEARCH_AND_HOME',
+                                      'search_template': 'https://tv.apple.com/in/search?term={query}'},
+ 'eventive': {'home_url': 'https://eventive.org/',
+              'provider_name': 'Eventive',
+              'route_status': 'HOME',
+              'search_template': None},
+ 'filmbox_plus': {'home_url': 'https://www.filmbox.com/',
+                  'provider_name': 'FilmBox+',
+                  'route_status': 'HOME',
+                  'search_template': None},
+ 'google_play_movies': {'home_url': 'https://play.google.com/store/movies',
+                        'provider_name': 'Google Play Movies',
+                        'route_status': 'SEARCH_AND_HOME',
+                        'search_template': 'https://play.google.com/store/search?q={query}&c=movies'},
+ 'hoichoi': {'home_url': 'https://www.hoichoi.tv/',
+             'provider_name': 'Hoichoi',
+             'route_status': 'SEARCH_AND_HOME',
+             'search_template': 'https://www.hoichoi.tv/search?q={query}'},
+ 'hoichoi_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                            'provider_name': 'Hoichoi Amazon Channel',
+                            'route_status': 'SEARCH_AND_HOME',
+                            'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'hungama_play': {'home_url': 'https://www.hungama.com/',
+                  'provider_name': 'Hungama Play',
+                  'route_status': 'HOME',
+                  'search_template': None},
+ 'iwonder_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                            'provider_name': 'Iwonder Amazon Channel',
+                            'route_status': 'SEARCH_AND_HOME',
+                            'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'jiohotstar': {'home_url': 'https://www.hotstar.com/in',
+                'provider_name': 'jiohotstar',
+                'route_status': 'SEARCH_AND_HOME',
+                'search_template': 'https://www.hotstar.com/in/search?q={query}'},
+ 'justwatch_tv': {'home_url': 'https://www.justwatch.com/in',
+                  'provider_name': 'JustWatch TV',
+                  'route_status': 'SEARCH_AND_HOME',
+                  'search_template': 'https://www.justwatch.com/in/search?q={query}'},
+ 'kableone': {'home_url': None,
+              'provider_name': 'KableOne',
+              'route_status': 'LABEL_ONLY',
+              'search_template': None},
+ 'lionsgate_play': {'home_url': 'https://www.lionsgateplay.com/',
+                    'provider_name': 'Lionsgate Play',
+                    'route_status': 'SEARCH_AND_HOME',
+                    'search_template': 'https://www.lionsgateplay.com/search?q={query}'},
+ 'lionsgate_play_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                                   'provider_name': 'Lionsgate Play Amazon Channel',
+                                   'route_status': 'SEARCH_AND_HOME',
+                                   'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'lionsgate_play_apple_tv_channel': {'home_url': 'https://tv.apple.com/in',
+                                     'provider_name': 'Lionsgate Play Apple TV Channel',
+                                     'route_status': 'SEARCH_AND_HOME',
+                                     'search_template': 'https://tv.apple.com/in/search?term={query}'},
+ 'manoramamax': {'home_url': 'https://www.manoramamax.com/',
+                 'provider_name': 'manoramaMAX',
+                 'route_status': 'SEARCH_AND_HOME',
+                 'search_template': 'https://www.manoramamax.com/search?q={query}'},
+ 'manoramamax_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                                'provider_name': 'ManoramaMAX Amazon Channel',
+                                'route_status': 'SEARCH_AND_HOME',
+                                'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'mgm_plus_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                             'provider_name': 'MGM Plus Amazon Channel',
+                             'route_status': 'SEARCH_AND_HOME',
+                             'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'movieme': {'home_url': None,
+             'provider_name': 'movieme',
+             'route_status': 'LABEL_ONLY',
+             'search_template': None},
+ 'moviesaints': {'home_url': 'https://www.moviesaints.com/',
+                 'provider_name': 'MovieSaints',
+                 'route_status': 'HOME',
+                 'search_template': None},
+ 'mubi': {'home_url': 'https://mubi.com/en/in',
+          'provider_name': 'MUBI',
+          'route_status': 'SEARCH_AND_HOME',
+          'search_template': 'https://mubi.com/en/in/search/films?query={query}'},
+ 'mubi_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                         'provider_name': 'MUBI Amazon Channel',
+                         'route_status': 'SEARCH_AND_HOME',
+                         'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'nammaflix_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                              'provider_name': 'NammaFlix Amazon Channel',
+                              'route_status': 'SEARCH_AND_HOME',
+                              'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'netflix': {'home_url': 'https://www.netflix.com/in/',
+             'provider_name': 'Netflix',
+             'route_status': 'SEARCH_AND_HOME',
+             'search_template': 'https://www.netflix.com/in/search?q={query}'},
+ 'nfdc_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                         'provider_name': 'NFDC Amazon Channel',
+                         'route_status': 'SEARCH_AND_HOME',
+                         'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'plex': {'home_url': 'https://watch.plex.tv/',
+          'provider_name': 'plex',
+          'route_status': 'SEARCH_AND_HOME',
+          'search_template': 'https://watch.plex.tv/search?q={query}'},
+ 'plex_channel': {'home_url': 'https://watch.plex.tv/',
+                  'provider_name': 'Plex Channel',
+                  'route_status': 'SEARCH_AND_HOME',
+                  'search_template': 'https://watch.plex.tv/search?q={query}'},
+ 'prime_video': {'home_url': 'https://www.primevideo.com/',
+                 'provider_name': 'prime_video',
+                 'route_status': 'SEARCH_AND_HOME',
+                 'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'shemaroome': {'home_url': 'https://www.shemaroome.com/',
+                'provider_name': 'ShemarooMe',
+                'route_status': 'SEARCH_AND_HOME',
+                'search_template': 'https://www.shemaroome.com/search?q={query}'},
+ 'shortstv_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                             'provider_name': 'ShortsTV Amazon Channel',
+                             'route_status': 'SEARCH_AND_HOME',
+                             'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'sony_pictures_amazon_channel': {'home_url': 'https://www.primevideo.com/',
+                                  'provider_name': 'Sony Pictures Amazon Channel',
+                                  'route_status': 'SEARCH_AND_HOME',
+                                  'search_template': 'https://www.primevideo.com/search?phrase={query}'},
+ 'sonyliv': {'home_url': 'https://www.sonyliv.com/',
+             'provider_name': 'sonyliv',
+             'route_status': 'SEARCH_AND_HOME',
+             'search_template': 'https://www.sonyliv.com/search?q={query}'},
+ 'sun_nxt': {'home_url': 'https://www.sunnxt.com/',
+             'provider_name': 'Sun NXT',
+             'route_status': 'SEARCH_AND_HOME',
+             'search_template': 'https://www.sunnxt.com/searchcontents?search={query}'},
+ 'tata_play': {'home_url': 'https://www.tataplay.com/',
+               'provider_name': 'Tata Play',
+               'route_status': 'HOME',
+               'search_template': None},
+ 'vi_movies_and_tv': {'home_url': 'https://www.myvi.in/vi-movies-and-tv',
+                      'provider_name': 'vi_movies_and_tv',
+                      'route_status': 'HOME',
+                      'search_template': None},
+ 'wow_presents_plus': {'home_url': 'https://www.wowpresentsplus.com/',
+                       'provider_name': 'WOW Presents Plus',
+                       'route_status': 'SEARCH_AND_HOME',
+                       'search_template': 'https://www.wowpresentsplus.com/search?q={query}'},
+ 'zee5': {'home_url': 'https://www.zee5.com/',
+          'provider_name': 'zee5',
+          'route_status': 'SEARCH_AND_HOME',
+          'search_template': 'https://www.zee5.com/search?q={query}'}}
+
+def _provider_user_actions(rows: list[dict[str, Any]], title: str) -> list[dict[str, Any]]:
+    """Serialize one accepted, routed Watch-on action per canonical provider."""
+    priority = {
+        "prime_video": 10, "jiohotstar": 20, "netflix": 30, "aha": 40,
+        "sun_nxt": 50, "zee5": 60, "sonyliv": 70, "manoramamax": 80,
+        "hoichoi": 90, "lionsgate_play": 100, "shemaroome": 110,
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for raw in rows or []:
+        item = dict(raw)
+        key = _provider_key(str(item.get("provider_key") or ""))
+        if key:
+            grouped.setdefault(key, []).append(item)
+
+    def _verified_direct(item: dict[str, Any]) -> str:
+        for field in ("watch_url", "final_url", "deep_link"):
+            value = str(item.get(field) or "").strip()
+            parsed = urlsplit(value)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                return value
+        return ""
+
+    output: list[dict[str, Any]] = []
+    for key, evidence in grouped.items():
+        route = _FLIXYFY_PROVIDER_ROUTE_REGISTRY.get(key, {})
+
+        def _score(item: dict[str, Any]) -> tuple[int, float]:
+            try:
+                confidence = float(item.get("confidence_score") or 0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            return (1 if _verified_direct(item) else 0, confidence)
+
+        item = _normalise_provider(max(evidence, key=_score), title)
+        provider_name = str(route.get("provider_name") or item.get("provider_name") or key).strip()
+        direct_url = _verified_direct(item)
+        search_template = str(route.get("search_template") or "").strip()
+        home_url = str(route.get("home_url") or "").strip()
+        route_status = str(route.get("route_status") or "LABEL_ONLY")
+
+        if direct_url:
+            button_url, navigation_kind = direct_url, "DIRECT"
+        elif route_status == "SEARCH_AND_HOME" and search_template and title.strip():
+            encoded = quote_plus(title.strip())
+            button_url = (
+                search_template.replace("{query}", encoded)
+                .replace("{q}", encoded)
+                .replace("{title}", encoded)
+                .replace("%s", encoded)
+            )
+            navigation_kind = "SEARCH"
+        elif route_status in {"HOME", "SEARCH_AND_HOME"} and home_url:
+            button_url, navigation_kind = home_url, "HOME"
+        else:
+            button_url, navigation_kind = None, "LABEL_ONLY"
+
+        availability_types = sorted({
+            str(row.get("availability_type") or row.get("provider_category") or "").strip()
+            for row in evidence
+            if str(row.get("availability_type") or row.get("provider_category") or "").strip()
+        })
+        label = f"Watch on {provider_name}"
+        item.update({
+            "provider_key": key,
+            "provider_name": provider_name,
+            "provider_display_name": provider_name,
+            "provider_public_label": label,
+            "home_url": home_url or None,
+            "search_template": search_template or None,
+            "button_label": label,
+            "button_url": button_url,
+            "watch_url": button_url,
+            "final_url": button_url,
+            "navigation_kind": navigation_kind,
+            "provider_route_status": route_status,
+            "media_kind": "ott",
+            "evidence_row_count": len(evidence),
+            "availability_types": availability_types,
+            "provider_priority": priority.get(key, 1000),
+        })
+        output.append(item)
+
+    output.sort(key=lambda row: (int(row.get("provider_priority") or 1000), str(row.get("provider_display_name") or "").lower()))
+    return output
+
 def _youtube_rows(canonical_movie_id: str) -> list[dict[str, Any]]:
     return _rows(
         f"SELECT y.*, v.representative_title, v.representative_language_code, "
@@ -645,7 +930,7 @@ def _detail_payload(domain: str, slug: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Not Found")
     item = _normalise_movie(row)
     canonical_movie_id = str(item.get("canonical_movie_id") or "")
-    providers = [_normalise_provider(row, str(item.get("title") or "")) for row in _provider_rows(canonical_movie_id)]
+    providers = _provider_user_actions(_provider_rows(canonical_movie_id), str(item.get("title") or ""))
     youtube = []
     for row in _youtube_rows(canonical_movie_id):
         youtube_item = dict(row)
