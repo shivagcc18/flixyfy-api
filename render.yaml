@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: flixyfy-api-free
+    runtime: docker
+    plan: free
+    region: ohio
+    repo: https://github.com/shivagcc18/flixyfy-api
+    branch: codex/render-free-backend-migration-v1-20260929
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: FLIXYFY_SEARCH_SIDECAR_DB
+        value: /app/runtime/flixyfy_person_search_sidecar_runtime.db
+      - key: FLIXYFY_SQLITE_QUERY_TIMEOUT_MS
+        value: "30000"
+      - key: DATABASE_URL
+        sync: false

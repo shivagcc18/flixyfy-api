@@ -1,0 +1,16 @@
+FROM python:3.12-slim AS sidecar
+WORKDIR /build
+COPY runtime_assets/flixyfy_person_search_sidecar_runtime.db.gz runtime_assets/PERSON_SIDECAR_MANIFEST.json ./
+RUN mkdir -p /build/runtime && python -c 'import gzip,hashlib,json,pathlib; m=json.loads(pathlib.Path("/build/PERSON_SIDECAR_MANIFEST.json").read_text(encoding="utf-8")); data=gzip.decompress(pathlib.Path("/build/flixyfy_person_search_sidecar_runtime.db.gz").read_bytes()); actual=hashlib.sha256(data).hexdigest(); assert actual==m["source_sha256"], "Person sidecar SHA256 mismatch"; assert len(data)==m["source_size"], "Person sidecar size mismatch"; p=pathlib.Path("/build/runtime/flixyfy_person_search_sidecar_runtime.db"); p.write_bytes(data); p.chmod(0o444)' && chmod 0555 /build/runtime
+
+FROM python:3.12-slim AS api
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt ./requirements.txt
+RUN python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+COPY app ./app
+COPY --from=sidecar /build/runtime/flixyfy_person_search_sidecar_runtime.db /app/runtime/flixyfy_person_search_sidecar_runtime.db
+RUN useradd --system --no-create-home --uid 10001 flixyfy && chmod 0444 /app/runtime/flixyfy_person_search_sidecar_runtime.db && chmod 0555 /app/runtime && chown -R root:root /app
+USER 10001:10001
+CMD ["sh", "-c", "exec python -m uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-8080}\""]
