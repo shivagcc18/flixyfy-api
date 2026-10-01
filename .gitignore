@@ -27,3 +27,9 @@ load_*_v*.py
 rebuild_*_v*.py
 add_*_indexes.py
 railway.json
+
+.vercel/
+.venv/
+venv/
+.vercel
+.env*
