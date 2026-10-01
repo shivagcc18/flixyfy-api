@@ -1,0 +1,13 @@
+{
+  "checkpoint": "FLIXYFY_RENDER_FREE_BACKEND_MIGRATION_AND_LAUNCH_ACCEPTANCE_V1",
+  "source_path": "E:\\FLIXYFY\\flixyfy-clean-stack-v2\\data_factory\\preproduction\\backend_mixed_topology_local_acceptance_v1_2_3\\20260928_183242_372\\flixyfy_person_search_sidecar_runtime.db",
+  "source_size": 48791552,
+  "source_sha256": "03731c53216588311da68d012db7232dcccd8461a13e3bf08d5b8502866511fa",
+  "accepted_person_identities": 6248,
+  "accepted_person_edges": 140415,
+  "runtime_destination": "/app/runtime/flixyfy_person_search_sidecar_runtime.db",
+  "compressed_artifact": "runtime_assets/flixyfy_person_search_sidecar_runtime.db.gz",
+  "compressed_size": 14589525,
+  "gzip_deterministic": true,
+  "decompressed_sha256_verified": true
+}
