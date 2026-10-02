@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlsplit
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -335,6 +335,37 @@ def _movie_rows(
         tuple(params + [limit, _offset(page, limit)]),
     )
     return int((total or {}).get("total") or 0), [_normalise_movie(row) for row in rows]
+
+
+def _home_movie_rows(
+    domain: str,
+    limit: int = 24,
+    provider: str | None = None,
+    language: str | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    sort: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the lean homepage card projection without an unused total count."""
+    limit = _limit(limit)
+    predicates, params = _movie_predicates(
+        domain, provider=provider, language=language, year_from=year_from, year_to=year_to
+    )
+    clause = " WHERE " + " AND ".join(predicates)
+    order_by = {
+        "popular": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
+        "rating": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
+        "newest": "i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST",
+        "oldest": "i.release_year ASC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST",
+        "title": "i.title ASC NULLS LAST, i.release_year DESC NULLS LAST",
+    }.get((sort or "newest").strip().lower(), "i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST")
+    return _rows(
+        f"SELECT i.canonical_movie_id, i.tmdb_id, i.title, i.release_year, i.domain, "
+        f"i.original_language, i.poster, i.backdrop, i.rating "
+        f"FROM {_qi('movie_identity_serving_v3')} i{clause} "
+        f"ORDER BY {order_by} LIMIT %s OFFSET 0",
+        tuple(params + [limit]),
+    )
 
 
 def _normalise_movie(row: dict[str, Any]) -> dict[str, Any]:
@@ -1250,25 +1281,26 @@ def _flixyfy_v4_movies(
 
 
 def _v4_discovery_home() -> dict[str, Any]:
-    trending = _movie_rows("current", 1, 24, sort="popular")[1]
-    hero = [item for item in trending if item.get("backdrop_url") or item.get("poster_url")][:5]
+    trending = _home_movie_rows("current", 24, sort="popular")
+    hero = [item for item in trending if item.get("backdrop") or item.get("poster")][:5]
     languages = {}
     for language in ("te", "hi", "ta", "kn", "ml"):
-        candidates = _movie_rows("current", 1, 24, language=language, sort="popular")[1]
+        candidates = _home_movie_rows("current", 24, language=language, sort="popular")
         languages[language] = [
             item for item in candidates
             if str(item.get("original_language") or "").strip().lower() == language
-            and item.get("poster_url")
+            and item.get("poster")
         ][:12]
-    new_releases = _movie_rows("current", 1, 12, sort="newest")[1]
-    classics = _movie_rows("historical", 1, 12, sort="popular", year_from=1960, year_to=1999)[1]
-    youtube = _movie_rows("current", 1, 12, provider="youtube", sort="popular")[1]
+    new_releases = _home_movie_rows("current", 12, sort="newest")
+    classics = _home_movie_rows("historical", 12, sort="popular", year_from=1960, year_to=1999)
+    youtube = _home_movie_rows("current", 12, provider="youtube", sort="popular")
     return {"hero": hero, "trending": trending[:12], "new_releases": new_releases[:12],
             "languages": languages, "classics": classics[:12], "youtube": youtube[:12]}
 
 
 @app.get("/api/v4/discovery/home")
-def _flixyfy_v4_discovery_home() -> dict[str, Any]:
+def _flixyfy_v4_discovery_home(response: Response) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "public, s-maxage=60, stale-while-revalidate=300"
     return _v4_discovery_home()
 
 
