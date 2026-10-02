@@ -162,8 +162,14 @@ def _provider_taxonomy_sql(alias: str = "p") -> str:
 
 
 def _approved_provider_sql(alias: str = "p") -> str:
-    taxonomy = _provider_taxonomy_sql(alias)
-    return f"LOWER(COALESCE({alias}.country, '')) IN ('in', 'india', 'ind') AND {taxonomy} IN ('SUBSCRIPTION_OTT', 'FREE_STREAMING')"
+    """Select accepted India provider edges without collapsing offer types.
+
+    `provider_ott_availability_v3` contains accepted serving rows. Rental,
+    purchase, ad-supported, and add-on-channel offers are valid provider
+    identities too; taxonomy is descriptive and must not act as a display
+    allowlist. Route resolution later decides SEARCH/HOME versus LABEL_ONLY.
+    """
+    return f"LOWER(COALESCE({alias}.country, '')) IN ('in', 'india', 'ind')"
 
 
 
