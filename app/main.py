@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import date
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlsplit
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -319,6 +320,9 @@ def _movie_rows(
     limit = _limit(limit)
     predicates, params = _movie_predicates(domain, provider, language, year, None, year_from, year_to)
     clause = " WHERE " + " AND ".join(predicates)
+    selected_sort = (sort or "newest").strip().lower()
+    if selected_sort == "newest":
+        _require_canonical_release_dates("i", predicates, params)
     total = _one(
         f"SELECT COUNT(*)::bigint AS total FROM {_qi('movie_identity_serving_v3')} i{clause}",
         tuple(params),
@@ -326,15 +330,49 @@ def _movie_rows(
     order_by = {
         "popular": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
         "rating": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
-        "newest": "i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST",
+        "newest": "i.release_date DESC NULLS LAST, i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST, i.canonical_movie_id ASC",
         "oldest": "i.release_year ASC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST",
         "title": "i.title ASC NULLS LAST, i.release_year DESC NULLS LAST",
-    }.get((sort or "newest").strip().lower(), "i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST")
+    }.get(selected_sort, "i.release_date DESC NULLS LAST, i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST, i.canonical_movie_id ASC")
     rows = _rows(
         MOVIE_SELECT + clause + f" ORDER BY {order_by} LIMIT %s OFFSET %s",
         tuple(params + [limit, _offset(page, limit)]),
     )
     return int((total or {}).get("total") or 0), [_normalise_movie(row) for row in rows]
+
+
+def _home_movie_rows(
+    domain: str,
+    limit: int = 24,
+    provider: str | None = None,
+    language: str | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    sort: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the lean homepage card projection without an unused total count."""
+    limit = _limit(limit)
+    predicates, params = _movie_predicates(
+        domain, provider=provider, language=language, year_from=year_from, year_to=year_to
+    )
+    clause = " WHERE " + " AND ".join(predicates)
+    selected_sort = (sort or "newest").strip().lower()
+    if selected_sort == "newest":
+        _require_canonical_release_dates("i", predicates, params)
+    order_by = {
+        "popular": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
+        "rating": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, i.title ASC NULLS LAST",
+        "newest": "i.release_date DESC NULLS LAST, i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST, i.canonical_movie_id ASC",
+        "oldest": "i.release_year ASC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST",
+        "title": "i.title ASC NULLS LAST, i.release_year DESC NULLS LAST",
+    }.get(selected_sort, "i.release_date DESC NULLS LAST, i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, i.title ASC NULLS LAST, i.canonical_movie_id ASC")
+    return _rows(
+        f"SELECT i.canonical_movie_id, i.tmdb_id, i.title, i.release_year, i.domain, "
+        f"i.original_language, i.poster, i.backdrop, i.rating "
+        f"FROM {_qi('movie_identity_serving_v3')} i{clause} "
+        f"ORDER BY {order_by} LIMIT %s OFFSET 0",
+        tuple(params + [limit]),
+    )
 
 
 def _normalise_movie(row: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +391,39 @@ def _normalise_movie(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _require_canonical_release_dates(
+    alias: str, predicates: list[str], params: list[Any], include_search_documents: bool = False
+) -> None:
+    """Fail closed before lexical YYYY-MM-DD ordering if scoped dates are malformed."""
+    if alias not in {"i"}:
+        raise ValueError("unsupported release-date validation alias")
+    clause = " WHERE " + " AND ".join(predicates)
+    search_join = (
+        f" JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = {alias}.canonical_movie_id"
+        if include_search_documents else ""
+    )
+    values = _rows(
+        f"SELECT DISTINCT {alias}.release_date FROM {_qi('movie_identity_serving_v3')} {alias}{search_join}"
+        f"{clause} AND {alias}.release_date IS NOT NULL",
+        tuple(params),
+    )
+    invalid = []
+    for value in values:
+        raw = str(value.get("release_date") or "")
+        try:
+            parsed = date.fromisoformat(raw)
+        except ValueError:
+            invalid.append(raw)
+            continue
+        if parsed.isoformat() != raw:
+            invalid.append(raw)
+    if invalid:
+        raise HTTPException(
+            status_code=503,
+            detail=f"newest ordering unavailable: {len(invalid)} non-canonical release_date value(s) in result scope",
+        )
+
+
 def _search_rows(
     q: str,
     domain: str = "all",
@@ -360,6 +431,7 @@ def _search_rows(
     provider: str | None = None,
     language: str | None = None,
     year: int | None = None,
+    sort: str | None = None,
 ) -> list[dict[str, Any]]:
     domains = ("current", "historical", "hollywood", "webseries") if domain == "all" else (_normalise_domain(domain),)
     output: list[dict[str, Any]] = []
@@ -373,20 +445,36 @@ def _search_rows(
             "OR LOWER(COALESCE(s.people, '')) LIKE LOWER(%s))"
         )
         params.extend([like] * 4)
+        if (sort or "relevance").strip().lower() == "newest":
+            _require_canonical_release_dates("i", predicates, params, include_search_documents=True)
         clause = " WHERE " + " AND ".join(predicates)
+        selected_sort = (sort or "relevance").strip().lower()
+        sql_sort = {
+            "newest": "i.release_date DESC NULLS LAST, i.release_year DESC NULLS LAST, i.rating DESC NULLS LAST, s.title ASC NULLS LAST, i.canonical_movie_id ASC",
+            "popular": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, s.title ASC NULLS LAST, i.canonical_movie_id ASC",
+            "rating": "i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, s.title ASC NULLS LAST, i.canonical_movie_id ASC",
+            "title": "s.title ASC NULLS LAST, i.release_year DESC NULLS LAST, i.canonical_movie_id ASC",
+        }.get(selected_sort, "i.rating DESC NULLS LAST, s.title ASC NULLS LAST, i.canonical_movie_id ASC")
         output.extend(
             _rows(
-                "SELECT s.*, i.poster, i.backdrop, i.original_language, i.release_year, "
+                "SELECT s.*, i.poster, i.backdrop, i.original_language, i.release_date, i.release_year, "
                 "i.domain, i.tmdb_id, i.imdb_id, i.rating, i.canonical_movie_id "
                 f"FROM {_qi('movie_search_document_v3')} s "
                 f"JOIN {_qi('movie_identity_serving_v3')} i ON i.canonical_movie_id = s.canonical_movie_id"
                 + clause
-                + " ORDER BY i.rating DESC NULLS LAST, s.title ASC NULLS LAST LIMIT %s",
+                + f" ORDER BY {sql_sort} LIMIT %s",
                 tuple(params + [_limit(limit, cap=100)]),
             )
         )
     output = [_normalise_movie(row) for row in output]
-    output.sort(key=lambda row: (float(row.get("rating") or 0), str(row.get("title") or "").lower()), reverse=True)
+    if (sort or "relevance").strip().lower() == "newest":
+        output.sort(key=lambda row: str(row.get("canonical_movie_id") or ""))
+        output.sort(key=lambda row: str(row.get("title") or "").casefold())
+        output.sort(key=lambda row: (row.get("rating") is not None, float(row.get("rating") or 0)), reverse=True)
+        output.sort(key=lambda row: (row.get("release_year") is not None, int(row.get("release_year") or 0)), reverse=True)
+        output.sort(key=lambda row: (row.get("release_date") is not None, str(row.get("release_date") or "")), reverse=True)
+    else:
+        output.sort(key=lambda row: (float(row.get("rating") or 0), str(row.get("title") or "").lower()), reverse=True)
     return output[: _limit(limit, cap=100)]
 
 
@@ -1194,10 +1282,10 @@ def _v4_content(
     return _items_payload(items, total, page, _limit(limit), domain)
 
 
-def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provider: str | None, language: str | None, year: int | None) -> dict[str, Any]:
+def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provider: str | None, language: str | None, year: int | None, sort: str | None = None) -> dict[str, Any]:
     current_domain = _normalise_domain(domain) if domain else "current"
     if not q:
-        total, items = _movie_rows(current_domain, page, limit, provider, language, year)
+        total, items = _movie_rows(current_domain, page, limit, provider, language, year, sort)
         return _items_payload(items, total, page, _limit(limit), current_domain)
     sidecar = resolve_person_search(q, provider)
     if sidecar is not None:
@@ -1206,7 +1294,7 @@ def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provide
         payload = _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
         payload["person_resolution"] = search_metadata(sidecar)
         return payload
-    items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year)
+    items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year, sort)
     start = _offset(page, _limit(limit))
     return _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
 
@@ -1250,25 +1338,26 @@ def _flixyfy_v4_movies(
 
 
 def _v4_discovery_home() -> dict[str, Any]:
-    trending = _movie_rows("current", 1, 24, sort="popular")[1]
-    hero = [item for item in trending if item.get("backdrop_url") or item.get("poster_url")][:5]
+    trending = _home_movie_rows("current", 24, sort="popular")
+    hero = [item for item in trending if item.get("backdrop") or item.get("poster")][:5]
     languages = {}
     for language in ("te", "hi", "ta", "kn", "ml"):
-        candidates = _movie_rows("current", 1, 24, language=language, sort="popular")[1]
+        candidates = _home_movie_rows("current", 24, language=language, sort="popular")
         languages[language] = [
             item for item in candidates
             if str(item.get("original_language") or "").strip().lower() == language
-            and item.get("poster_url")
+            and item.get("poster")
         ][:12]
-    new_releases = _movie_rows("current", 1, 12, sort="newest")[1]
-    classics = _movie_rows("historical", 1, 12, sort="popular", year_from=1960, year_to=1999)[1]
-    youtube = _movie_rows("current", 1, 12, provider="youtube", sort="popular")[1]
+    new_releases = _home_movie_rows("current", 12, sort="newest")
+    classics = _home_movie_rows("historical", 12, sort="popular", year_from=1960, year_to=1999)
+    youtube = _home_movie_rows("current", 12, provider="youtube", sort="popular")
     return {"hero": hero, "trending": trending[:12], "new_releases": new_releases[:12],
             "languages": languages, "classics": classics[:12], "youtube": youtube[:12]}
 
 
 @app.get("/api/v4/discovery/home")
-def _flixyfy_v4_discovery_home() -> dict[str, Any]:
+def _flixyfy_v4_discovery_home(response: Response) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "public, s-maxage=60, stale-while-revalidate=300"
     return _v4_discovery_home()
 
 
@@ -1294,7 +1383,7 @@ def _flixyfy_v4_webseries(page: int = 1, limit: int = 24, provider: str | None =
 
 @app.get("/api/v4/search")
 def _flixyfy_v4_search(q: str | None = None, page: int = 1, limit: int = 24, domain: str | None = None, type: str | None = None, region: str | None = None, provider: str | None = None, language: str | None = None, year: int | None = None, sort: str | None = None) -> dict[str, Any]:
-    return _v4_search(q, page, limit, domain, provider, language, year)
+    return _v4_search(q, page, limit, domain, provider, language, year, sort)
 
 
 @app.get("/api/v4/global-search")
