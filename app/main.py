@@ -754,48 +754,47 @@ def _person_intelligence_page(
     genre: str | None,
     year: int | None,
 ) -> tuple[int, list[dict[str, Any]]]:
-    """Count and paginate exact Person credits after canonical-ID deduplication."""
-    requested_domains = ("current", "historical", "hollywood", "webseries") if domain == "all" else (_normalise_domain(domain),)
-    domain_clauses: list[str] = []
-    domain_params: list[Any] = []
-    for requested_domain in requested_domains:
-        predicates, params = _movie_predicates(requested_domain, provider, language, year, genre)
-        predicates.append(
-            f"EXISTS (SELECT 1 FROM {_qi('movie_people_serving_v3')} mp "
-            "WHERE mp.canonical_movie_id = i.canonical_movie_id AND mp.person_id = %s)"
-        )
-        params.append(person_id)
-        domain_clauses.append("(" + " AND ".join(predicates) + ")")
-        domain_params.extend(params)
-    where = " OR ".join(domain_clauses)
-    from_sql = (
-        f"FROM {_qi('movie_search_document_v3')} s "
-        f"JOIN {_qi('movie_identity_serving_v3')} i ON i.canonical_movie_id = s.canonical_movie_id"
-    )
-    total_row = _one(
-        "SELECT COUNT(DISTINCT i.canonical_movie_id)::bigint AS total " + from_sql + " WHERE " + where,
-        tuple(domain_params),
-    )
-    role_sql = f"""
-        ARRAY(
-            SELECT DISTINCT mp_roles.role
-            FROM {_qi('movie_people_serving_v3')} mp_roles
-            WHERE mp_roles.canonical_movie_id = i.canonical_movie_id
-              AND mp_roles.person_id = %s AND mp_roles.role IS NOT NULL
-        ) AS matched_person_roles
-    """
+    """Count, order and page compact exact-Person movie keys before rich hydration."""
+    predicates, filter_params = _movie_predicates(domain, provider, language, year, genre)
+    where = " AND ".join(predicates)
     size = _limit(limit, cap=100)
     rows = _rows(
-        "WITH matched AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
-        "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, i.imdb_id, "
-        "i.rating, " + role_sql + " " + from_sql + " WHERE " + where
-        + " ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST) "
-        "SELECT * FROM matched ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, "
-        "canonical_movie_id ASC LIMIT %s OFFSET %s",
-        tuple([person_id] + domain_params + [size, _offset(page, size)]),
+        f"WITH person_movie_ids AS MATERIALIZED ("
+        f"SELECT DISTINCT canonical_movie_id FROM {_qi('movie_people_serving_v3')} "
+        "WHERE person_id = %s AND canonical_movie_id IS NOT NULL), "
+        "matched_keys AS MATERIALIZED ("
+        "SELECT DISTINCT ON (i.canonical_movie_id) i.canonical_movie_id, i.rating, s.title "
+        f"FROM person_movie_ids p JOIN {_qi('movie_identity_serving_v3')} i "
+        "ON i.canonical_movie_id = p.canonical_movie_id "
+        f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = i.canonical_movie_id "
+        f"WHERE {where} "
+        "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST), "
+        "total AS (SELECT COUNT(*)::bigint AS total FROM matched_keys), "
+        "page_keys AS (SELECT canonical_movie_id, rating, title FROM matched_keys "
+        "ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC "
+        "LIMIT %s OFFSET %s), "
+        "page_rows AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
+        "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, i.imdb_id, i.rating, "
+        "ARRAY(SELECT DISTINCT mp_roles.role FROM "
+        f"{_qi('movie_people_serving_v3')} mp_roles "
+        "WHERE mp_roles.canonical_movie_id = pk.canonical_movie_id "
+        "AND mp_roles.person_id = %s AND mp_roles.role IS NOT NULL) AS matched_person_roles "
+        f"FROM page_keys pk JOIN {_qi('movie_identity_serving_v3')} i "
+        "ON i.canonical_movie_id = pk.canonical_movie_id "
+        f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = pk.canonical_movie_id "
+        "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST) "
+        "SELECT total.total, page_rows.* FROM total LEFT JOIN page_rows ON TRUE "
+        "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, "
+        "page_rows.canonical_movie_id ASC",
+        tuple([person_id] + filter_params + [size, _offset(page, size), person_id]),
     )
-    items = [_normalise_movie(row) for row in rows]
-    return int((total_row or {}).get("total") or 0), items
+    total = int((rows[0] if rows else {}).get("total") or 0)
+    items = [
+        _normalise_movie(row)
+        for row in rows
+        if row.get("canonical_movie_id") is not None
+    ]
+    return total, items
 
 
 def _parse_person_id(value: str | None) -> int | None:

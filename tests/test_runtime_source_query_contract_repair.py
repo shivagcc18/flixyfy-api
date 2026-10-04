@@ -26,27 +26,27 @@ def test_person_language_uses_serving_credits_and_quarantines_ties(monkeypatch):
 @pytest.mark.parametrize(("page", "offset"), ((1, 0), (2, 100), (3, 200)))
 def test_person_filmography_counts_deduplicates_and_paginates_in_sql(monkeypatch, page, offset):
     captured = {}
-    monkeypatch.setattr(main, "_one", lambda sql, params=(): (captured.update(count=(sql, params)) or {"total": 250}))
     monkeypatch.setattr(main, "_rows", lambda sql, params=(): (captured.update(page=(sql, params)) or []))
 
     total, rows = main._person_intelligence_page(1061913, "all", page, 100, None, None, None, None)
 
-    count_sql, count_params = captured["count"]
     page_sql, page_params = captured["page"]
-    assert total == 250 and rows == []
-    assert "COUNT(DISTINCT i.canonical_movie_id)" in count_sql
-    assert "mp.person_id = %s" in count_sql
+    assert total == 0 and rows == []
+    assert "person_movie_ids AS MATERIALIZED" in page_sql
+    assert "WHERE person_id = %s AND canonical_movie_id IS NOT NULL" in page_sql
+    assert "matched_keys AS MATERIALIZED" in page_sql
     assert "DISTINCT ON (i.canonical_movie_id)" in page_sql
-    # s.* already contains canonical_movie_id; selecting i.canonical_movie_id
-    # again gives the CTE duplicate output names and breaks its outer ORDER BY.
-    assert "i.rating, i.canonical_movie_id," not in page_sql
-    assert "i.rating," in page_sql and "AS matched_person_roles" in page_sql
-    assert "ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC" in page_sql
+    assert "total AS (SELECT COUNT(*)::bigint AS total FROM matched_keys)" in page_sql
+    assert "page_keys AS (SELECT canonical_movie_id, rating, title FROM matched_keys" in page_sql
+    assert "LIMIT %s OFFSET %s), page_rows AS" in page_sql
     assert "SELECT DISTINCT mp_roles.role" in page_sql
-    assert "LIMIT %s OFFSET %s" in page_sql
+    assert "s.*, i.poster, i.backdrop" in page_sql
+    assert "i.rating, pk.canonical_movie_id" not in page_sql
+    assert "SELECT total.total, page_rows.*" in page_sql
+    assert "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, " in page_sql
     assert page_params[0] == 1061913
-    assert page_params[-2:] == (100, offset)
-    assert count_params.count(1061913) == 4
+    assert page_params[-3:-1] == (100, offset)
+    assert page_params[-1] == 1061913
 
 
 def test_person_filmography_response_reports_full_total_and_has_more(monkeypatch):
@@ -64,6 +64,15 @@ def test_person_filmography_response_reports_full_total_and_has_more(monkeypatch
     assert payload["page_size"] == 100
     assert payload["has_more"] is True
     assert payload["items"][0]["match_evidence"]["person_id"] == "1061913"
+
+
+def test_person_filmography_empty_page_keeps_full_total(monkeypatch):
+    monkeypatch.setattr(
+        main, "_rows", lambda sql, params=(): [{"total": 372, "canonical_movie_id": None}]
+    )
+    total, rows = main._person_intelligence_page(1061913, "all", 20, 40, None, None, None, None)
+    assert total == 372
+    assert rows == []
 
 
 @pytest.mark.parametrize(
@@ -94,10 +103,9 @@ def test_person_filmography_response_page_boundaries(
 
 
 def test_person_filmography_duplicate_edges_and_multiple_roles_are_projected_once(monkeypatch):
-    captured = {"count_sql": "", "page_sql": ""}
-    monkeypatch.setattr(main, "_one", lambda sql, params=(): (captured.update(count_sql=sql) or {"total": 1}))
+    captured = {"page_sql": ""}
     monkeypatch.setattr(main, "_rows", lambda sql, params=(): (captured.update(page_sql=sql) or [{
-        "canonical_movie_id": "TMDB:1", "title": "Example", "rating": None,
+        "total": 1, "canonical_movie_id": "TMDB:1", "title": "Example", "rating": None,
         "poster": None, "matched_person_roles": ["actor", "director"],
     }]))
     total, rows = main._person_intelligence_page(1061913, "all", 1, 10, None, None, None, None)
@@ -105,7 +113,7 @@ def test_person_filmography_duplicate_edges_and_multiple_roles_are_projected_onc
     assert [row["canonical_movie_id"] for row in rows] == ["TMDB:1"]
     assert rows[0]["matched_person_roles"] == ["actor", "director"]
     assert rows[0]["rating"] is None and rows[0]["poster"] is None
-    assert "COUNT(DISTINCT i.canonical_movie_id)" in captured["count_sql"]
+    assert "COUNT(*)::bigint AS total FROM matched_keys" in captured["page_sql"]
     assert "DISTINCT ON (i.canonical_movie_id)" in captured["page_sql"]
     assert "SELECT DISTINCT mp_roles.role" in captured["page_sql"]
 
