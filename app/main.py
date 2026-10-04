@@ -143,6 +143,49 @@ def _language_match_values(value: str | None) -> tuple[str, ...]:
     return (raw,)
 
 
+def _primary_language_sql(alias: str = "i") -> str:
+    """Normalize the accepted movie identity's original-language field."""
+    raw = f"LOWER(BTRIM(COALESCE({alias}.original_language, '')))"
+    cases = []
+    for code, values in LANGUAGE_ALIASES.items():
+        canonical = next((value for value in values if value != code), code)
+        for value in values:
+            cases.append(f"WHEN '{value}' THEN '{canonical}'")
+    return f"CASE {raw} {' '.join(cases)} ELSE NULLIF({raw}, '') END"
+
+
+def _primary_language_ctes() -> str:
+    language = _primary_language_sql("i")
+    return f"""
+        person_language_counts AS (
+            SELECT p.person_id, {language} AS primary_language,
+                   COUNT(DISTINCT p.canonical_movie_id)::bigint AS movie_count
+            FROM {_qi('movie_people_serving_v3')} p
+            JOIN {_qi('movie_identity_serving_v3')} i
+              ON i.canonical_movie_id = p.canonical_movie_id
+            WHERE {language} IS NOT NULL
+            GROUP BY p.person_id, {language}
+        ),
+        person_language_ranked AS (
+            SELECT *, DENSE_RANK() OVER (
+                PARTITION BY person_id ORDER BY movie_count DESC
+            ) AS language_rank
+            FROM person_language_counts
+        ),
+        person_primary_language AS (
+            SELECT person_id,
+                   CASE WHEN COUNT(*) FILTER (WHERE language_rank = 1) = 1
+                        THEN MAX(primary_language) FILTER (WHERE language_rank = 1)
+                        ELSE NULL END AS primary_language,
+                   CASE WHEN COUNT(*) FILTER (WHERE language_rank = 1) = 1
+                        THEN 'CONFIRMED' ELSE 'AMBIGUOUS' END AS language_status,
+                   MAX(movie_count) AS primary_language_movie_count
+            FROM person_language_ranked
+            GROUP BY person_id
+        )
+    """
+
+
 _RENTAL_PROVIDER_KEYS = {"amazon_video_store", "apple_tv_store", "bookmyshow", "google_play_movies"}
 _AGGREGATOR_PROVIDER_KEYS = {"justwatch_tv", "tata_play"}
 
@@ -498,6 +541,65 @@ def _person_search_rows(result: Any, domain: str, limit: int, language: str | No
     output = [_normalise_movie(row) for row in output]
     output.sort(key=lambda row: (float(row.get("rating") or 0), str(row.get("title") or "").lower()), reverse=True)
     return output[: _limit(limit, cap=100)]
+
+
+def _person_intelligence_page(
+    person_id: int,
+    domain: str,
+    page: int,
+    limit: int,
+    provider: str | None,
+    language: str | None,
+    genre: str | None,
+    year: int | None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Count and page exact stable-ID credits in SQL, after identity filtering."""
+    requested_domains = ("current", "historical", "hollywood", "webseries") if domain == "all" else (_normalise_domain(domain),)
+    domain_clauses: list[str] = []
+    domain_params: list[Any] = []
+    for requested_domain in requested_domains:
+        predicates, params = _movie_predicates(requested_domain, provider, language, year, genre)
+        predicates.append(
+            f"EXISTS (SELECT 1 FROM {_qi('movie_people_serving_v3')} mp "
+            "WHERE mp.canonical_movie_id = i.canonical_movie_id AND mp.person_id = %s)"
+        )
+        params.append(person_id)
+        domain_clauses.append("(" + " AND ".join(predicates) + ")")
+        domain_params.extend(params)
+    where = " OR ".join(domain_clauses)
+    from_sql = (
+        f"FROM {_qi('movie_search_document_v3')} s "
+        f"JOIN {_qi('movie_identity_serving_v3')} i ON i.canonical_movie_id = s.canonical_movie_id"
+    )
+    total_row = _one(
+        "SELECT COUNT(DISTINCT i.canonical_movie_id)::bigint AS total " + from_sql + " WHERE " + where,
+        tuple(domain_params),
+    )
+    role_sql = f"""
+        ARRAY(
+            SELECT DISTINCT mp_roles.role
+            FROM {_qi('movie_people_serving_v3')} mp_roles
+            WHERE mp_roles.canonical_movie_id = i.canonical_movie_id
+              AND mp_roles.person_id = %s
+              AND mp_roles.role IS NOT NULL
+        ) AS matched_person_roles
+    """
+    size = _limit(limit, cap=100)
+    start = _offset(page, size)
+    rows = _rows(
+        "WITH matched AS ("
+        "SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
+        "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, "
+        "i.imdb_id, i.rating, i.canonical_movie_id, " + role_sql + " " + from_sql
+        + " WHERE " + where
+        + " ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST"
+        + ") SELECT * FROM matched "
+        "ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC LIMIT %s OFFSET %s",
+        tuple([person_id] + domain_params + [size, start]),
+    )
+    items = [_normalise_movie(row) for row in rows]
+    total = int((total_row or {}).get("total") or 0)
+    return total, items
 
 
 def _person_entity_rows(q: str, limit: int) -> list[dict[str, Any]]:
@@ -1057,7 +1159,14 @@ def _detail_payload(domain: str, slug: str) -> dict[str, Any]:
     return item
 
 
-def _items_payload(items: list[dict[str, Any]], total: int, page: int, limit: int, domain: str | None = None) -> dict[str, Any]:
+def _items_payload(
+    items: list[dict[str, Any]],
+    total: int,
+    page: int,
+    limit: int,
+    domain: str | None = None,
+    has_more: bool | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "items": items,
         "results": items,
@@ -1069,6 +1178,8 @@ def _items_payload(items: list[dict[str, Any]], total: int, page: int, limit: in
     }
     if domain is not None:
         payload["domain"] = domain
+    if has_more is not None:
+        payload["has_more"] = bool(has_more)
     return payload
 
 
@@ -1088,36 +1199,43 @@ def _people_rows(
         where.append("(LOWER(COALESCE(p.name, '')) LIKE LOWER(%s) OR LOWER(COALESCE(p.normalized_name, '')) LIKE LOWER(%s))")
         params.extend([f"%{q.strip()}%"] * 2)
     if language:
-        where.append(
-            f"EXISTS (SELECT 1 FROM {_qi('movie_language_serving_v3')} l "
-            "WHERE l.canonical_movie_id = p.canonical_movie_id "
-            "AND (LOWER(l.language_code) = %s OR LOWER(l.language_name) = %s OR LOWER(l.normalized_name) = %s))"
-        )
-        params.extend([str(language).lower()] * 3)
+        canonical_language = _language_match_values(language)[-1]
+        where.append("ppl.primary_language = %s AND ppl.language_status = 'CONFIRMED'")
+        params.append(canonical_language)
     clause = " WHERE " + " AND ".join(where)
     having = ""
     if min_movies is not None:
         having = " HAVING COUNT(DISTINCT p.canonical_movie_id) >= %s"
         params.append(int(min_movies))
-    total_row = _one(
-        "SELECT COUNT(*)::bigint AS total FROM (SELECT p.person_id "
-        f"FROM {_qi('movie_people_serving_v3')} p JOIN {_qi('movie_identity_serving_v3')} i "
-        "ON i.canonical_movie_id = p.canonical_movie_id"
-        + clause
-        + " GROUP BY p.person_id, p.name, p.normalized_name, p.compact_name"
+    ctes = _primary_language_ctes()
+    from_sql = (
+        f"FROM {_qi('movie_people_serving_v3')} p "
+        f"JOIN {_qi('movie_identity_serving_v3')} i ON i.canonical_movie_id = p.canonical_movie_id "
+        "LEFT JOIN person_primary_language ppl ON ppl.person_id = p.person_id"
+    )
+    grouped_people = (
+        "SELECT p.person_id, p.name, p.normalized_name, p.compact_name, "
+        "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count, "
+        "COUNT(DISTINCT p.canonical_movie_id)::bigint AS movie_count"
+        + " " + from_sql + clause
+        + " GROUP BY p.person_id, p.name, p.normalized_name, p.compact_name, "
+        "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count"
         + having
-        + ") people",
+    )
+    total_row = _one(
+        "WITH " + ctes + " SELECT COUNT(*)::bigint AS total FROM (" + grouped_people + ") people",
         tuple(params),
     )
     rows = _rows(
-        "SELECT p.person_id, p.name, p.normalized_name, p.compact_name, "
+        "WITH " + ctes + " SELECT p.person_id, p.name, p.normalized_name, p.compact_name, "
+        "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count, "
         "COUNT(DISTINCT p.canonical_movie_id)::bigint AS movie_count, "
         "COUNT(DISTINCT CASE WHEN y.canonical_movie_id IS NOT NULL THEN p.canonical_movie_id END)::bigint AS youtube_movie_count "
-        f"FROM {_qi('movie_people_serving_v3')} p JOIN {_qi('movie_identity_serving_v3')} i "
-        "ON i.canonical_movie_id = p.canonical_movie_id "
+        + from_sql + " "
         f"LEFT JOIN {_qi('movie_youtube_availability_v3')} y ON y.canonical_movie_id = p.canonical_movie_id"
         + clause
-        + " GROUP BY p.person_id, p.name, p.normalized_name, p.compact_name"
+        + " GROUP BY p.person_id, p.name, p.normalized_name, p.compact_name, "
+        "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count"
         + having
         + " ORDER BY movie_count DESC, p.name ASC LIMIT %s OFFSET %s",
         tuple(params + [_limit(limit), _offset(page, _limit(limit))]),
@@ -1210,9 +1328,15 @@ def search_intelligence(
 ) -> dict[str, Any]:
     canonical_person_id = _parse_person_id(person_id)
     size = _limit(limit, cap=100)
-    items = _search_intelligence_rows(q, domain, size, provider, canonical_person_id, language, genre, year)
-    start = _offset(page, size)
-    visible = items[start : start + size]
+    if canonical_person_id is not None:
+        total, visible = _person_intelligence_page(
+            canonical_person_id, domain, page, size, provider, language, genre, year
+        )
+    else:
+        items = _search_intelligence_rows(q, domain, size, provider, None, language, genre, year)
+        start = _offset(page, size)
+        visible = items[start : start + size]
+        total = len(items)
     for item in visible:
         matched_roles = _person_roles(item.pop("matched_person_roles", None))
         if canonical_person_id is None:
@@ -1227,7 +1351,8 @@ def search_intelligence(
             evidence["provider_key"] = _provider_key(provider)
             evidence["provider_confirmed"] = True
         item["match_evidence"] = evidence
-    return _items_payload(visible, len(items), page, size, domain if domain != "all" else None)
+    has_more = page * size < total if canonical_person_id is not None else None
+    return _items_payload(visible, total, page, size, domain if domain != "all" else None, has_more)
 
 
 @app.get("/api/v1/search")

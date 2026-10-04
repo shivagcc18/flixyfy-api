@@ -73,14 +73,8 @@ def test_canonical_person_search_uses_and_predicates_and_no_person_text_fallback
 def test_canonical_person_response_emits_integrity_evidence(monkeypatch):
     monkeypatch.setattr(
         main,
-        "_search_intelligence_rows",
-        lambda *args: [
-            {
-                "canonical_movie_id": "TMDB:1",
-                "title": "Example",
-                "matched_person_roles": ["Cast"],
-            }
-        ],
+        "_person_intelligence_page",
+        lambda *args: (1, [{"canonical_movie_id": "TMDB:1", "title": "Example", "matched_person_roles": ["Cast"]}]),
     )
     payload = main.search_intelligence(
         q="Prabhas",
@@ -99,10 +93,12 @@ def test_canonical_person_response_emits_integrity_evidence(monkeypatch):
         "provider_key": "netflix",
         "provider_confirmed": True,
     }
+    assert payload["total"] == 1
+    assert payload["has_more"] is False
 
 
 def test_empty_canonical_result_is_valid(monkeypatch):
-    monkeypatch.setattr(main, "_search_intelligence_rows", lambda *args: [])
+    monkeypatch.setattr(main, "_person_intelligence_page", lambda *args: (0, []))
     payload = main.search_intelligence(
         q=None,
         person_id="237045",
@@ -116,13 +112,14 @@ def test_empty_canonical_result_is_valid(monkeypatch):
     )
     assert payload["total"] == 0
     assert payload["items"] == []
+    assert payload["has_more"] is False
 
 
 def test_missing_evidence_cannot_be_published(monkeypatch):
     monkeypatch.setattr(
         main,
-        "_search_intelligence_rows",
-        lambda *args: [{"canonical_movie_id": "TMDB:1", "title": "Invalid", "matched_person_roles": []}],
+        "_person_intelligence_page",
+        lambda *args: (1, [{"canonical_movie_id": "TMDB:1", "title": "Invalid", "matched_person_roles": []}]),
     )
     with pytest.raises(RuntimeError, match="person edge evidence"):
         main.search_intelligence(
