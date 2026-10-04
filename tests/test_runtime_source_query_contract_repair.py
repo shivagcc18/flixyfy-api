@@ -37,7 +37,12 @@ def test_person_filmography_counts_deduplicates_and_paginates_in_sql(monkeypatch
     assert "COUNT(DISTINCT i.canonical_movie_id)" in count_sql
     assert "mp.person_id = %s" in count_sql
     assert "DISTINCT ON (i.canonical_movie_id)" in page_sql
+    # s.* already contains canonical_movie_id; selecting i.canonical_movie_id
+    # again gives the CTE duplicate output names and breaks its outer ORDER BY.
+    assert "i.rating, i.canonical_movie_id," not in page_sql
+    assert "i.rating," in page_sql and "AS matched_person_roles" in page_sql
     assert "ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC" in page_sql
+    assert "SELECT DISTINCT mp_roles.role" in page_sql
     assert "LIMIT %s OFFSET %s" in page_sql
     assert page_params[0] == 1061913
     assert page_params[-2:] == (100, offset)
@@ -59,6 +64,50 @@ def test_person_filmography_response_reports_full_total_and_has_more(monkeypatch
     assert payload["page_size"] == 100
     assert payload["has_more"] is True
     assert payload["items"][0]["match_evidence"]["person_id"] == "1061913"
+
+
+@pytest.mark.parametrize(
+    ("total", "rows", "page", "limit", "expected_count", "expected_has_more"),
+    [
+        (0, [], 1, 5, 0, False),                         # zero rows
+        (1, [{"canonical_movie_id": "TMDB:1", "matched_person_roles": ["actor"]}], 1, 5, 1, False),
+        (2, [{"canonical_movie_id": f"TMDB:{i}", "matched_person_roles": ["actor"]} for i in (1, 2)], 1, 5, 2, False),
+        (5, [{"canonical_movie_id": f"TMDB:{i}", "matched_person_roles": ["actor"]} for i in range(1, 6)], 1, 5, 5, False),
+        (8, [{"canonical_movie_id": f"TMDB:{i}", "matched_person_roles": ["actor"]} for i in range(1, 6)], 1, 5, 5, True),
+        (250, [{"canonical_movie_id": f"TMDB:{i}", "matched_person_roles": ["actor"]} for i in range(201, 251)], 3, 100, 50, False),
+        (6, [], 5, 2, 0, False),                           # page beyond end
+    ],
+)
+def test_person_filmography_response_page_boundaries(
+    monkeypatch, total, rows, page, limit, expected_count, expected_has_more
+):
+    monkeypatch.setattr(main, "_person_intelligence_page", lambda *args: (total, rows))
+    payload = main.search_intelligence(
+        q=None, person_id="1061913", provider=None, domain="all",
+        language=None, genre=None, year=None, page=page, limit=limit,
+    )
+    assert payload["total"] == total
+    assert payload["page"] == page
+    assert payload["page_size"] == limit
+    assert len(payload["items"]) == expected_count
+    assert payload["has_more"] is expected_has_more
+
+
+def test_person_filmography_duplicate_edges_and_multiple_roles_are_projected_once(monkeypatch):
+    captured = {"count_sql": "", "page_sql": ""}
+    monkeypatch.setattr(main, "_one", lambda sql, params=(): (captured.update(count_sql=sql) or {"total": 1}))
+    monkeypatch.setattr(main, "_rows", lambda sql, params=(): (captured.update(page_sql=sql) or [{
+        "canonical_movie_id": "TMDB:1", "title": "Example", "rating": None,
+        "poster": None, "matched_person_roles": ["actor", "director"],
+    }]))
+    total, rows = main._person_intelligence_page(1061913, "all", 1, 10, None, None, None, None)
+    assert total == 1
+    assert [row["canonical_movie_id"] for row in rows] == ["TMDB:1"]
+    assert rows[0]["matched_person_roles"] == ["actor", "director"]
+    assert rows[0]["rating"] is None and rows[0]["poster"] is None
+    assert "COUNT(DISTINCT i.canonical_movie_id)" in captured["count_sql"]
+    assert "DISTINCT ON (i.canonical_movie_id)" in captured["page_sql"]
+    assert "SELECT DISTINCT mp_roles.role" in captured["page_sql"]
 
 
 @pytest.mark.parametrize(

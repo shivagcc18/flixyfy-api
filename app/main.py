@@ -773,7 +773,7 @@ def _person_intelligence_page(
     rows = _rows(
         "WITH matched AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
         "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, i.imdb_id, "
-        "i.rating, i.canonical_movie_id, " + role_sql + " " + from_sql + " WHERE " + where
+        "i.rating, " + role_sql + " " + from_sql + " WHERE " + where
         + " ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST) "
         "SELECT * FROM matched ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, "
         "canonical_movie_id ASC LIMIT %s OFFSET %s",
