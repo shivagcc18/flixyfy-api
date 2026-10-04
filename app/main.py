@@ -755,7 +755,22 @@ def _person_intelligence_page(
     year: int | None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Count, order and page compact exact-Person movie keys before rich hydration."""
-    predicates, filter_params = _movie_predicates(domain, provider, language, year, genre)
+    if str(domain or "").strip().lower() == "all":
+        all_domain_values = tuple(
+            value.lower()
+            for requested_domain in ("current", "historical", "hollywood", "webseries")
+            for value in _domain_values(requested_domain)
+        )
+        predicates, initial_params = _movie_predicates("current", provider, language, year, genre)
+        current_domain_count = len(_domain_values("current"))
+        predicates[0] = (
+            "LOWER(COALESCE(i.domain, '')) IN ("
+            + ",".join(["%s"] * len(all_domain_values))
+            + ")"
+        )
+        filter_params = list(all_domain_values) + initial_params[current_domain_count:]
+    else:
+        predicates, filter_params = _movie_predicates(domain, provider, language, year, genre)
     where = " AND ".join(predicates)
     size = _limit(limit, cap=100)
     rows = _rows(

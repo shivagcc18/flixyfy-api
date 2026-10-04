@@ -34,6 +34,10 @@ def test_person_filmography_counts_deduplicates_and_paginates_in_sql(monkeypatch
     assert total == 0 and rows == []
     assert "person_movie_ids AS MATERIALIZED" in page_sql
     assert "WHERE person_id = %s AND canonical_movie_id IS NOT NULL" in page_sql
+    assert "LOWER(COALESCE(i.domain, '')) IN (" in page_sql
+    assert page_params[1:10] == (
+        "current", "indian", "movie", "movies", "historical", "hollywood", "global", "webseries", "series"
+    )
     assert "matched_keys AS MATERIALIZED" in page_sql
     assert "DISTINCT ON (i.canonical_movie_id)" in page_sql
     assert "total AS (SELECT COUNT(*)::bigint AS total FROM matched_keys)" in page_sql
