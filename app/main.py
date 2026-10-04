@@ -188,20 +188,38 @@ def _primary_language_ctes() -> str:
 
 def _youtube_ranked_sql(movie_filter_sql: str | None = None) -> str:
     movie_filter = f" AND {movie_filter_sql}" if movie_filter_sql else ""
+    def numeric_json_order(alias: str, field: str, direction: str) -> str:
+        value = f"to_jsonb({alias})->>'{field}'"
+        return (
+            f"CASE WHEN {value} ~ '^-?[0-9]+([.][0-9]+)?$' "
+            f"THEN ({value})::numeric END {direction} NULLS LAST"
+        )
+
+    edge_order = ", ".join((
+        numeric_json_order("edges", "selection_rank", "ASC"),
+        numeric_json_order("edges", "confidence_score", "DESC"),
+        numeric_json_order("edges", "source_priority", "ASC"),
+        "edges.video_id ASC",
+    ))
+    source_order = ", ".join((
+        "y.canonical_movie_id", "y.video_id",
+        numeric_json_order("y", "selection_rank", "ASC"),
+        numeric_json_order("y", "confidence_score", "DESC"),
+        numeric_json_order("y", "source_priority", "ASC"),
+        "to_jsonb(y)->>'audio_language_name' ASC NULLS LAST",
+        "to_jsonb(y)->>'video_url' ASC NULLS LAST",
+        "to_jsonb(y)->>'watch_url' ASC NULLS LAST",
+        "to_jsonb(y)->>'youtube_url' ASC NULLS LAST",
+    ))
     return (
         "SELECT edges.*, v.representative_title, v.representative_language_code, "
         "v.representative_language_name, v.duration_seconds AS master_duration_seconds, "
-        "ROW_NUMBER() OVER (PARTITION BY edges.canonical_movie_id ORDER BY "
-        "edges.selection_rank ASC NULLS LAST, edges.confidence_score DESC NULLS LAST, "
-        "edges.source_priority ASC NULLS LAST, edges.video_id ASC) AS serving_rank "
+        "ROW_NUMBER() OVER (PARTITION BY edges.canonical_movie_id ORDER BY " + edge_order + ") AS serving_rank "
         "FROM (SELECT DISTINCT ON (y.canonical_movie_id, y.video_id) y.* "
         f"FROM {_qi('movie_youtube_availability_v3')} y "
         f"JOIN {_qi('youtube_video_master_v3')} v ON v.video_id = y.video_id "
         "WHERE NULLIF(BTRIM(y.video_id), '') IS NOT NULL" + movie_filter + " "
-        "ORDER BY y.canonical_movie_id, y.video_id, y.selection_rank ASC NULLS LAST, "
-        "y.confidence_score DESC NULLS LAST, y.source_priority ASC NULLS LAST, "
-        "y.audio_language_name ASC NULLS LAST, y.video_url ASC NULLS LAST, "
-        "y.watch_url ASC NULLS LAST, y.youtube_url ASC NULLS LAST) edges "
+        "ORDER BY " + source_order + ") edges "
         f"JOIN {_qi('youtube_video_master_v3')} v ON v.video_id = edges.video_id"
     )
 

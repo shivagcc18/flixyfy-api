@@ -159,8 +159,8 @@ def test_youtube_serving_is_distinct_master_backed_and_capped_at_three(monkeypat
     assert "JOIN public.\"youtube_video_master_v3\" v" in sql
     assert "COALESCE(v.is_available, FALSE) IS TRUE" not in sql
     assert "serving_rank <= 3" in sql
-    assert "selection_rank ASC NULLS LAST" in sql
-    assert "confidence_score DESC NULLS LAST" in sql
+    assert "to_jsonb(y)->>'selection_rank'" in sql
+    assert "to_jsonb(edges)->>'confidence_score'" in sql
     assert "LEFT JOIN" not in sql
 
 
