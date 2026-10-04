@@ -157,7 +157,7 @@ def test_youtube_serving_is_distinct_master_backed_and_capped_at_three(monkeypat
     assert captured["params"] == ("TMDB:123",)
     assert "DISTINCT ON (y.canonical_movie_id, y.video_id)" in sql
     assert "JOIN public.\"youtube_video_master_v3\" v" in sql
-    assert "COALESCE(v.is_available, FALSE) IS TRUE" in sql
+    assert "COALESCE(v.is_available, FALSE) IS TRUE" not in sql
     assert "serving_rank <= 3" in sql
     assert "selection_rank ASC NULLS LAST" in sql
     assert "confidence_score DESC NULLS LAST" in sql

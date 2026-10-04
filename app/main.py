@@ -197,14 +197,12 @@ def _youtube_ranked_sql(movie_filter_sql: str | None = None) -> str:
         "FROM (SELECT DISTINCT ON (y.canonical_movie_id, y.video_id) y.* "
         f"FROM {_qi('movie_youtube_availability_v3')} y "
         f"JOIN {_qi('youtube_video_master_v3')} v ON v.video_id = y.video_id "
-        "AND COALESCE(v.is_available, FALSE) IS TRUE "
         "WHERE NULLIF(BTRIM(y.video_id), '') IS NOT NULL" + movie_filter + " "
         "ORDER BY y.canonical_movie_id, y.video_id, y.selection_rank ASC NULLS LAST, "
         "y.confidence_score DESC NULLS LAST, y.source_priority ASC NULLS LAST, "
         "y.audio_language_name ASC NULLS LAST, y.video_url ASC NULLS LAST, "
         "y.watch_url ASC NULLS LAST, y.youtube_url ASC NULLS LAST) edges "
-        f"JOIN {_qi('youtube_video_master_v3')} v ON v.video_id = edges.video_id "
-        "AND COALESCE(v.is_available, FALSE) IS TRUE"
+        f"JOIN {_qi('youtube_video_master_v3')} v ON v.video_id = edges.video_id"
     )
 
 
@@ -212,7 +210,6 @@ def _youtube_exists_sql(movie_alias: str = "i") -> str:
     return (
         "EXISTS (SELECT 1 FROM " + _qi("movie_youtube_availability_v3") + " y "
         "JOIN " + _qi("youtube_video_master_v3") + " v ON v.video_id = y.video_id "
-        "AND COALESCE(v.is_available, FALSE) IS TRUE "
         f"WHERE y.canonical_movie_id = {movie_alias}.canonical_movie_id "
         "AND NULLIF(BTRIM(y.video_id), '') IS NOT NULL)"
     )
