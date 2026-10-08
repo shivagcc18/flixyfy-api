@@ -775,8 +775,11 @@ def _person_intelligence_page(
     size = _limit(limit, cap=100)
     rows = _rows(
         f"WITH person_movie_ids AS MATERIALIZED ("
-        f"SELECT DISTINCT canonical_movie_id FROM {_qi('movie_people_serving_v3')} "
-        "WHERE person_id = %s AND canonical_movie_id IS NOT NULL), "
+        f"SELECT canonical_movie_id, "
+        "ARRAY_AGG(DISTINCT role) FILTER (WHERE role IS NOT NULL) AS matched_person_roles "
+        f"FROM {_qi('movie_people_serving_v3')} "
+        "WHERE person_id = %s AND canonical_movie_id IS NOT NULL "
+        "GROUP BY canonical_movie_id), "
         "matched_keys AS MATERIALIZED ("
         "SELECT DISTINCT ON (i.canonical_movie_id) i.canonical_movie_id, i.rating, s.title "
         f"FROM person_movie_ids p JOIN {_qi('movie_identity_serving_v3')} i "
@@ -790,18 +793,16 @@ def _person_intelligence_page(
         "LIMIT %s OFFSET %s), "
         "page_rows AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
         "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, i.imdb_id, i.rating, "
-        "ARRAY(SELECT DISTINCT mp_roles.role FROM "
-        f"{_qi('movie_people_serving_v3')} mp_roles "
-        "WHERE mp_roles.canonical_movie_id = pk.canonical_movie_id "
-        "AND mp_roles.person_id = %s AND mp_roles.role IS NOT NULL) AS matched_person_roles "
+        "p.matched_person_roles "
         f"FROM page_keys pk JOIN {_qi('movie_identity_serving_v3')} i "
         "ON i.canonical_movie_id = pk.canonical_movie_id "
+        "JOIN person_movie_ids p ON p.canonical_movie_id = pk.canonical_movie_id "
         f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = pk.canonical_movie_id "
         "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST) "
         "SELECT total.total, page_rows.* FROM total LEFT JOIN page_rows ON TRUE "
         "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, "
         "page_rows.canonical_movie_id ASC",
-        tuple([person_id] + filter_params + [size, _offset(page, size), person_id]),
+        tuple([person_id] + filter_params + [size, _offset(page, size)]),
     )
     total = int((rows[0] if rows else {}).get("total") or 0)
     items = [

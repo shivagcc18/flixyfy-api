@@ -33,7 +33,8 @@ def test_person_filmography_counts_deduplicates_and_paginates_in_sql(monkeypatch
     page_sql, page_params = captured["page"]
     assert total == 0 and rows == []
     assert "person_movie_ids AS MATERIALIZED" in page_sql
-    assert "WHERE person_id = %s AND canonical_movie_id IS NOT NULL" in page_sql
+    assert "WHERE person_id = %s AND canonical_movie_id IS NOT NULL GROUP BY canonical_movie_id" in page_sql
+    assert "ARRAY_AGG(DISTINCT role) FILTER (WHERE role IS NOT NULL) AS matched_person_roles" in page_sql
     assert "LOWER(COALESCE(i.domain, '')) IN (" in page_sql
     assert page_params[1:10] == (
         "current", "indian", "movie", "movies", "historical", "hollywood", "global", "webseries", "series"
@@ -43,14 +44,14 @@ def test_person_filmography_counts_deduplicates_and_paginates_in_sql(monkeypatch
     assert "total AS (SELECT COUNT(*)::bigint AS total FROM matched_keys)" in page_sql
     assert "page_keys AS (SELECT canonical_movie_id, rating, title FROM matched_keys" in page_sql
     assert "LIMIT %s OFFSET %s), page_rows AS" in page_sql
-    assert "SELECT DISTINCT mp_roles.role" in page_sql
+    assert "JOIN person_movie_ids p ON p.canonical_movie_id = pk.canonical_movie_id" in page_sql
+    assert "mp_roles" not in page_sql
     assert "s.*, i.poster, i.backdrop" in page_sql
     assert "i.rating, pk.canonical_movie_id" not in page_sql
     assert "SELECT total.total, page_rows.*" in page_sql
     assert "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, " in page_sql
     assert page_params[0] == 1061913
-    assert page_params[-3:-1] == (100, offset)
-    assert page_params[-1] == 1061913
+    assert page_params[-2:] == (100, offset)
 
 
 def test_person_filmography_response_reports_full_total_and_has_more(monkeypatch):
@@ -119,7 +120,7 @@ def test_person_filmography_duplicate_edges_and_multiple_roles_are_projected_onc
     assert rows[0]["rating"] is None and rows[0]["poster"] is None
     assert "COUNT(*)::bigint AS total FROM matched_keys" in captured["page_sql"]
     assert "DISTINCT ON (i.canonical_movie_id)" in captured["page_sql"]
-    assert "SELECT DISTINCT mp_roles.role" in captured["page_sql"]
+    assert "ARRAY_AGG(DISTINCT role) FILTER (WHERE role IS NOT NULL)" in captured["page_sql"]
 
 
 @pytest.mark.parametrize(
