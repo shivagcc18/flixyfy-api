@@ -125,11 +125,11 @@ def _provider_key(value: str | None) -> str:
 
 
 LANGUAGE_ALIASES: dict[str, tuple[str, ...]] = {
-    "as": ("as", "assamese"), "bn": ("bn", "bengali"), "bho": ("bho", "bhojpuri"),
-    "gu": ("gu", "gujarati"), "hi": ("hi", "hindi"), "kn": ("kn", "kannada"),
-    "ml": ("ml", "malayalam"), "mr": ("mr", "marathi"), "or": ("or", "odia", "oriya"),
-    "pa": ("pa", "punjabi"), "ta": ("ta", "tamil"), "te": ("te", "telugu"),
-    "ur": ("ur", "urdu"),
+    "as": ("as", "assamese", "asm"), "bn": ("bn", "bengali", "ben"), "bho": ("bho", "bhojpuri"),
+    "gu": ("gu", "gujarati", "guj"), "hi": ("hi", "hindi", "hin"), "kn": ("kn", "kannada", "kan"),
+    "ml": ("ml", "malayalam", "mal"), "mr": ("mr", "marathi", "mar"), "or": ("or", "odia", "ori", "ory", "oriya"),
+    "pa": ("pa", "punjabi", "pan"), "ta": ("ta", "tamil", "tam"), "te": ("te", "telugu", "tel"),
+    "ur": ("ur", "urdu", "urd"),
 }
 
 
@@ -148,7 +148,7 @@ def _primary_language_sql(alias: str = "i") -> str:
     raw = f"LOWER(BTRIM(COALESCE({alias}.original_language, '')))"
     cases = []
     for code, values in LANGUAGE_ALIASES.items():
-        canonical = next((value for value in values if value != code), code)
+        canonical = values[1] if len(values) > 1 else code
         for value in values:
             cases.append(f"WHEN '{value}' THEN '{canonical}'")
     return f"CASE {raw} {' '.join(cases)} ELSE NULLIF({raw}, '') END"
@@ -179,7 +179,11 @@ def _primary_language_ctes() -> str:
                         ELSE NULL END AS primary_language,
                    CASE WHEN COUNT(*) FILTER (WHERE language_rank = 1) = 1
                         THEN 'CONFIRMED' ELSE 'AMBIGUOUS' END AS language_status,
-                   MAX(movie_count) AS primary_language_movie_count
+                   MAX(movie_count) AS primary_language_movie_count,
+                   jsonb_agg(jsonb_build_object(
+                       'language', primary_language, 'movie_count', movie_count
+                   ) ORDER BY movie_count DESC, primary_language) AS languages,
+                   jsonb_object_agg(primary_language, movie_count) AS movie_count_by_language
             FROM person_language_ranked
             GROUP BY person_id
         )
@@ -1272,7 +1276,10 @@ def _people_rows(
         where.append("(LOWER(COALESCE(p.name, '')) LIKE LOWER(%s) OR LOWER(COALESCE(p.normalized_name, '')) LIKE LOWER(%s))")
         params.extend([f"%{q.strip()}%"] * 2)
     if language:
-        where.append("ppl.primary_language = ANY(%s) AND ppl.language_status = 'CONFIRMED'")
+        where.append(
+            "EXISTS (SELECT 1 FROM person_language_counts plc "
+            "WHERE plc.person_id = p.person_id AND plc.primary_language = ANY(%s))"
+        )
         params.append(list(_language_match_values(language)))
     clause = " WHERE " + " AND ".join(where)
     having = ""
@@ -1287,7 +1294,8 @@ def _people_rows(
     )
     group = (
         " GROUP BY p.person_id, p.name, p.normalized_name, p.compact_name, "
-        "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count"
+        "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count, "
+        "ppl.languages, ppl.movie_count_by_language"
     )
     total_row = _one(
         "WITH " + ctes + " SELECT COUNT(*)::bigint AS total FROM (SELECT p.person_id "
@@ -1301,6 +1309,7 @@ def _people_rows(
     rows = _rows(
         "WITH " + ctes + " SELECT p.person_id, p.name, p.normalized_name, p.compact_name, "
         "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count, "
+        "ppl.languages, ppl.movie_count_by_language, "
         "COUNT(DISTINCT p.canonical_movie_id)::bigint AS movie_count, "
         "COUNT(DISTINCT CASE WHEN y.canonical_movie_id IS NOT NULL THEN p.canonical_movie_id END)::bigint AS youtube_movie_count "
         + joins + " "
@@ -1352,7 +1361,11 @@ app.add_middleware(
 
 @app.get("/api/v1/health")
 def health() -> dict[str, Any]:
-    row = _one("SELECT current_database() AS database_name, now() AS checked_at")
+    row = _one(
+        "SELECT current_database() AS database_name, "
+        "current_setting('neon.branch_id', true) AS neon_branch_id, "
+        "current_setting('neon.endpoint_id', true) AS neon_endpoint_id, now() AS checked_at"
+    )
     return {"status": "ok", "database_connected": True, **(row or {})}
 
 
@@ -1615,6 +1628,51 @@ def _flixyfy_v4_people(page: int = 1, limit: int = 24, q: str | None = None, dom
     domain = _normalise_domain(domain)
     total, items = _people_rows(domain, page, limit, q, language, min_movies)
     return _items_payload(items, total, page, _limit(limit), domain)
+
+
+@app.get("/api/v4/people/{person_id}")
+def _flixyfy_v4_person_detail(person_id: str, limit: int = 160, language: str | None = None) -> dict[str, Any]:
+    canonical_person_id = _parse_person_id(person_id)
+    if canonical_person_id is None:
+        raise HTTPException(status_code=400, detail="person_id must be a canonical person identifier")
+    person_row = _one(
+        f"SELECT p.person_id::text AS person_id, MIN(p.name) AS name, "
+        "MIN(p.normalized_name) AS normalized_name, MIN(p.compact_name) AS compact_name, "
+        "COUNT(DISTINCT p.canonical_movie_id)::bigint AS career_attached_movie_count, "
+        "ARRAY_AGG(DISTINCT LOWER(p.role) ORDER BY LOWER(p.role)) "
+        "FILTER (WHERE p.role IS NOT NULL) AS roles "
+        f"FROM {_qi('movie_people_serving_v3')} p WHERE p.person_id = %s GROUP BY p.person_id",
+        (canonical_person_id,),
+    )
+    if not person_row:
+        raise HTTPException(status_code=404, detail="Person not found")
+    size = _limit(limit, default=160, cap=200)
+    total, items = _person_intelligence_page(
+        canonical_person_id, "all", 1, size, None, language, None, None
+    )
+    person = dict(person_row)
+    person["display_name"] = person.get("name")
+    person["person_slug"] = _person_slug(person.get("compact_name") or person.get("normalized_name") or person.get("name"))
+    person["slug"] = person["person_slug"]
+    person["roles"] = _person_roles(person.get("roles"))
+    person["movie_count"] = int(total)
+    person["primary_language_movie_count"] = int(total)
+    person["career_movie_count"] = int(person.get("career_attached_movie_count") or 0)
+    person["page_title"] = f"{person['display_name']} Movies"
+    for item in items:
+        roles = _person_roles(item.pop("matched_person_roles", None))
+        if not roles:
+            raise RuntimeError("canonical person detail missing person edge evidence")
+        item["match_evidence"] = {"person_id": str(canonical_person_id), "person_roles": roles}
+    payload = _items_payload(items, total, 1, size, "all")
+    payload.update({
+        "person": person,
+        "primary_language_movie_count": int(total),
+        "career_attached_movie_count": int(person.get("career_attached_movie_count") or 0),
+        "language": language,
+        "has_more": len(items) < total,
+    })
+    return payload
 
 
 @app.get("/api/v4/language/{language_slug}")
