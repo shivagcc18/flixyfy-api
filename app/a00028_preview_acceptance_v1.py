@@ -262,6 +262,22 @@ def run_a00028_preview_acceptance() -> dict[str, Any]:
             "wrong_person_leakage": sum(row.get("wrong_person_leakage", 0) for row in people),
             "failures": failures[:20],
         },
+        "person_crosswalk": [
+            {
+                "display_name": row.get("name"),
+                "accepted_graph_person_id": row.get("person_id"),
+                "search_person_ids": row.get("search_ids", []),
+                "people_person_ids": row.get("people_ids", []),
+                "person_detail_id": row.get("detail_id"),
+                "identity_pass": bool(row.get("identity_pass")),
+                "filmography_parity_pass": bool(row.get("parity_pass")),
+                "search_total": row.get("search_total"),
+                "person_total": row.get("person_total"),
+                "search_paginated_unique": row.get("search_paginated_unique"),
+                "person_paginated_unique": row.get("person_paginated_unique"),
+            }
+            for row in people
+        ],
         "pagination": {"long_people": long_cases, "pass": sum(1 for row in long_cases if row.get("parity_pass")), "fail": sum(1 for row in long_cases if not row.get("parity_pass"))},
         "NTR_SR": special_people["NTR_SR"],
         "INDRANS": special_people["INDRANS"],
