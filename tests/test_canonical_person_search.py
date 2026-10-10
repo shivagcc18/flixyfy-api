@@ -170,8 +170,43 @@ def test_person_search_sidecar_uses_unique_current_canonical_identity(monkeypatc
     monkeypatch.setattr(main, "_person_entity_rows", lambda query, limit: [
         {"person_id": "1001828", "display_name": "Nithiin"},
     ])
-    monkeypatch.setattr(main, "_person_search_rows", lambda *args: [{"canonical_movie_id": "TMDB:226837", "title": "Raam"}])
+    captured = {}
+
+    def page(person_id, page, limit, domain, provider, language, year):
+        captured.update(person_id=person_id, page=page, limit=limit, domain=domain)
+        return {"total": 133, "items": [{"canonical_movie_id": "TMDB:226837", "match_evidence": {"person_id": person_id}}]}
+
+    monkeypatch.setattr(main, "_canonical_person_alias_page", page)
 
     payload = main._v4_search("Nithiin", 1, 5, None, None, None, None)
 
+    assert payload["person_resolution"]["resolved_person_ids"] == ["1001828"]
+    assert captured == {"person_id": "1001828", "page": 1, "limit": 5, "domain": "all"}
+    assert payload["total"] == 133
+
+
+def test_person_search_sidecar_uses_live_graph_pagination_after_identity_resolution(monkeypatch):
+    from app.search_sidecar_v1 import PersonSearch
+
+    result = PersonSearch(
+        query="Nithiin", normalized_alias="nithiin", provider=None, person_ids=("1001828",),
+        person_names=("Nithiin",), canonical_movie_ids=tuple(f"TMDB:{i}" for i in range(133)), ambiguous=False,
+    )
+    monkeypatch.setattr(main, "resolve_person_search", lambda *args: result)
+    monkeypatch.setattr(main, "_person_entity_rows", lambda query, limit: [
+        {"person_id": "1001828", "display_name": "Nithiin"},
+    ])
+    captured = {}
+
+    def page(person_id, page, limit, domain, provider, language, year):
+        captured.update(person_id=person_id, page=page, limit=limit, domain=domain)
+        return {"total": 133, "items": [{"canonical_movie_id": "TMDB:101"}]}
+
+    monkeypatch.setattr(main, "_canonical_person_alias_page", page)
+    monkeypatch.setattr(main, "_person_search_rows", lambda *args: pytest.fail("bounded sidecar rows must not serve paged filmography"))
+
+    payload = main._v4_search("Nithiin", 2, 100, None, None, None, None)
+
+    assert captured == {"person_id": "1001828", "page": 2, "limit": 100, "domain": "all"}
+    assert payload["total"] == 133
     assert payload["person_resolution"]["resolved_person_ids"] == ["1001828"]

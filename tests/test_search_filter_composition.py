@@ -3,17 +3,17 @@ import app.main as main
 
 def test_language_aliases_are_case_insensitive_for_codes_and_names():
     for value, expected in (
-        ("te", ("te", "telugu")),
-        ("Te", ("te", "telugu")),
-        ("TELUGU", ("te", "telugu")),
-        ("tElUgU", ("te", "telugu")),
-        ("TA", ("ta", "tamil")),
-        ("Tamil", ("ta", "tamil")),
-        ("HI", ("hi", "hindi")),
-        ("Malayalam", ("ml", "malayalam")),
-        ("Kn", ("kn", "kannada")),
-        ("BENGALI", ("bn", "bengali")),
-        ("Mr", ("mr", "marathi")),
+        ("te", ("te", "telugu", "tel")),
+        ("Te", ("te", "telugu", "tel")),
+        ("TELUGU", ("te", "telugu", "tel")),
+        ("tElUgU", ("te", "telugu", "tel")),
+        ("TA", ("ta", "tamil", "tam")),
+        ("Tamil", ("ta", "tamil", "tam")),
+        ("HI", ("hi", "hindi", "hin")),
+        ("Malayalam", ("ml", "malayalam", "mal")),
+        ("Kn", ("kn", "kannada", "kan")),
+        ("BENGALI", ("bn", "bengali", "ben")),
+        ("Mr", ("mr", "marathi", "mar")),
     ):
         assert main._language_match_values(value) == expected
 
@@ -24,7 +24,7 @@ def test_telugu_aliases_use_identity_and_language_relation_fallbacks():
 
     assert "i.original_language" in sql
     assert "movie_language_serving_v3" in sql
-    assert params[-4:] == [["te", "telugu"]] * 4
+    assert params[-4:] == [["te", "telugu", "tel"]] * 4
 
 
 def test_language_provider_year_predicates_are_composed_with_and():
@@ -39,7 +39,7 @@ def test_language_provider_year_predicates_are_composed_with_and():
     assert sql.count("EXISTS") >= 2
     assert "i.release_year = %s" in sql
     assert "p.provider_key" in sql
-    assert params[-6:] == [["te", "telugu"], ["te", "telugu"], ["te", "telugu"], ["te", "telugu"], 2024, "vi_movies_and_tv"]
+    assert params[-6:] == [["te", "telugu", "tel"], ["te", "telugu", "tel"], ["te", "telugu", "tel"], ["te", "telugu", "tel"], 2024, "vi_movies_and_tv"]
 
 
 def test_empty_structured_search_delegates_to_movie_rows(monkeypatch):

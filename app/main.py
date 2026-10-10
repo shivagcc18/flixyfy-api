@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from datetime import date
 from contextlib import asynccontextmanager
 from typing import Any, Literal
@@ -1315,8 +1316,7 @@ def _people_rows(
         params.extend([f"%{q.strip()}%"] * 2)
     if language:
         where.append(
-            "EXISTS (SELECT 1 FROM person_language_counts plc "
-            "WHERE plc.person_id = p.person_id AND plc.primary_language = ANY(%s))"
+            "ppl.language_status = 'CONFIRMED' AND ppl.primary_language = ANY(%s)"
         )
         params.append(list(_language_match_values(language)))
     clause = " WHERE " + " AND ".join(where)
@@ -1404,7 +1404,14 @@ def health() -> dict[str, Any]:
         "current_setting('neon.branch_id', true) AS neon_branch_id, "
         "current_setting('neon.endpoint_id', true) AS neon_endpoint_id, now() AS checked_at"
     )
-    return {"status": "ok", "database_connected": True, **(row or {})}
+    payload = {"status": "ok", "database_connected": True, **(row or {})}
+    environment = (os.environ.get("VERCEL_ENV") or os.environ.get("FLIXYFY_RUNTIME_ENV") or "").strip().casefold()
+    if environment == "preview":
+        binding = os.environ.get("FLIXYFY_PERSON_SIDECAR_RUNTIME_BINDING")
+        if not binding:
+            raise RuntimeError("Preview Person sidecar binding was not initialized")
+        payload["person_search_sidecar"] = json.loads(binding)
+    return payload
 
 
 @app.get("/api/v1/content")
@@ -1594,7 +1601,16 @@ def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provide
             if len(exact_ids) > 1 or not set(sidecar.person_ids).issubset(exact_ids):
                 sidecar = None
     if sidecar is not None:
-        items = _person_search_rows(sidecar, current_domain if domain else "all", 100, language, year)
+        # Search and Person detail must page the same live canonical graph. The
+        # sidecar resolves identity; using its bounded movie list as the serving
+        # page would truncate long filmographies at 100 rows and lose parity.
+        if len(sidecar.person_ids) == 1:
+            payload = _canonical_person_alias_page(
+                sidecar.person_ids[0], page, limit, domain or "all", provider, language, year,
+            )
+            payload["person_resolution"] = search_metadata(sidecar)
+            return payload
+        items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year, sort)
         start = _offset(page, _limit(limit))
         payload = _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
         payload["person_resolution"] = search_metadata(sidecar)
@@ -1607,6 +1623,15 @@ def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provide
 @app.get("/api/v4/health")
 def _flixyfy_v4_health() -> dict[str, Any]:
     return health()
+
+
+@app.get("/api/v4/preview/a00028/person-runtime-acceptance")
+def _flixyfy_preview_a00028_person_runtime_acceptance() -> dict[str, Any]:
+    if (os.environ.get("VERCEL_ENV") or "").strip().casefold() != "preview":
+        raise HTTPException(status_code=404, detail="Not found")
+    from app.a00028_preview_acceptance_v1 import run_a00028_preview_acceptance
+
+    return run_a00028_preview_acceptance()
 
 
 @app.get("/api/v4/providers")

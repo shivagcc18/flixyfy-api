@@ -1,0 +1,18 @@
+{
+  "checkpoint": "FLIXYFY_A00028_PERSON_ALIAS_AUTHORITY_SYSTEMIC_RECONCILIATION_V10",
+  "source_path": "reports/_ACTIVE_CONTROL/a00028_person_alias_authority_systemic_reconciliation_v10/20261010_214000/A00028_PERSON_ALIAS_AUTHORITY_RECONCILED_CANDIDATE_V10.db",
+  "source_size": 149118976,
+  "source_sha256": "88b97fd2ce6a0b8c4d4b934a1210691e1097e770f5888a419d4c65138e230fa2",
+  "accepted_person_identities": 86539,
+  "accepted_person_edges": 354829,
+  "resolver_rows": 93371,
+  "runtime_destination": "${TMPDIR}/flixyfy_person_search_sidecar_v10.db",
+  "compressed_artifact": "runtime_assets/flixyfy_person_search_sidecar_v10.db.gz",
+  "compressed_size": 40599314,
+  "compressed_sha256": "f92d13b0fdf71ac4494129b4fcad1367a9538b3e7c9951631a4bedc464402763",
+  "gzip_deterministic": true,
+  "decompressed_sha256_verified": true,
+  "sqlite_integrity_verified": true,
+  "top100_acceptance_path": "runtime_assets/A00028_TOP100_CANDIDATE_ACCEPTANCE_V10.json",
+  "top100_acceptance_sha256": "4c5e37f91c0acb64e3a5b4791ae0b26ebcb573b11b8d20bcf1b574f288c12974"
+}
