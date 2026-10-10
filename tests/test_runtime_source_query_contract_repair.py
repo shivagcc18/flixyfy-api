@@ -106,14 +106,14 @@ def test_person_filmography_counts_deduplicates_and_paginates_in_sql(monkeypatch
     assert "matched_keys AS MATERIALIZED" in page_sql
     assert "DISTINCT ON (i.canonical_movie_id)" in page_sql
     assert "total AS (SELECT COUNT(*)::bigint AS total FROM matched_keys)" in page_sql
-    assert "page_keys AS (SELECT canonical_movie_id, rating, title FROM matched_keys" in page_sql
+    assert "page_keys AS (SELECT canonical_movie_id, rating, release_year, release_date, title FROM matched_keys" in page_sql
     assert "LIMIT %s OFFSET %s), page_rows AS" in page_sql
     assert "JOIN person_movie_ids p ON p.canonical_movie_id = pk.canonical_movie_id" in page_sql
     assert "mp_roles" not in page_sql
     assert "s.*, i.poster, i.backdrop" in page_sql
     assert "i.rating, pk.canonical_movie_id" not in page_sql
     assert "SELECT total.total, page_rows.*" in page_sql
-    assert "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, " in page_sql
+    assert "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.sort_release_year DESC NULLS LAST, " in page_sql
     assert page_params[0] == 1061913
     assert page_params[-2:] == (100, offset)
 

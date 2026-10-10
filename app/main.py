@@ -820,8 +820,31 @@ def _person_intelligence_page(
     genre: str | None,
     year: int | None,
     offset: int | None = None,
+    sort: str | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Count, order and page compact exact-Person movie keys before rich hydration."""
+    selected_sort = (sort or "popular").strip().lower()
+    person_sort_orders = {
+        "popular": (
+            "rating DESC NULLS LAST, release_year DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC",
+            "page_rows.rating DESC NULLS LAST, page_rows.sort_release_year DESC NULLS LAST, page_rows.title ASC NULLS LAST, page_rows.canonical_movie_id ASC",
+        ),
+        "newest": (
+            "release_date DESC NULLS LAST, release_year DESC NULLS LAST, rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC",
+            "page_rows.sort_release_date DESC NULLS LAST, page_rows.sort_release_year DESC NULLS LAST, page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, page_rows.canonical_movie_id ASC",
+        ),
+        "oldest": (
+            "release_year ASC NULLS LAST, rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC",
+            "page_rows.sort_release_year ASC NULLS LAST, page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, page_rows.canonical_movie_id ASC",
+        ),
+        "title": (
+            "title ASC NULLS LAST, release_year DESC NULLS LAST, canonical_movie_id ASC",
+            "page_rows.title ASC NULLS LAST, page_rows.sort_release_year DESC NULLS LAST, page_rows.canonical_movie_id ASC",
+        ),
+    }
+    order_by = person_sort_orders.get(selected_sort)
+    if order_by is None:
+        raise HTTPException(status_code=400, detail="sort must be one of popular, newest, oldest, title")
     if str(domain or "").strip().lower() == "all":
         all_domain_values = tuple(
             value.lower()
@@ -838,6 +861,8 @@ def _person_intelligence_page(
         filter_params = list(all_domain_values) + initial_params[current_domain_count:]
     else:
         predicates, filter_params = _movie_predicates(domain, provider, language, year, genre)
+    if selected_sort == "newest":
+        _require_canonical_release_dates("i", predicates, filter_params, include_search_documents=True)
     where = " AND ".join(predicates)
     size = _limit(limit, cap=100)
     rows = _rows(
@@ -848,18 +873,19 @@ def _person_intelligence_page(
         "WHERE person_id = %s AND canonical_movie_id IS NOT NULL "
         "GROUP BY canonical_movie_id), "
         "matched_keys AS MATERIALIZED ("
-        "SELECT DISTINCT ON (i.canonical_movie_id) i.canonical_movie_id, i.rating, s.title "
+        "SELECT DISTINCT ON (i.canonical_movie_id) i.canonical_movie_id, i.rating, i.release_year, i.release_date, s.title "
         f"FROM person_movie_ids p JOIN {_qi('movie_identity_serving_v3')} i "
         "ON i.canonical_movie_id = p.canonical_movie_id "
         f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = i.canonical_movie_id "
         f"WHERE {where} "
-        "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST), "
+        "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, i.release_year DESC NULLS LAST, s.title ASC NULLS LAST), "
         "total AS (SELECT COUNT(*)::bigint AS total FROM matched_keys), "
-        "page_keys AS (SELECT canonical_movie_id, rating, title FROM matched_keys "
-        "ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC "
+        "page_keys AS (SELECT canonical_movie_id, rating, release_year, release_date, title FROM matched_keys "
+        "ORDER BY " + order_by[0] + " "
         "LIMIT %s OFFSET %s), "
         "page_rows AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
-        "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, i.imdb_id, i.rating, "
+        "i.original_language, i.release_year, i.release_date AS sort_release_date, "
+        "i.release_year AS sort_release_year, i.domain, i.tmdb_id, i.imdb_id, i.rating, "
         "p.matched_person_roles "
         f"FROM page_keys pk JOIN {_qi('movie_identity_serving_v3')} i "
         "ON i.canonical_movie_id = pk.canonical_movie_id "
@@ -867,8 +893,7 @@ def _person_intelligence_page(
         f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = pk.canonical_movie_id "
         "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST) "
         "SELECT total.total, page_rows.* FROM total LEFT JOIN page_rows ON TRUE "
-        "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, "
-        "page_rows.canonical_movie_id ASC",
+        "ORDER BY " + order_by[1],
         tuple([person_id] + filter_params + [size, max(0, offset) if offset is not None else _offset(page, size)]),
     )
     total = int((rows[0] if rows else {}).get("total") or 0)
@@ -1604,12 +1629,13 @@ def search_intelligence(
     year: int | None = None,
     page: int = Query(1, ge=1),
     limit: int = Query(24, ge=1, le=100),
+    sort: str | None = None,
 ) -> dict[str, Any]:
     canonical_person_id = _parse_person_id(person_id)
     size = _limit(limit, cap=100)
     if canonical_person_id is not None:
         total, visible = _person_intelligence_page(
-            canonical_person_id, domain, page, size, provider, language, genre, year
+            canonical_person_id, domain, page, size, provider, language, genre, year, None, sort
         )
     else:
         items = _search_intelligence_rows(q, domain, size, provider, None, language, genre, year)
