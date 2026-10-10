@@ -886,8 +886,9 @@ def _person_intelligence_page(
         "page_rows AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
         "i.original_language, i.release_year, i.release_date AS sort_release_date, "
         "i.release_year AS sort_release_year, i.domain, i.tmdb_id, i.imdb_id, i.rating, "
-        "p.matched_person_roles "
-        f"FROM page_keys pk JOIN {_qi('movie_identity_serving_v3')} i "
+        "p.matched_person_roles, "
+        + _movie_availability_projection("i")
+        + f"FROM page_keys pk JOIN {_qi('movie_identity_serving_v3')} i "
         "ON i.canonical_movie_id = pk.canonical_movie_id "
         "JOIN person_movie_ids p ON p.canonical_movie_id = pk.canonical_movie_id "
         f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = pk.canonical_movie_id "
