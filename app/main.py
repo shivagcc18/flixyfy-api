@@ -880,6 +880,113 @@ def _person_intelligence_page(
     return total, items
 
 
+def _person_combination_page(
+    person_ids: list[int],
+    roles: list[str] | None,
+    domain: str,
+    page: int,
+    limit: int,
+    provider: str | None,
+    language: str | None,
+    genre: str | None,
+    year: int | None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Return movies credited to every selected canonical person ID."""
+    predicates, filter_params = _movie_predicates(domain, provider, language, year, genre)
+    selected_values = ", ".join(["(%s::bigint, %s::text)"] * len(person_ids))
+    selected_params: list[Any] = []
+    for index, person_id in enumerate(person_ids):
+        selected_params.extend([person_id, roles[index] if roles else None])
+    where = " AND ".join([*predicates, "i.canonical_movie_id IS NOT NULL"])
+    size = _limit(limit, cap=100)
+    rows = _rows(
+        "WITH selected_people(person_id, required_role) AS (VALUES " + selected_values + "), "
+        f"person_edges AS MATERIALIZED (SELECT e.canonical_movie_id, e.person_id::text AS person_id, "
+        "ARRAY_AGG(DISTINCT LOWER(BTRIM(e.role)) ORDER BY LOWER(BTRIM(e.role))) "
+        "FILTER (WHERE e.role IS NOT NULL AND BTRIM(e.role) <> '') AS roles "
+        f"FROM {_qi('movie_people_serving_v3')} e JOIN selected_people sp "
+        "ON e.person_id = sp.person_id "
+        "WHERE e.canonical_movie_id IS NOT NULL "
+        "AND (sp.required_role IS NULL OR LOWER(BTRIM(e.role)) = sp.required_role) "
+        "GROUP BY e.canonical_movie_id, e.person_id), "
+        "matched_keys AS MATERIALIZED (SELECT i.canonical_movie_id, i.rating, s.title, "
+        "JSONB_OBJECT_AGG(pe.person_id, pe.roles) AS person_roles_by_id "
+        f"FROM person_edges pe JOIN {_qi('movie_identity_serving_v3')} i "
+        "ON i.canonical_movie_id = pe.canonical_movie_id "
+        f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = i.canonical_movie_id "
+        f"WHERE {where} GROUP BY i.canonical_movie_id, i.rating, s.title "
+        "HAVING COUNT(DISTINCT pe.person_id) = %s), "
+        "total AS (SELECT COUNT(DISTINCT canonical_movie_id)::bigint AS total FROM matched_keys), "
+        "page_keys AS (SELECT DISTINCT ON (canonical_movie_id) canonical_movie_id, rating, title, person_roles_by_id "
+        "FROM matched_keys ORDER BY canonical_movie_id, rating DESC NULLS LAST, title ASC NULLS LAST), "
+        "selected_page AS (SELECT * FROM page_keys ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC LIMIT %s OFFSET %s), "
+        "page_rows AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
+        "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, i.imdb_id, i.rating, "
+        "sp.person_roles_by_id "
+        f"FROM selected_page sp JOIN {_qi('movie_identity_serving_v3')} i "
+        "ON i.canonical_movie_id = sp.canonical_movie_id "
+        f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = sp.canonical_movie_id "
+        "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST) "
+        "SELECT total.total, page_rows.* FROM total LEFT JOIN page_rows ON TRUE "
+        "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, page_rows.canonical_movie_id ASC",
+        tuple(selected_params + filter_params + [len(person_ids), size, _offset(page, size)]),
+    )
+    total = int((rows[0] if rows else {}).get("total") or 0)
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("canonical_movie_id") is None:
+            continue
+        item = _normalise_movie(row)
+        raw_evidence = row.get("person_roles_by_id") or {}
+        if isinstance(raw_evidence, str):
+            try:
+                raw_evidence = json.loads(raw_evidence)
+            except (TypeError, ValueError):
+                raise RuntimeError("combination result has invalid person edge evidence")
+        if not isinstance(raw_evidence, dict):
+            raise RuntimeError("combination result has invalid person edge evidence")
+        evidence: dict[str, list[str]] = {}
+        for person_id in person_ids:
+            observed = raw_evidence.get(str(person_id))
+            if isinstance(observed, str):
+                observed = [observed]
+            exact_roles = sorted({str(value).strip().lower() for value in (observed or []) if str(value).strip()})
+            if not exact_roles:
+                raise RuntimeError("combination result missing selected person edge evidence")
+            evidence[str(person_id)] = exact_roles
+        item["match_evidence"] = {"people": evidence}
+        if provider:
+            item["match_evidence"]["provider_key"] = _provider_key(provider)
+            item["match_evidence"]["provider_confirmed"] = True
+        output.append(item)
+    return total, output
+
+
+def _parse_combination_person_ids(values: list[str] | None) -> list[int]:
+    if values is None or not 2 <= len(values) <= 8:
+        raise HTTPException(status_code=400, detail="person_id must contain 2 to 8 canonical IDs")
+    parsed: list[int] = []
+    for value in values:
+        person_id = _parse_person_id(value)
+        if person_id is None or person_id <= 0 or person_id > 9_223_372_036_854_775_807 or str(person_id) != str(value).strip():
+            raise HTTPException(status_code=400, detail="person_id values must be canonical numeric identifiers")
+        parsed.append(person_id)
+    if len(set(parsed)) != len(parsed):
+        raise HTTPException(status_code=400, detail="person_id values must be unique")
+    return parsed
+
+
+def _parse_combination_roles(values: list[str] | None, count: int) -> list[str] | None:
+    if values is None:
+        return None
+    if len(values) != count:
+        raise HTTPException(status_code=400, detail="role must align one-to-one with person_id")
+    roles = [str(value).strip().lower() for value in values]
+    if any(not value or len(value) > 40 or not re.fullmatch(r"[a-z][a-z0-9_ -]*", value) for value in roles):
+        raise HTTPException(status_code=400, detail="role values must be exact non-empty role labels")
+    return roles
+
+
 def _parse_person_id(value: str | None) -> int | None:
     if value is None or not str(value).strip():
         return None
@@ -1525,6 +1632,33 @@ def search_intelligence(
         item["match_evidence"] = evidence
     payload = _items_payload(visible, total, page, size, domain if domain != "all" else None)
     payload["has_more"] = _offset(page, size) + len(visible) < total
+    return payload
+
+
+@app.get("/api/v1/search/intelligence/combination")
+def search_intelligence_combination(
+    person_id: list[str] = Query(...),
+    role: list[str] | None = Query(None),
+    provider: str | None = Query(None, max_length=80),
+    domain: SearchDomain = "all",
+    language: str | None = Query(None, max_length=40),
+    genre: str | None = Query(None, max_length=80),
+    year: int | None = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(24, ge=1, le=100),
+) -> dict[str, Any]:
+    canonical_ids = _parse_combination_person_ids(person_id)
+    exact_roles = _parse_combination_roles(role, len(canonical_ids))
+    size = _limit(limit, cap=100)
+    total, items = _person_combination_page(
+        canonical_ids, exact_roles, domain, page, size, provider, language, genre, year,
+    )
+    payload = _items_payload(items, total, page, size, domain if domain != "all" else None)
+    payload.update({
+        "has_more": _offset(page, size) + len(items) < total,
+        "person_ids": [str(value) for value in canonical_ids],
+        "roles": exact_roles,
+    })
     return payload
 
 
