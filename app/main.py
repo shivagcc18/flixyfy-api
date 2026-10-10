@@ -108,11 +108,13 @@ def _normalise_domain(value: str | None) -> str:
         "global_movies": "hollywood",
     }
     value = str(value or "current").strip().lower()
-    return aliases.get(value, value if value in {"current", "historical", "hollywood", "webseries"} else "current")
+    return aliases.get(value, value if value in {"all", "current", "historical", "hollywood", "webseries"} else "current")
 
 
 def _domain_values(domain: str) -> tuple[str, ...]:
     domain = _normalise_domain(domain)
+    if domain == "all":
+        return ("current", "historical", "hollywood", "webseries")
     if domain == "current":
         return ("current", "indian", "movie", "movies")
     if domain == "historical":
@@ -691,20 +693,42 @@ def _person_entity_payload(row: dict[str, Any], query: str) -> dict[str, Any]:
     return payload
 
 
-def _person_entity_rows_by_id(person_id: str) -> list[dict[str, Any]]:
+def _person_entity_rows_by_id(
+    person_id: str, domain: str = "all", language: str | None = None,
+    min_movies: int | None = None,
+) -> list[dict[str, Any]]:
     """Build one compact card from the serving graph for an exact canonical ID."""
     relation = _qi("movie_people_serving_v3")
+    domains = _domain_values(domain)
+    where = [
+        "p.person_id::text = %s",
+        f"LOWER(COALESCE(i.domain, '')) IN ({','.join(['%s'] * len(domains))})",
+    ]
+    params: list[Any] = [str(person_id), *(value.lower() for value in domains)]
+    if language:
+        where.append("ppl.language_status = 'CONFIRMED' AND ppl.primary_language = ANY(%s)")
+        params.append(list(_language_match_values(language)))
+    having = " HAVING COUNT(DISTINCT p.canonical_movie_id) >= %s" if min_movies is not None else ""
+    if min_movies is not None:
+        params.append(int(min_movies))
     return _rows(
-        f"SELECT person_id, MIN(NULLIF(BTRIM(name), '')) AS display_name, "
-        "ARRAY_AGG(DISTINCT NULLIF(BTRIM(name), '') ORDER BY NULLIF(BTRIM(name), '')) "
-        "FILTER (WHERE NULLIF(BTRIM(name), '') IS NOT NULL) AS aliases, "
-        "ARRAY_AGG(DISTINCT LOWER(NULLIF(BTRIM(role), '')) ORDER BY LOWER(NULLIF(BTRIM(role), ''))) "
-        "FILTER (WHERE NULLIF(BTRIM(role), '') IS NOT NULL) AS roles, "
-        "COUNT(DISTINCT canonical_movie_id)::bigint AS movie_count, "
-        "COUNT(*) OVER()::bigint AS total_matches "
-        f"FROM {relation} WHERE person_id::text = %s "
-        "GROUP BY person_id ORDER BY person_id LIMIT 1",
-        (str(person_id),),
+        "WITH " + _primary_language_ctes() + " "
+        f"SELECT p.person_id, MIN(NULLIF(BTRIM(p.name), '')) AS display_name, "
+        "ARRAY_AGG(DISTINCT NULLIF(BTRIM(p.name), '') ORDER BY NULLIF(BTRIM(p.name), '')) "
+        "FILTER (WHERE NULLIF(BTRIM(p.name), '') IS NOT NULL) AS aliases, "
+        "ARRAY_AGG(DISTINCT LOWER(NULLIF(BTRIM(p.role), '')) ORDER BY LOWER(NULLIF(BTRIM(p.role), ''))) "
+        "FILTER (WHERE NULLIF(BTRIM(p.role), '') IS NOT NULL) AS roles, "
+        "COUNT(DISTINCT p.canonical_movie_id)::bigint AS movie_count, "
+        "ppl.primary_language, ppl.language_status, ppl.primary_language_movie_count, "
+        "ppl.languages, ppl.movie_count_by_language "
+        f"FROM {relation} p "
+        f"JOIN {_qi('movie_identity_serving_v3')} i ON i.canonical_movie_id = p.canonical_movie_id "
+        "LEFT JOIN person_primary_language ppl ON ppl.person_id = p.person_id "
+        "WHERE " + " AND ".join(where) + " "
+        "GROUP BY p.person_id, ppl.primary_language, ppl.language_status, "
+        "ppl.primary_language_movie_count, ppl.languages, ppl.movie_count_by_language"
+        + having + " ORDER BY p.person_id LIMIT 1",
+        tuple(params),
     )
 
 
@@ -1570,6 +1594,55 @@ def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provide
     if not q:
         total, items = _movie_rows(current_domain, page, limit, provider, language, year, sort)
         return _items_payload(items, total, page, _limit(limit), current_domain)
+    preview_runtime = (os.environ.get("VERCEL_ENV") or "").strip().casefold() == "preview"
+    if preview_runtime:
+        # The V10 sidecar is the Preview identity authority. Resolve it before
+        # the older Preview crosswalk, which can still contain stale or broader
+        # same-name candidates. Confirm a unique target by exact live Person ID
+        # and serving name; never turn a missing/stale target into a selection.
+        sidecar = resolve_person_search(q, provider)
+        if sidecar is not None:
+            metadata = search_metadata(sidecar)
+            if len(sidecar.person_ids) == 1 and not sidecar.ambiguous:
+                person_id = sidecar.person_ids[0]
+                live_rows = _person_entity_rows_by_id(person_id)
+                live_names = {
+                    _person_query_forms(str(name))[1]
+                    for row in live_rows
+                    for name in [row.get("display_name"), *(row.get("aliases") or [])]
+                    if name
+                }
+                candidate_name = next(iter(sidecar.person_names), "")
+                if live_rows and candidate_name and _person_query_forms(candidate_name)[1] in live_names:
+                    payload = _canonical_person_alias_page(
+                        person_id, page, limit, domain or "all", provider, language, year,
+                    )
+                    payload["person_resolution"] = metadata
+                    return payload
+                metadata["outcome"] = "STALE_OR_UNVERIFIED_TARGET"
+                metadata["canonical_person_id"] = None
+                metadata["ambiguous"] = False
+                metadata["resolved_person_ids"] = []
+                metadata["candidate_person_ids"] = []
+            # Preserve ambiguity and unsupported behavior. The V10 candidate
+            # remains authoritative for Preview auto-selection.
+            items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year, sort)
+            start = _offset(page, _limit(limit))
+            payload = _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
+            payload["person_resolution"] = metadata
+            return payload
+        alias_resolution = resolve_preview_person_alias(q)
+        if alias_resolution is not None:
+            metadata = alias_resolution_metadata(alias_resolution)
+            if alias_resolution.outcome == "AMBIGUOUS":
+                items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year, sort)
+                start = _offset(page, _limit(limit))
+                payload = _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
+                payload["person_resolution"] = metadata
+                return payload
+        items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year, sort)
+        start = _offset(page, _limit(limit))
+        return _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
     alias_resolution = resolve_preview_person_alias(q)
     if alias_resolution is not None:
         metadata = alias_resolution_metadata(alias_resolution)
@@ -1743,6 +1816,14 @@ def _flixyfy_v4_historical_people(page: int = 1, limit: int = 24, q: str | None 
 @app.get("/api/v4/people")
 def _flixyfy_v4_people(page: int = 1, limit: int = 24, q: str | None = None, domain: str | None = None, language: str | None = None, min_movies: int | None = None, tier: str | None = None) -> dict[str, Any]:
     domain = _normalise_domain(domain)
+    if (os.environ.get("VERCEL_ENV") or "").strip().casefold() == "preview" and q:
+        sidecar = resolve_person_search(q)
+        if sidecar is not None and len(sidecar.person_ids) == 1 and not sidecar.ambiguous:
+            rows = _person_entity_rows_by_id(sidecar.person_ids[0], domain, language, min_movies)
+            if rows:
+                item = _person_entity_payload(rows[0], q)
+                return _items_payload([item] if page == 1 else [], 1, page, _limit(limit), domain)
+            return _items_payload([], 0, page, _limit(limit), domain)
     total, items = _people_rows(domain, page, limit, q, language, min_movies)
     return _items_payload(items, total, page, _limit(limit), domain)
 
