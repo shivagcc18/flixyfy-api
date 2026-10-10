@@ -137,3 +137,41 @@ def test_missing_evidence_cannot_be_published(monkeypatch):
             limit=24,
         )
 
+
+
+def test_person_search_sidecar_fails_closed_for_duplicate_current_canonical_identities(monkeypatch):
+    from app.search_sidecar_v1 import PersonSearch
+
+    result = PersonSearch(
+        query="ANR", normalized_alias="anr", provider=None, person_ids=("6192119",),
+        person_names=("Akkineni Nageswara Rao",), canonical_movie_ids=("TMDB:1",), ambiguous=False,
+    )
+    monkeypatch.setattr(main, "resolve_person_search", lambda *args: result)
+    monkeypatch.setattr(main, "_person_entity_rows", lambda query, limit: [
+        {"person_id": "237254", "display_name": "Akkineni Nageswara Rao"},
+        {"person_id": "6192119", "display_name": "Akkineni Nageswara Rao"},
+    ])
+    monkeypatch.setattr(main, "_search_rows", lambda *args: [])
+    monkeypatch.setattr(main, "_person_search_rows", lambda *args: pytest.fail("stale sidecar must not select a duplicate identity"))
+
+    payload = main._v4_search("ANR", 1, 5, None, None, None, None)
+
+    assert "person_resolution" not in payload
+
+
+def test_person_search_sidecar_uses_unique_current_canonical_identity(monkeypatch):
+    from app.search_sidecar_v1 import PersonSearch
+
+    result = PersonSearch(
+        query="Nithiin", normalized_alias="nithiin", provider=None, person_ids=("1001828",),
+        person_names=("Nithiin",), canonical_movie_ids=("TMDB:226837",), ambiguous=False,
+    )
+    monkeypatch.setattr(main, "resolve_person_search", lambda *args: result)
+    monkeypatch.setattr(main, "_person_entity_rows", lambda query, limit: [
+        {"person_id": "1001828", "display_name": "Nithiin"},
+    ])
+    monkeypatch.setattr(main, "_person_search_rows", lambda *args: [{"canonical_movie_id": "TMDB:226837", "title": "Raam"}])
+
+    payload = main._v4_search("Nithiin", 1, 5, None, None, None, None)
+
+    assert payload["person_resolution"]["resolved_person_ids"] == ["1001828"]

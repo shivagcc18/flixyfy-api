@@ -1,6 +1,70 @@
+import json
+from pathlib import Path
+
 import pytest
 
 import app.main as main
+
+
+_PERSON_PAGINATION_FIXTURE = json.loads(
+    (Path(__file__).parent / "fixtures" / "person_pagination_contract.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", _PERSON_PAGINATION_FIXTURE["cases"], ids=lambda case: case["query"])
+def test_exact_person_detail_pagination_matches_current_accepted_movie_id_set(monkeypatch, case):
+    movie_ids = case["movie_ids"]
+    total = case["reported_total"]
+    assert len(movie_ids) == total
+    assert len(set(movie_ids)) == total
+
+    monkeypatch.setattr(main, "_parse_person_id", lambda value: int(value))
+    monkeypatch.setattr(main, "_one", lambda *args: {
+        "person_id": case["canonical_person_id"],
+        "name": case["canonical_name"],
+        "normalized_name": case["canonical_name"].casefold(),
+        "compact_name": "".join(case["canonical_name"].casefold().split()),
+        "career_attached_movie_count": total,
+        "roles": ["actor"],
+    })
+
+    def accepted_page(person_id, domain, page, limit, provider, language, genre, year, offset=None):
+        start = offset if offset is not None else (page - 1) * limit
+        keys = movie_ids[start:start + limit]
+        return total, [{
+            "canonical_movie_id": key,
+            "title": key,
+            "matched_person_roles": ["actor"],
+        } for key in keys]
+
+    monkeypatch.setattr(main, "_person_intelligence_page", accepted_page)
+    page = 1
+    items = []
+    page_ids = []
+    while True:
+        payload = main._flixyfy_v4_person_detail(case["canonical_person_id"], page=page, limit=100)
+        current_ids = [item["canonical_movie_id"] for item in payload["items"]]
+        page_ids.append(current_ids)
+        items.extend(current_ids)
+        assert payload["canonical_person_id"] == case["canonical_person_id"]
+        assert payload["total"] == total
+        assert payload["offset"] == (page - 1) * 100
+        assert payload["returned"] == len(current_ids)
+        if not payload["has_more"]:
+            assert payload["next_offset"] is None
+            break
+        assert payload["next_offset"] == page * 100
+        page += 1
+
+    assert len(items) == total
+    assert len(set(items)) == total
+    assert len(items) - len(set(items)) == 0
+    if total > 100:
+        assert len(page_ids) > 1
+        assert page_ids[0] != page_ids[1]
+    else:
+        assert len(page_ids) == 1
+        assert page_ids[0] == movie_ids
 
 
 def test_person_language_uses_serving_credits_and_quarantines_ties(monkeypatch):
@@ -52,6 +116,55 @@ def test_person_filmography_counts_deduplicates_and_paginates_in_sql(monkeypatch
     assert "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, " in page_sql
     assert page_params[0] == 1061913
     assert page_params[-2:] == (100, offset)
+
+
+def test_exact_person_detail_page_two_uses_offset_and_reports_next_cursor(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(main, "_parse_person_id", lambda value: int(value))
+    monkeypatch.setattr(main, "_one", lambda *args: {
+        "person_id": "123", "name": "Example Actor", "normalized_name": "example actor",
+        "compact_name": "exampleactor", "career_attached_movie_count": 109, "roles": ["actor"],
+    })
+
+    def page(person_id, domain, page, limit, provider, language, genre, year, offset=None):
+        captured.update(person_id=person_id, page=page, limit=limit, offset=offset)
+        return 109, [{
+            "canonical_movie_id": f"TMDB:{100 + i}",
+            "title": f"Film {100 + i}",
+            "matched_person_roles": ["actor"],
+        } for i in range(9)]
+
+    monkeypatch.setattr(main, "_person_intelligence_page", page)
+    payload = main._flixyfy_v4_person_detail("123", page=2, limit=100)
+
+    assert captured == {"person_id": 123, "page": 2, "limit": 100, "offset": 100}
+    assert payload["total"] == 109
+    assert payload["offset"] == 100
+    assert payload["returned"] == 9
+    assert payload["has_more"] is False
+    assert payload["next_offset"] is None
+    assert payload["items"][0]["match_evidence"]["person_id"] == "123"
+
+
+def test_exact_person_detail_offset_takes_precedence_and_advertises_next_offset(monkeypatch):
+    monkeypatch.setattr(main, "_parse_person_id", lambda value: int(value))
+    monkeypatch.setattr(main, "_one", lambda *args: {
+        "person_id": "123", "name": "Example Actor", "normalized_name": "example actor",
+        "compact_name": "exampleactor", "career_attached_movie_count": 250, "roles": ["actor"],
+    })
+    monkeypatch.setattr(main, "_person_intelligence_page", lambda *args: (250, [
+        {"canonical_movie_id": f"TMDB:{100 + i}", "title": f"Film {100 + i}", "matched_person_roles": ["actor"]}
+        for i in range(50)
+    ]))
+
+    payload = main._flixyfy_v4_person_detail("123", page=1, limit=50, offset=100)
+
+    assert payload["page"] == 3
+    assert payload["limit"] == 50
+    assert payload["offset"] == 100
+    assert payload["returned"] == 50
+    assert payload["has_more"] is True
+    assert payload["next_offset"] == 150
 
 
 def test_person_filmography_response_reports_full_total_and_has_more(monkeypatch):

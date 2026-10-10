@@ -1,0 +1,74 @@
+{
+  "schema": "flixyfy_person_alias_crosswalk_preview_v1",
+  "environment_scope": "PREVIEW_ONLY",
+  "entries": [
+    {
+      "alias": "ANR",
+      "outcome": "UNIQUE_CANONICAL",
+      "canonical_person_id": "237254",
+      "confidence": "HIGH",
+      "evidence": ["accepted_top20_seed:237254", "https://www.wikidata.org/wiki/Q278980", "https://www.imdb.com/name/nm0004463/", "duplicate_id_comparison:6192119"]
+    },
+    {
+      "alias": "Akkineni Nageswara Rao",
+      "outcome": "UNIQUE_CANONICAL",
+      "canonical_person_id": "237254",
+      "confidence": "HIGH",
+      "evidence": ["accepted_top20_seed:237254", "https://www.wikidata.org/wiki/Q278980", "https://www.imdb.com/name/nm0004463/", "duplicate_id_comparison:6192119"]
+    },
+    {
+      "alias": "A. Nageswara Rao",
+      "outcome": "UNIQUE_CANONICAL",
+      "canonical_person_id": "237254",
+      "confidence": "HIGH",
+      "evidence": ["https://www.wikidata.org/wiki/Q278980", "https://www.imdb.com/name/nm0004463/"]
+    },
+    {
+      "alias": "A Nageswara Rao",
+      "outcome": "UNIQUE_CANONICAL",
+      "canonical_person_id": "237254",
+      "confidence": "HIGH",
+      "evidence": ["https://www.wikidata.org/wiki/Q278980", "https://www.imdb.com/name/nm0004463/"]
+    },
+    {
+      "alias": "Nithiin",
+      "outcome": "UNIQUE_CANONICAL",
+      "canonical_person_id": "1001828",
+      "confidence": "HIGH",
+      "evidence": ["https://www.wikidata.org/wiki/Q7041296", "https://www.imdb.com/name/nm1094012/", "verified TMDB person ID 1001828"]
+    },
+    {
+      "alias": "Nithin Kumar Reddy",
+      "outcome": "UNIQUE_CANONICAL",
+      "canonical_person_id": "1001828",
+      "confidence": "HIGH",
+      "evidence": ["https://www.wikidata.org/wiki/Q7041296", "https://www.imdb.com/name/nm1094012/", "https://en.wikipedia.org/wiki/Nithiin", "verified TMDB person ID 1001828"]
+    },
+    {
+      "alias": "Nitin",
+      "outcome": "AMBIGUOUS",
+      "candidate_person_ids": ["3366178", "6269589"],
+      "confidence": "UNRESOLVED",
+      "evidence": ["local_entity_collisions:3366178,6269589", "movie_overlap_with_1001828:0"]
+    },
+    {
+      "alias": "Nithin",
+      "outcome": "AMBIGUOUS",
+      "candidate_person_ids": ["5045362", "5045368"],
+      "confidence": "UNRESOLVED",
+      "evidence": ["local_entity_collisions:5045362,5045368", "movie_overlap_with_1001828:0"]
+    },
+    {
+      "alias": "Nitin Reddy",
+      "outcome": "UNSUPPORTED",
+      "confidence": "UNSUPPORTED",
+      "evidence": ["no_exact_local_identity_or_external_crosswalk_found"]
+    },
+    {
+      "alias": "Nithin Reddy",
+      "outcome": "UNSUPPORTED",
+      "confidence": "UNSUPPORTED",
+      "evidence": ["no_exact_local_identity_or_external_crosswalk_found"]
+    }
+  ]
+}

@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from app.search_sidecar_v1 import resolve_person_search, search_metadata
+from app.person_alias_crosswalk_v1 import resolve_preview_person_alias, resolution_metadata as alias_resolution_metadata
 
 
 PACKAGE_RELATIONS = frozenset(
@@ -689,6 +690,42 @@ def _person_entity_payload(row: dict[str, Any], query: str) -> dict[str, Any]:
     return payload
 
 
+def _person_entity_rows_by_id(person_id: str) -> list[dict[str, Any]]:
+    """Build one compact card from the serving graph for an exact canonical ID."""
+    relation = _qi("movie_people_serving_v3")
+    return _rows(
+        f"SELECT person_id, MIN(NULLIF(BTRIM(name), '')) AS display_name, "
+        "ARRAY_AGG(DISTINCT NULLIF(BTRIM(name), '') ORDER BY NULLIF(BTRIM(name), '')) "
+        "FILTER (WHERE NULLIF(BTRIM(name), '') IS NOT NULL) AS aliases, "
+        "ARRAY_AGG(DISTINCT LOWER(NULLIF(BTRIM(role), '')) ORDER BY LOWER(NULLIF(BTRIM(role), ''))) "
+        "FILTER (WHERE NULLIF(BTRIM(role), '') IS NOT NULL) AS roles, "
+        "COUNT(DISTINCT canonical_movie_id)::bigint AS movie_count, "
+        "COUNT(*) OVER()::bigint AS total_matches "
+        f"FROM {relation} WHERE person_id::text = %s "
+        "GROUP BY person_id ORDER BY person_id LIMIT 1",
+        (str(person_id),),
+    )
+
+
+def _canonical_person_alias_page(
+    person_id: str, page: int, limit: int, domain: str, provider: str | None,
+    language: str | None, year: int | None,
+) -> dict[str, Any]:
+    canonical_id = _parse_person_id(person_id)
+    if canonical_id is None:
+        return _items_payload([], 0, page, _limit(limit), domain)
+    query_domain = domain or "all"
+    total, items = _person_intelligence_page(
+        canonical_id, query_domain, page, limit, provider, language, None, year,
+    )
+    for item in items:
+        roles = _person_roles(item.pop("matched_person_roles", None))
+        if not roles:
+            raise RuntimeError("canonical person alias result missing person edge evidence")
+        item["match_evidence"] = {"person_id": str(canonical_id), "person_roles": roles}
+    return _items_payload(items, total, page, _limit(limit), domain or "all")
+
+
 def _search_intelligence_rows(
     q: str | None,
     domain: str,
@@ -757,6 +794,7 @@ def _person_intelligence_page(
     language: str | None,
     genre: str | None,
     year: int | None,
+    offset: int | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Count, order and page compact exact-Person movie keys before rich hydration."""
     if str(domain or "").strip().lower() == "all":
@@ -806,7 +844,7 @@ def _person_intelligence_page(
         "SELECT total.total, page_rows.* FROM total LEFT JOIN page_rows ON TRUE "
         "ORDER BY page_rows.rating DESC NULLS LAST, page_rows.title ASC NULLS LAST, "
         "page_rows.canonical_movie_id ASC",
-        tuple([person_id] + filter_params + [size, _offset(page, size)]),
+        tuple([person_id] + filter_params + [size, max(0, offset) if offset is not None else _offset(page, size)]),
     )
     total = int((rows[0] if rows else {}).get("total") or 0)
     items = [
@@ -1395,6 +1433,22 @@ def search_entities(
     entity_type: Literal["person"] = "person",
     limit: int = Query(8, ge=1, le=20),
 ) -> dict[str, Any]:
+    alias_resolution = resolve_preview_person_alias(q)
+    if alias_resolution is not None:
+        metadata = alias_resolution_metadata(alias_resolution)
+        if alias_resolution.outcome == "UNIQUE_CANONICAL" and alias_resolution.canonical_person_id:
+            rows = _person_entity_rows_by_id(alias_resolution.canonical_person_id)
+            items = [_person_entity_payload(rows[0], q)] if rows else []
+            return {
+                "query": q, "entity_type": entity_type, "total": len(items),
+                "limit": _limit(limit, default=8, cap=20), "items": items,
+                "entities": items, "person_resolution": metadata,
+            }
+        return {
+            "query": q, "entity_type": entity_type, "total": 0,
+            "limit": _limit(limit, default=8, cap=20), "items": [],
+            "entities": [], "person_resolution": metadata,
+        }
     rows = _person_entity_rows(q, limit)
     items = [_person_entity_payload(row, q) for row in rows]
     total = int((rows[0] or {}).get("total_matches") or 0) if rows else 0
@@ -1449,6 +1503,15 @@ def search(
     domain: SearchDomain = "all",
     limit: int = Query(30, ge=1, le=100),
 ) -> dict[str, Any]:
+    alias_resolution = resolve_preview_person_alias(q)
+    if alias_resolution is not None:
+        metadata = alias_resolution_metadata(alias_resolution)
+        if alias_resolution.outcome == "UNIQUE_CANONICAL" and alias_resolution.canonical_person_id:
+            payload = _canonical_person_alias_page(
+                alias_resolution.canonical_person_id, 1, limit, domain, None, None, None,
+            )
+            return {"query": q, "domain": domain, **payload, "person_resolution": metadata}
+        return {"query": q, "domain": domain, "total": 0, "items": [], "person_resolution": metadata}
     sidecar = resolve_person_search(q)
     if sidecar is not None:
         items = _person_search_rows(sidecar, domain, limit)
@@ -1500,7 +1563,36 @@ def _v4_search(q: str | None, page: int, limit: int, domain: str | None, provide
     if not q:
         total, items = _movie_rows(current_domain, page, limit, provider, language, year, sort)
         return _items_payload(items, total, page, _limit(limit), current_domain)
+    alias_resolution = resolve_preview_person_alias(q)
+    if alias_resolution is not None:
+        metadata = alias_resolution_metadata(alias_resolution)
+        if alias_resolution.outcome == "UNIQUE_CANONICAL" and alias_resolution.canonical_person_id:
+            payload = _canonical_person_alias_page(
+                alias_resolution.canonical_person_id, page, limit, domain or "all", provider, language, year,
+            )
+            payload["person_resolution"] = metadata
+            return payload
+        items = _search_rows(q, current_domain if domain else "all", _limit(limit), provider, language, year, sort)
+        start = _offset(page, _limit(limit))
+        payload = _items_payload(items[start : start + _limit(limit)], len(items), page, _limit(limit), _normalise_domain(domain) if domain else None)
+        payload["person_resolution"] = metadata
+        return payload
     sidecar = resolve_person_search(q, provider)
+    if sidecar is not None:
+        # The materialized alias sidecar can lag the live Person graph. Validate
+        # its canonical display name against current serving identities before
+        # using its person-to-movie set; duplicate exact-name IDs must stay unresolved.
+        canonical_name = next(iter(sidecar.person_names), "")
+        if canonical_name:
+            canonical_rows = _person_entity_rows(canonical_name, 20)
+            canonical_key = _person_query_forms(canonical_name)[1]
+            exact_ids = {
+                str(row.get("person_id"))
+                for row in canonical_rows
+                if _person_query_forms(str(row.get("display_name") or ""))[1] == canonical_key
+            }
+            if len(exact_ids) > 1 or not set(sidecar.person_ids).issubset(exact_ids):
+                sidecar = None
     if sidecar is not None:
         items = _person_search_rows(sidecar, current_domain if domain else "all", 100, language, year)
         start = _offset(page, _limit(limit))
@@ -1631,7 +1723,13 @@ def _flixyfy_v4_people(page: int = 1, limit: int = 24, q: str | None = None, dom
 
 
 @app.get("/api/v4/people/{person_id}")
-def _flixyfy_v4_person_detail(person_id: str, limit: int = 160, language: str | None = None) -> dict[str, Any]:
+def _flixyfy_v4_person_detail(
+    person_id: str,
+    page: int = 1,
+    limit: int = 100,
+    offset: int | None = None,
+    language: str | None = None,
+) -> dict[str, Any]:
     canonical_person_id = _parse_person_id(person_id)
     if canonical_person_id is None:
         raise HTTPException(status_code=400, detail="person_id must be a canonical person identifier")
@@ -1646,9 +1744,11 @@ def _flixyfy_v4_person_detail(person_id: str, limit: int = 160, language: str | 
     )
     if not person_row:
         raise HTTPException(status_code=404, detail="Person not found")
-    size = _limit(limit, default=160, cap=200)
+    size = _limit(limit, default=100, cap=100)
+    page_offset = max(0, int(offset)) if offset is not None else _offset(page, size)
+    response_page = page_offset // size + 1
     total, items = _person_intelligence_page(
-        canonical_person_id, "all", 1, size, None, language, None, None
+        canonical_person_id, "all", response_page, size, None, language, None, None, page_offset
     )
     person = dict(person_row)
     person["display_name"] = person.get("name")
@@ -1664,13 +1764,18 @@ def _flixyfy_v4_person_detail(person_id: str, limit: int = 160, language: str | 
         if not roles:
             raise RuntimeError("canonical person detail missing person edge evidence")
         item["match_evidence"] = {"person_id": str(canonical_person_id), "person_roles": roles}
-    payload = _items_payload(items, total, 1, size, "all")
+    payload = _items_payload(items, total, response_page, size, "all")
+    has_more = page_offset + len(items) < total
     payload.update({
+        "canonical_person_id": str(canonical_person_id),
         "person": person,
         "primary_language_movie_count": int(total),
         "career_attached_movie_count": int(person.get("career_attached_movie_count") or 0),
         "language": language,
-        "has_more": len(items) < total,
+        "offset": page_offset,
+        "returned": len(items),
+        "has_more": has_more,
+        "next_offset": page_offset + len(items) if has_more else None,
     })
     return payload
 
