@@ -948,8 +948,9 @@ def _person_combination_page(
         "selected_page AS (SELECT * FROM page_keys ORDER BY rating DESC NULLS LAST, title ASC NULLS LAST, canonical_movie_id ASC LIMIT %s OFFSET %s), "
         "page_rows AS (SELECT DISTINCT ON (i.canonical_movie_id) s.*, i.poster, i.backdrop, "
         "i.original_language, i.release_year, i.release_date, i.domain, i.tmdb_id, i.imdb_id, i.rating, "
-        "sp.person_roles_by_id "
-        f"FROM selected_page sp JOIN {_qi('movie_identity_serving_v3')} i "
+        "sp.person_roles_by_id, "
+        + _movie_availability_projection("i")
+        + f"FROM selected_page sp JOIN {_qi('movie_identity_serving_v3')} i "
         "ON i.canonical_movie_id = sp.canonical_movie_id "
         f"JOIN {_qi('movie_search_document_v3')} s ON s.canonical_movie_id = sp.canonical_movie_id "
         "ORDER BY i.canonical_movie_id, i.rating DESC NULLS LAST, s.title ASC NULLS LAST) "

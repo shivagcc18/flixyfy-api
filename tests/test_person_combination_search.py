@@ -90,3 +90,35 @@ def test_combination_evidence_preserves_exact_serving_role_labels(monkeypatch):
         "148037": ["cast"],
         "115440": ["director"],
     }
+
+
+def test_combination_page_projects_runtime_availability_summaries(monkeypatch):
+    captured = {}
+
+    def rows(sql, params=()):
+        captured["sql"] = sql
+        return [{
+            "total": 1,
+            "canonical_movie_id": "TMDB:42",
+            "person_roles_by_id": {"148037": ["cast"], "115440": ["director"]},
+            "runtime_has_ott": True,
+            "runtime_has_youtube": True,
+            "runtime_provider_count": 2,
+            "runtime_youtube_count": 3,
+        }]
+
+    monkeypatch.setattr(main, "_rows", rows)
+    total, items = main._person_combination_page(
+        [148037, 115440], ["cast", "director"], "current", 1, 24,
+        None, None, None, None,
+    )
+
+    assert "runtime_has_ott" in captured["sql"]
+    assert "runtime_has_youtube" in captured["sql"]
+    assert "runtime_provider_count" in captured["sql"]
+    assert "runtime_youtube_count" in captured["sql"]
+    assert total == 1
+    assert items[0]["has_ott"] is True
+    assert items[0]["has_youtube"] is True
+    assert items[0]["provider_count"] == 2
+    assert items[0]["youtube_count"] == 3
